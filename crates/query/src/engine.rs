@@ -4,13 +4,14 @@
 //! here we only do the materialise work and snapshot metadata read.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use consumer_engine_core::{
-    BoxError, Error, Freshness, FreshnessRegistry, GuardrailConfig, SnapshotSpec,
-    WRITE_CATALOG_ALIAS,
+    BoxError, Error, Freshness, FreshnessRegistry, GuardrailConfig, READ_ONLY_CATALOG_ALIAS,
+    SnapshotSpec, WRITE_CATALOG_ALIAS,
 };
 use consumer_engine_execution::{QueryResult, Reader, RowCells};
 use consumer_engine_ingestion::IngestionHandle;
@@ -87,6 +88,98 @@ impl QueryEngine {
         self.run_sync(&q).await
     }
 
+    /// Run a read-only catalogue/feature-store query under the statement
+    /// timeout guardrail (AGENTS.md § Resource Limits: every storage read needs
+    /// a timeout — a stalled probe must not block the single reader thread).
+    async fn catalogue_read(&self, sql: &str, params: Vec<Value>) -> Result<QueryResult> {
+        let timeout = Duration::from_secs(self.guardrails.statement_timeout_secs);
+        match tokio::time::timeout(timeout, self.reader.query_with_params(sql, params)).await {
+            Ok(inner) => inner.map_err(Into::into),
+            Err(_) => Err(QueryError::Guardrail {
+                rule: "statement_timeout".into(),
+                limit: format!("{}s", self.guardrails.statement_timeout_secs),
+            }),
+        }
+    }
+
+    /// Compile a segment and run the catalogue guardrail (spec 13 §1). Shared by
+    /// the sync path (`prepare`) and the materialise path so both enforce
+    /// equally (a materialise IS a query, spec 12 §2a).
+    async fn compile_and_check(&self, q: &SegmentQuery) -> Result<CompiledQuery> {
+        let compiled = compile(q)?;
+        self.enforce_catalogue(q).await?;
+        Ok(compiled)
+    }
+
+    /// Reject a segment that references a raw column absent from the
+    /// `semantic_catalog` or a `Feature` name no producer has ever written
+    /// (spec 13 §1 / issue #6 AC#3: the agent may only query catalogued names —
+    /// no invented columns or features). No-op when `enforce_catalogue` is off.
+    /// The raw-column check is batched per referenced table; the feature check
+    /// probes `feature_store` for each referenced feature name.
+    ///
+    /// # Errors
+    /// [`QueryError::InvalidDsl`] naming the first missing column/feature.
+    async fn enforce_catalogue(&self, q: &SegmentQuery) -> Result<()> {
+        if !self.guardrails.enforce_catalogue {
+            return Ok(());
+        }
+        let refs = crate::ast::referenced_columns(q);
+        let mut by_table: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        for r in refs {
+            by_table
+                .entry((r.system, r.entity))
+                .or_default()
+                .insert(r.column);
+        }
+        for ((system, entity), cols) in by_table {
+            let qr = self
+                .catalogue_read(
+                    &format!(
+                        "SELECT DISTINCT column_name FROM \
+                         {READ_ONLY_CATALOG_ALIAS}.semantic_catalog WHERE system = ? AND \
+                         table_name = ? AND column_name IS NOT NULL"
+                    ),
+                    vec![Value::Text(system.clone()), Value::Text(entity.clone())],
+                )
+                .await?;
+            let catalogued: BTreeSet<String> = qr
+                .rows
+                .iter()
+                .filter_map(|row| {
+                    row.first()
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect();
+            for col in cols {
+                if !catalogued.contains(&col) {
+                    return Err(QueryError::InvalidDsl(format!(
+                        "column {system}.{entity}.{col} is not in the semantic catalogue; onboard \
+                         + profile {system}.{entity} first (spec 13 §1)"
+                    )));
+                }
+            }
+        }
+        for name in crate::ast::referenced_features(q) {
+            let qr = self
+                .catalogue_read(
+                    &format!(
+                        "SELECT 1 FROM {READ_ONLY_CATALOG_ALIAS}.feature_store WHERE feature_name \
+                         = ? LIMIT 1"
+                    ),
+                    vec![Value::Text(name.clone())],
+                )
+                .await?;
+            if qr.rows.is_empty() {
+                return Err(QueryError::InvalidDsl(format!(
+                    "feature {name} is not registered; run the producer first (spec 13 §1)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Compile + best-effort EXPLAIN estimate a plan, enforcing row budgets
     /// **before execution** (AC#3). M1 promotes to [`Mode::Async`] when the
     /// estimated rows exceed `sync_row_cap` (then `run_sync` rejects it).
@@ -104,7 +197,7 @@ impl QueryEngine {
     /// # Errors
     /// Propagates compile/guardrail errors.
     async fn prepare(&self, q: &SegmentQuery) -> Result<(Plan, CompiledQuery)> {
-        let compiled = compile(q)?;
+        let compiled = self.compile_and_check(q).await?;
         let est = explain_cost(&self.reader, &compiled).await;
         enforce(&est, &self.guardrails)?;
         let mode = if est.est_rows > self.guardrails.sync_row_cap {
@@ -199,7 +292,7 @@ impl QueryEngine {
         // alias and surfaces a bad-DSL failure early, but does NOT enforce row
         // budgets (large is the point of materialising). Errors from EXPLAIN
         // (a real compile error) are surfaced via `compile` below.
-        let compiled = compile(q)?;
+        let compiled = self.compile_and_check(q).await?;
         let est = explain_cost(&self.reader, &compiled).await;
         tracing::info!(est_rows = est.est_rows, "materialise estimate");
 
@@ -335,7 +428,10 @@ mod tests {
         let engine = QueryEngine::new(
             reader,
             ingestion.clone(),
-            GuardrailConfig::default(),
+            GuardrailConfig {
+                enforce_catalogue: false,
+                ..GuardrailConfig::default()
+            },
             Arc::new(FreshnessRegistry::new()),
         );
 
@@ -428,7 +524,10 @@ mod tests {
         let engine = QueryEngine::new(
             reader,
             ingestion.clone(),
-            GuardrailConfig::default(),
+            GuardrailConfig {
+                enforce_catalogue: false,
+                ..GuardrailConfig::default()
+            },
             Arc::clone(&freshness),
         );
 
@@ -453,6 +552,171 @@ mod tests {
             res.freshness.lag_seconds
         );
 
+        ingestion.shutdown();
+    }
+
+    /// Shared setup: a writer with an ingested `erp.orders` (columns
+    /// user_id, sku, qty) whose catalogue holds exactly `{user_id, sku}`
+    /// (written directly — this exercises enforcement, not profiling; `qty`
+    /// exists in the raw table but is deliberately uncatalogued). Returns the
+    /// tempdir (kept alive), the ingestion handle, and the engine.
+    #[allow(clippy::type_complexity)]
+    async fn setup_engine(
+        guardrails: GuardrailConfig,
+    ) -> (
+        tempfile::TempDir,
+        consumer_engine_ingestion::IngestionHandle,
+        QueryEngine,
+    ) {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = consumer_engine_storage::Writer::attach(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("attach");
+        writer
+            .ingest_raw(
+                "erp",
+                "orders",
+                &["user_id".into(), "sku".into(), "qty".into()],
+                &[vec![Some("u1".into()), Some("A".into()), Some("3".into())]],
+            )
+            .expect("ingest");
+        writer
+            .ensure_feature_store_table()
+            .expect("ensure feature store");
+        // Register one feature so the Feature-op guardrail can be exercised.
+        writer
+            .write_feature_rows(&[consumer_engine_core::FeatureRow {
+                user_id: "u1".into(),
+                feature_name: "cadence.regularity".into(),
+                num_value: 1.0,
+                as_of_ts: "2025-01-01T00:00:00Z".into(),
+                producer_id: "cadence_sql".into(),
+            }])
+            .expect("write feature");
+        // Mirror the producer flow: write rows, then refresh the wide view.
+        writer
+            .refresh_feature_wide_view("cadence", &["regularity".into()])
+            .expect("refresh view");
+        // Catalogue = {user_id, sku} only; qty is deliberately uncatalogued.
+        let mut catalog = Vec::new();
+        for col in ["user_id", "sku"] {
+            catalog.push(consumer_engine_core::CatalogRow {
+                entity_type: "column".into(),
+                system: "erp".into(),
+                table_name: "orders".into(),
+                column_name: Some(col.into()),
+                semantic_type: consumer_engine_core::SemanticType::Identifier,
+                data_type: "VARCHAR".into(),
+                description: format!("column {col}"),
+                pii_flag: false,
+                sample_values: serde_json::json!([]),
+                embedding: vec![0.0; 4],
+            });
+        }
+        writer.write_catalog_rows(&catalog).expect("write catalog");
+
+        let ingestion = consumer_engine_ingestion::IngestionHandle::start(
+            writer,
+            Arc::new(consumer_engine_ingestion::ProducerRegistry::new()),
+        )
+        .expect("start");
+        let read_conn = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let attach_sql = consumer_engine_storage::read_only_attach_sql(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        );
+        let reader = Reader::start(read_conn, attach_sql, ReaderLimits::default()).expect("reader");
+        let engine = QueryEngine::new(
+            reader,
+            ingestion.clone(),
+            guardrails,
+            Arc::new(FreshnessRegistry::new()),
+        );
+        (tmp, ingestion, engine)
+    }
+
+    fn filter_on(column: &str) -> crate::ast::SegmentQuery {
+        crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"},
+            "key": "user_id",
+            "ops": [{"kind":"filter","predicate":{"column":column,"op":"eq","value":"x"}}]
+        }))
+        .expect("parse")
+    }
+
+    #[tokio::test]
+    async fn test_should_allow_catalogued_column() {
+        let (_tmp, ingestion, engine) = setup_engine(GuardrailConfig::default()).await;
+        let res = engine.run_sync(&filter_on("sku")).await;
+        assert!(
+            res.is_ok(),
+            "catalogued column must pass enforcement: {res:?}"
+        );
+        ingestion.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_reject_uncatalogued_column() {
+        let (_tmp, ingestion, engine) = setup_engine(GuardrailConfig::default()).await;
+        let err = engine
+            .run_sync(&filter_on("qty"))
+            .await
+            .expect_err("uncatalogued column must be rejected");
+        assert!(
+            matches!(err, QueryError::InvalidDsl(_)),
+            "expected InvalidDsl, got {err:?}"
+        );
+        ingestion.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_skip_enforcement_when_disabled() {
+        // With enforcement off, the uncatalogued-but-present `qty` column runs
+        // (the raw column exists, so the SQL is valid).
+        let (_tmp, ingestion, engine) = setup_engine(GuardrailConfig {
+            enforce_catalogue: false,
+            ..GuardrailConfig::default()
+        })
+        .await;
+        let res = engine.run_sync(&filter_on("qty")).await;
+        assert!(res.is_ok(), "enforcement off must not reject: {res:?}");
+        ingestion.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_reject_unregistered_feature() {
+        // A Feature op must reference a feature a producer has actually written
+        // (issue #6 AC#3: no invented feature names -> 400, not a 500 at SQL).
+        let (_tmp, ingestion, engine) = setup_engine(GuardrailConfig::default()).await;
+        let ok = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"},
+            "key": "user_id",
+            "ops": [{"kind":"feature","name":"cadence.regularity","op":"gt","value":0.7}]
+        }))
+        .expect("parse");
+        let res = engine.run_sync(&ok).await;
+        assert!(res.is_ok(), "registered feature must pass: {res:?}");
+
+        let bad = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"},
+            "key": "user_id",
+            "ops": [{"kind":"feature","name":"cadence.bogus","op":"gt","value":0.7}]
+        }))
+        .expect("parse");
+        let err = engine
+            .run_sync(&bad)
+            .await
+            .expect_err("unregistered feature must be rejected");
+        assert!(
+            matches!(err, QueryError::InvalidDsl(_)),
+            "expected InvalidDsl, got {err:?}"
+        );
         ingestion.shutdown();
     }
 }

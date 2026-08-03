@@ -303,3 +303,18 @@ Append-only.
   invariant.
 - **Fix shape (later)**: bound `materialize`'s `as_of_ts` to the min source
   freshness once typed `TIMESTAMPTZ` raw columns exist, and test the leak.
+
+### T5-I5 — catalogue-freshness warning unimplemented (by design, M3 scope)
+
+- **Citation**: `specs/13-semantic-layer.md` §3 I5 ("the query path warns if a
+  referenced column's catalogue entry is older than the source's latest
+  snapshot"); `crates/query/src/engine.rs` (`enforce_catalogue`).
+- **Finding**: `enforce_catalogue` (issue #6 AC#3) checks catalogue **membership**
+  only — it rejects columns absent from `semantic_catalog` but does not warn on
+  stale catalogue entries (built before a later re-onboard). I5 is a stated spec
+  invariant but is **not** an acceptance criterion of issue #6, whose AC#3
+  (reject non-catalogued columns) is fully implemented + tested.
+- **Fix shape (later)**: stamp each `semantic_catalog` row with the source
+  snapshot it was built from (re-onboard versioning, spec 13 §4) and emit a
+  `warn!` when a referenced column's entry predates the source's latest ingest
+  (reusing the `FreshnessRegistry` epoch).

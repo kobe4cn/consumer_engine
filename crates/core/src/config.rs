@@ -74,6 +74,12 @@ pub struct GuardrailConfig {
     /// JIT (`Derive`) survivor-set cap above which a derive is rejected.
     #[serde(default = "default_j_survivor_cap")]
     pub j_survivor_cap: u64,
+    /// Whether the query path rejects DSL referencing columns not present in the
+    /// `semantic_catalog` (spec 13 §1: the agent may only query catalogued
+    /// columns). Defaults on so production is safe; unit tests that onboard
+    /// directly (bypassing the Profiler) opt out.
+    #[serde(default = "default_enforce_catalogue")]
+    pub enforce_catalogue: bool,
 }
 
 fn default_memory_limit() -> String {
@@ -111,6 +117,11 @@ const fn default_j_survivor_cap() -> u64 {
     200_000
 }
 
+/// Catalogue enforcement defaults ON (production-safe; spec 13 §1).
+const fn default_enforce_catalogue() -> bool {
+    true
+}
+
 impl Default for GuardrailConfig {
     fn default() -> Self {
         Self {
@@ -122,6 +133,7 @@ impl Default for GuardrailConfig {
             max_output_rows: default_max_output_rows(),
             max_bytes_scanned: default_max_bytes_scanned(),
             j_survivor_cap: default_j_survivor_cap(),
+            enforce_catalogue: default_enforce_catalogue(),
         }
     }
 }
