@@ -29,6 +29,10 @@ config = { version = "0.14", default-features = false, features = ["yaml"] }
 uuid = { version = "1", features = ["v7"] }
 validator = { version = "0.20", features = ["derive"] }
 
+# Object-safe async traits for the Feature Store producer + semantic LLM seams
+# (AGENTS.md § Async: `dyn Trait` dispatch mandates `async-trait`).
+async-trait = "0.1"
+
 # Crypto / concurrency for the M2 presigned-export + job registry
 dashmap = "6"
 hmac = "0.12"
@@ -43,3 +47,4 @@ consumer_engine-execution = { path = "crates/execution" }
 consumer_engine-ingestion = { path = "crates/ingestion" }
 consumer_engine-ingress = { path = "crates/ingress" }
 consumer_engine-query = { path = "crates/query" }
+consumer_engine-semantic = { path = "crates/semantic" }

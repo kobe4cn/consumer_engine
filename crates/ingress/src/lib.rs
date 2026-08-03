@@ -10,11 +10,8 @@
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicI64, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -24,15 +21,18 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use consumer_engine_core::{Error, Freshness, validate_ident};
+use consumer_engine_core::{Error, Freshness, FreshnessRegistry, SourceType, validate_ident};
 use consumer_engine_execution::RowCells;
 use consumer_engine_ingestion::IngestionHandle;
 use consumer_engine_query::{QueryEngine, QueryError};
+use consumer_engine_semantic::{IntentRag, Profiler};
 use serde::{Deserialize, Serialize};
 
 pub mod audience;
+pub mod catalog;
 pub mod jobs;
 pub mod presign;
+pub mod producers;
 
 pub use jobs::{JobRegistry, JobStatus};
 
@@ -46,6 +46,8 @@ const MAX_SQL_BYTES: usize = 8_192;
 const MAX_CELL_BYTES: usize = 4_096;
 /// Request body limit.
 const BODY_LIMIT: usize = 10 * 1024 * 1024;
+/// Wall-clock budget for the onboarding profile step (spec 21 I5: bounded).
+const PROFILE_TIMEOUT_SECS: u64 = 5;
 
 /// Shared state injected into handlers.
 #[derive(Clone, Debug)]
@@ -54,8 +56,12 @@ pub struct AppState {
     pub ingestion: IngestionHandle,
     /// The query engine (DSL → guarded SQL).
     pub query_engine: QueryEngine,
-    /// Epoch seconds of the last successful ingest (drives the freshness label).
-    pub last_ingest_epoch: Arc<AtomicI64>,
+    /// Graded per-source freshness registry (D5).
+    pub freshness: Arc<FreshnessRegistry>,
+    /// The L0 onboarding profiler (spec 13).
+    pub profiler: Arc<Profiler>,
+    /// The L1 Intent RAG retriever (spec 13).
+    pub intent_rag: Arc<IntentRag>,
     /// Async-job registry for `POST /jobs` / `GET /jobs/:id`.
     pub jobs: Arc<JobRegistry>,
     /// HMAC-SHA256 signing key for presigned export URLs (32 bytes of OS
@@ -71,6 +77,9 @@ pub struct OnboardRequest {
     entity: String,
     columns: Vec<String>,
     rows: Vec<Vec<Option<String>>>,
+    /// Source adapter kind (default `"batch"`; `"cdc"` for change-data-capture).
+    #[serde(default)]
+    source_type: Option<String>,
 }
 
 /// `POST /sources/onboard` response body.
@@ -78,6 +87,10 @@ pub struct OnboardRequest {
 #[serde(rename_all = "camelCase")]
 pub struct OnboardResponse {
     rows_inserted: usize,
+    /// Whether the L0 Profiler successfully profiled + catalogued the table.
+    profiled: bool,
+    /// The profiled column names (empty if profiling failed/timed out).
+    columns: Vec<String>,
 }
 
 /// `POST /query` request body. Provide `dsl` (happy path) or `sql` (escape
@@ -117,6 +130,8 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/sources/onboard", post(onboard))
         .route("/query", post(query))
+        .route("/catalog", get(catalog::get_catalog))
+        .route("/producers/run", post(producers::run_producer))
         .route("/jobs", post(jobs::post_jobs))
         .route("/jobs/{id}", get(jobs::get_job))
         .route("/audience/{snapshot_id}", get(audience::get_audience))
@@ -171,10 +186,58 @@ async fn onboard(
         .ingestion
         .ingest_raw(&req.system, &req.entity, req.columns, req.rows)
         .await?;
+    let source_type = parse_source_type(&req.source_type)?;
     state
-        .last_ingest_epoch
-        .store(now_epoch(), Ordering::Relaxed);
-    Ok(Json(OnboardResponse { rows_inserted: n }))
+        .freshness
+        .set(&req.system, &req.entity, source_type, now_epoch())?;
+
+    // Profile with a wall-clock budget (spec 21 I5); a timeout/failure degrades
+    // to `profiled=false` rather than failing the whole onboard (the rows are
+    // already ingested).
+    let (profiled, columns) = match tokio::time::timeout(
+        Duration::from_secs(PROFILE_TIMEOUT_SECS),
+        state.profiler.onboard(&req.system, &req.entity),
+    )
+    .await
+    {
+        Ok(Ok(rows)) => {
+            let cols: Vec<String> = rows.iter().filter_map(|r| r.column_name.clone()).collect();
+            match state.ingestion.write_catalog(rows).await {
+                Ok(_) => (true, cols),
+                Err(e) => {
+                    tracing::warn!(error = %e, "catalog write failed after profile");
+                    (false, Vec::new())
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "profile failed");
+            (false, Vec::new())
+        }
+        Err(_) => {
+            tracing::warn!("profile timed out");
+            (false, Vec::new())
+        }
+    };
+    Ok(Json(OnboardResponse {
+        rows_inserted: n,
+        profiled,
+        columns,
+    }))
+}
+
+/// Parse the `sourceType` field into a [`SourceType`], defaulting to batch.
+///
+/// # Errors
+/// [`ApiError::Core`] for an unknown source-type label (reject, don't coerce).
+fn parse_source_type(s: &Option<String>) -> Result<SourceType, ApiError> {
+    match s.as_deref() {
+        None | Some("batch") => Ok(SourceType::Batch),
+        Some("cdc") => Ok(SourceType::Cdc),
+        Some(other) => Err(ApiError::Core(Error::InvalidInput(format!(
+            "unknown sourceType {other:?}"
+        )))),
+    }
 }
 
 /// `POST /query`.

@@ -107,6 +107,15 @@ passes.
 
 ## 7. Phase 4 — Feature Store + semantic layer (closes M3)
 
+> **Status: DONE — M3 closed.** Detailed plan: [`t4-feature-store-semantic-plan.md`](./t4-feature-store-semantic-plan.md)
+> (phases A–J). Phase A (core types + storage DDL/writers) landed first; phases
+> B–J (producer trait/registry + cadence producer, `Feature` DSL op, semantic
+> crate L0/L1, graded freshness, REST `/catalog` + `/producers/run`, server
+> wiring, M3 exit tests) completed in this pass. All 7 M3 exit criteria are
+> covered by tests; the full Rust gate (`build`, `test`, `+nightly fmt`,
+> `clippy -- -D warnings`, `audit`, `deny check`) is green. Findings/deferrals
+> are recorded in [93 §From Phase 4](./93-improvements-review.md).
+
 | #   | Task | Spec | Effort |
 | --- | ---- | ---- | ------ |
 | 4.1 | Producer trait + registry + `feature_store` write path + wide pivot views | [20 §2](./20-ingestion.md), [D9](./99-key-decisions.md) | 3d |

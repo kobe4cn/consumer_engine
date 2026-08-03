@@ -15,6 +15,15 @@ static IDENT_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::ne
     regex::Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").expect("valid static regex")
 });
 
+/// Feature-name allowlist: 1–64 chars of `[A-Za-z0-9_.-]` — note the `.` vs
+/// [`IDENT_RE`], so namespaced `family.short` feature names and producer ids
+/// are accepted.
+// Hardcoded valid pattern; see `IDENT_RE` justification.
+#[allow(clippy::expect_used)]
+static FEATURE_NAME_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+    regex::Regex::new(r"^[a-zA-Z0-9_.-]{1,64}$").expect("valid static regex")
+});
+
 /// Validate an identifier against the boundary allowlist `^[a-zA-Z0-9_-]{1,64}$`.
 ///
 /// # Errors
@@ -26,6 +35,23 @@ pub fn validate_ident(name: &str) -> Result<()> {
     } else {
         Err(Error::InvalidInput(format!(
             "invalid identifier {name:?}: must match ^[a-zA-Z0-9_-]{{1,64}}$"
+        )))
+    }
+}
+
+/// Validate a feature name / producer id against the boundary allowlist
+/// `^[a-zA-Z0-9_.-]{1,64}$` (note the `.` vs [`validate_ident`], so namespaced
+/// `family.short` feature names are accepted).
+///
+/// # Errors
+/// Returns [`Error::InvalidInput`] if `name` is empty, longer than 64 chars, or
+/// contains a character outside the allowlist.
+pub fn validate_feature_name(name: &str) -> Result<()> {
+    if FEATURE_NAME_RE.is_match(name) {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "invalid feature name {name:?}: must match ^[a-zA-Z0-9_.-]{{1,64}}$"
         )))
     }
 }

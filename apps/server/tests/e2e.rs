@@ -632,3 +632,284 @@ async fn test_should_stream_parquet_export() {
         "csv format must be 415"
     );
 }
+
+// --- M3: Feature Store + semantic layer (Phase 4) ---
+
+/// Onboard a source table with an explicit source type (default is batch).
+async fn onboard_typed(
+    client: &reqwest::Client,
+    base: &str,
+    system: &str,
+    entity: &str,
+    columns: &[&str],
+    rows: Vec<Vec<&str>>,
+    source_type: &str,
+) {
+    let resp = client
+        .post(format!("{base}/sources/onboard"))
+        .json(&serde_json::json!({
+            "system": system,
+            "entity": entity,
+            "columns": columns,
+            "rows": rows,
+            "sourceType": source_type,
+        }))
+        .send()
+        .await
+        .expect("onboard");
+    assert!(
+        resp.status().is_success(),
+        "onboard {system}.{entity} failed: {}",
+        resp.status()
+    );
+}
+
+/// Extract the first cell of every row from a query response.
+fn first_column(values: &Value) -> Vec<String> {
+    values["rows"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r.get(0).and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn test_should_report_worst_source_freshness() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    // A batch source and a cdc source.
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "sku"],
+        vec![vec!["u1", "A"]],
+    )
+    .await;
+    onboard_typed(
+        &client,
+        &base,
+        "erp",
+        "events",
+        &["user_id", "ts"],
+        vec![vec!["u1", "2025-01-01T00:00:00Z"]],
+        "cdc",
+    )
+    .await;
+
+    // A query touching both sources (orders ∩ events).
+    let q = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({
+            "dsl": {
+                "source": {"system":"erp","entity":"orders"},
+                "key": "user_id",
+                "ops": [{"kind":"setOp","op":"intersect",
+                         "other":{"source":{"system":"erp","entity":"events"},"key":"user_id","ops":[]}}]
+            }
+        }))
+        .send()
+        .await
+        .expect("query");
+    assert!(q.status().is_success(), "query failed: {}", q.status());
+    let v: Value = q.json().await.expect("json");
+    assert_eq!(
+        v["freshness"]["worstSource"], "batch",
+        "graded freshness must report the batch posture: {v}"
+    );
+}
+
+#[tokio::test]
+async fn test_should_resolve_periodic_buyers_end_to_end() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    // Crafted cadence: a regular (weekly) buyer and an erratic buyer.
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "ts"],
+        vec![
+            vec!["reg", "2025-01-01T00:00:00Z"],
+            vec!["reg", "2025-01-08T00:00:00Z"],
+            vec!["reg", "2025-01-15T00:00:00Z"],
+            vec!["reg", "2025-01-22T00:00:00Z"],
+            vec!["err", "2025-01-01T00:00:00Z"],
+            vec!["err", "2025-06-01T00:00:00Z"],
+            vec!["err", "2025-06-02T00:00:00Z"],
+        ],
+    )
+    .await;
+
+    // Run the cadence producer (point-in-time at 2025-12-31).
+    let resp = client
+        .post(format!("{base}/producers/run"))
+        .json(&serde_json::json!({"producerId":"cadence_sql","asOf":"2025-12-31T00:00:00Z"}))
+        .send()
+        .await
+        .expect("run producer");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "producer run failed: {}",
+        resp.status()
+    );
+    let pr: Value = resp.json().await.expect("json");
+    assert!(
+        pr["rowsWritten"].as_u64().unwrap_or(0) >= 2,
+        "both users must be scored: {pr}"
+    );
+
+    // Feature query: cadence.regularity > 0.7 → only the regular buyer.
+    let dsl = serde_json::json!({
+        "source": {"system":"erp","entity":"orders"},
+        "key": "user_id",
+        "ops": [{"kind":"feature","name":"cadence.regularity","op":"gt","value":0.7}]
+    });
+    let q = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({ "dsl": dsl }))
+        .send()
+        .await
+        .expect("query");
+    assert!(
+        q.status().is_success(),
+        "feature query failed: {}",
+        q.status()
+    );
+    let qv: Value = q.json().await.expect("json");
+    let users = first_column(&qv);
+    assert!(
+        users.iter().any(|u| u == "reg"),
+        "regular buyer must match: {users:?}"
+    );
+    assert!(
+        !users.iter().any(|u| u == "err"),
+        "erratic buyer must NOT match: {users:?}"
+    );
+
+    // Materialise the same segment; the snapshot holds only the regular buyer.
+    let resp = client
+        .post(format!("{base}/jobs"))
+        .json(&serde_json::json!({
+            "dsl": dsl,
+            "materialize": {"campaignId": "cadence"}
+        }))
+        .send()
+        .await
+        .expect("post jobs");
+    assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+    let v: Value = resp.json().await.expect("json");
+    let job_id = v["jobId"].as_str().expect("jobId").to_string();
+    let status = poll_until_done(&client, &base, &job_id).await;
+    assert!(status["error"].is_null(), "job must succeed: {status}");
+    let snap = status["snapshotId"]
+        .as_str()
+        .expect("snapshotId")
+        .to_string();
+
+    let resp = client
+        .get(format!("{base}/audience/{snap}"))
+        .send()
+        .await
+        .expect("audience");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let meta: Value = resp.json().await.expect("meta");
+    assert_eq!(
+        meta["rowCount"], 1,
+        "only the regular buyer is materialised: {meta}"
+    );
+
+    // Export + decode the Parquet: every row must carry a non-null hit_reason
+    // (Phase I exit requirement: assert snapshot count + non-null hit_reason).
+    let dl = meta["downloadUrl"].as_str().expect("downloadUrl");
+    let resp = client
+        .get(format!("{base}{dl}"))
+        .send()
+        .await
+        .expect("export");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "export must be 200");
+    let bytes = resp.bytes().await.expect("export bytes");
+    let (rows, hr_nulls, _feat_nulls) = decode_parquet_snapshot(bytes);
+    assert_eq!(
+        rows, 1,
+        "parquet row count must match the materialised segment"
+    );
+    assert_eq!(hr_nulls, 0, "hit_reason must be non-null on every row");
+}
+
+#[tokio::test]
+async fn test_should_profile_new_table_on_onboard() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/sources/onboard"))
+        .json(&serde_json::json!({
+            "system": "erp",
+            "entity": "orders",
+            "columns": ["user_id", "sku", "ts"],
+            "rows": [["u1", "A", "2025-01-01T00:00:00Z"]]
+        }))
+        .send()
+        .await
+        .expect("onboard");
+    assert!(resp.status().is_success());
+    let v: Value = resp.json().await.expect("json");
+    assert_eq!(v["profiled"], true, "onboard must profile the table: {v}");
+    let cols = v["columns"].as_array().expect("columns array");
+    assert_eq!(cols.len(), 3, "all 3 columns profiled: {v}");
+
+    // /catalog returns bounded hits, each carrying a description.
+    let resp = client
+        .get(format!("{base}/catalog?q=user&k=5"))
+        .send()
+        .await
+        .expect("catalog");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let hits: Value = resp.json().await.expect("json");
+    let arr = hits.as_array().expect("hits array");
+    assert!(arr.len() <= 5, "catalog must be bounded by k");
+    for h in arr {
+        assert!(
+            h["description"].as_str().is_some_and(|s| !s.is_empty()),
+            "hit must have a description: {h}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_should_catalog_returns_bounded_candidates() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    // Onboard a table with several columns → several catalog rows.
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "sku", "amount", "ts"],
+        vec![vec!["u1", "A", "10", "2025-01-01T00:00:00Z"]],
+    )
+    .await;
+
+    for k in [1_usize, 2, 3] {
+        let resp = client
+            .get(format!("{base}/catalog?k={k}"))
+            .send()
+            .await
+            .expect("catalog");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let hits: Value = resp.json().await.expect("json");
+        let arr = hits.as_array().expect("hits array");
+        assert!(
+            arr.len() <= k,
+            "k={k} must bound candidates, got {}",
+            arr.len()
+        );
+    }
+}

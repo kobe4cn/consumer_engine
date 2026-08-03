@@ -237,3 +237,69 @@ Append-only.
   `axum::body::Body::from(Vec<u8>)` directly), and `bytes` is a server
   **test-only** dev-dep (in-memory `parquet` decode via `ChunkReader for Bytes`,
   avoiding disallowed blocking `std::fs`). All strictly cleaner than the plan.
+
+## From Phase 4 / T4 (M3) — Feature Store + semantic layer
+
+### T4-CATALOG-LIST — DuckDB `List` parameter binding unsupported (FIXED)
+
+- **Citation**: `crates/storage/src/lib.rs` (`write_catalog_rows`).
+- **Finding**: Phase A's catalog writer bound the `embedding` column as
+  `Value::List(...)`; DuckDB's Rust binding rejects this (`"binding List
+  parameters is not yet supported"`). The Phase A test `test_should_write_catalog_rows`
+  was committed without ever running, so the defect lay dormant.
+- **Fix applied**: the embedding is now written via a `list_value(?, ?, …)`
+  constructor with one scalar placeholder per dimension (each float bound
+  individually), with a dimension-consistency check. `semantic_catalog` stays
+  `FLOAT[]` (variable-length) for M3's brute-force cosine; a phase-2 fixed-`FLOAT[dim]`
+  + HNSW migration remains flagged.
+
+### T4-RECENCY-NOW — Recency/Lapsed compile `now() - INTERVAL` is rejected (DEFERRED)
+
+- **Citation**: `crates/query/src/compiler.rs` (`compile_recency`,
+  `compile_lapsed`) → `now() - INTERVAL '<n>' DAY`.
+- **Finding**: `now()` returns `TIMESTAMP WITH TIME ZONE`, and this DuckDB build
+  has **no** `-(TIMESTAMPTZ, INTERVAL)` overload (binder error). The M1/M2 B-temporal
+  ops were unit-tested only for SQL-string shape, never executed against real
+  DuckDB, so the defect was latent. Discovered during M3 when a freshness test
+  first ran a `Recency` query.
+- **Why deferred from M3**: out of Phase 4 scope (B capability, Phase 2); no M3
+  exit criterion depends on `Recency`/`Lapsed` (the freshness + periodic-buyers
+  tests use `SetOp`/`Feature`).
+- **Fix shape (Phase 2 follow-up)**: render `CAST(now() AS TIMESTAMP) - INTERVAL '<n>' DAY`
+  and cast the raw `e.ts` (`VARCHAR`) to `TIMESTAMPTZ` for the comparison, then
+  add an end-to-end `Recency`/`Lapsed` test.
+
+### T4-PRODUCER-CONFIG — producers hardcoded in `Engine::build` (DEFERRED)
+
+- **Citation**: `apps/server/src/lib.rs` (`Engine::build`, the `CadenceRegularityProducer`
+  over `erp.orders`).
+- **Finding**: M3 wires one demo producer (the PRD's cadence over `erp.orders`)
+  directly in server construction. A real deployment needs config-driven
+  producer registration (dataset + schedule + as_of source).
+- **Fix shape (later phase)**: a `producers` section in `EngineConfig` →
+  `ProducerRegistry` construction; `run(as_of)` `as_of` sourced from the
+  source's freshness epoch (D9), not a caller-supplied string.
+
+### T4-SEMANTIC-TABLE-ROW — Profiler emits column rows only (design note)
+
+- **Citation**: `crates/semantic/src/profiler.rs` (`onboard`).
+- **Finding**: the detailed plan said "emit one `entity_type=table` row"; the
+  implementation emits **column-level** rows only (`entity_type="column"`).
+  `SemanticType` has no `Table` variant, and column rows are exactly what the
+  IntentRag needs to hand the agent composable DSL predicates.
+- **Action**: none for M3 (documented deviation; all exit tests pass). A table-level
+  summary row can be added if a future IntentRag needs table-granular ranking.
+
+### T4-I3 — point-in-time bounding: producer-level DONE, snapshot-level still deferred
+
+- **Citation**: `crates/ingestion/src/producers/cadence.rs` (`WHERE ts <= ?`);
+  `crates/query/src/engine.rs` (`materialize`, `as_of_ts = now()`).
+- **Finding**: the earlier T4-I3 deferral is now **partly resolved** — producer
+  point-in-time correctness is enforced at the SQL level (`ts <= ?`, bound as
+  text; ISO-8601 compares lexicographically = chronologically) and tested
+  (`test_should_run_producer_point_in_time_bounded`). Snapshot-level bounding
+  **remains** `as_of_ts = materialisation time` by design for M3 (documented);
+  the exit test asserts I2 atomicity + non-null `hit_reason`, not the leak
+  invariant.
+- **Fix shape (later)**: bound `materialize`'s `as_of_ts` to the min source
+  freshness once typed `TIMESTAMPTZ` raw columns exist, and test the leak.

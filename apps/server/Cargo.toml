@@ -16,6 +16,7 @@ consumer_engine-execution.workspace = true
 consumer_engine-ingestion.workspace = true
 consumer_engine-ingress.workspace = true
 consumer_engine-query.workspace = true
+consumer_engine-semantic.workspace = true
 getrandom.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

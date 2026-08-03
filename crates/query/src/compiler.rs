@@ -7,7 +7,7 @@
 //! (invariant I1, `specs/12-query-engine.md`). Temporal windows use integer
 //! `INTERVAL '<n>' DAY` constants only.
 
-use consumer_engine_core::READ_ONLY_CATALOG_ALIAS;
+use consumer_engine_core::{READ_ONLY_CATALOG_ALIAS, split_feature_name};
 use duckdb::types::Value;
 
 use crate::{
@@ -116,13 +116,23 @@ fn compile_at(q: &SegmentQuery, depth: u8, alias: &str) -> Result<CompiledQuery>
                     alias,
                 )?);
             }
+            Op::Feature { name, op, value } => {
+                conjuncts.push(compile_feature(
+                    name,
+                    *op,
+                    *value,
+                    &q.key,
+                    &mut params,
+                    alias,
+                )?);
+            }
             Op::SetOp { op, other } => {
                 setop = Some((op, other));
             }
-            // parse::validate rejects these for M1; defensive double-check.
-            Op::Exclude { .. } | Op::Feature | Op::Derive | Op::Similar | Op::Characterize => {
+            // parse::validate rejects these for M3; defensive double-check.
+            Op::Exclude { .. } | Op::Derive | Op::Similar | Op::Characterize => {
                 return Err(QueryError::InvalidDsl(
-                    "capability not supported in M1".into(),
+                    "capability not supported in M3".into(),
                 ));
             }
         }
@@ -304,6 +314,55 @@ fn compile_lapsed(
     ))
 }
 
+/// Compile a `Feature` op into an `EXISTS` conjunct against the wide pivot view
+/// `feature_wide_{family}`. The feature value is bound as a parameter (I1);
+/// `family`/`short` are validated identifiers rendered into the view/column
+/// names. The feature view is **not** added to `sources` — freshness is graded
+/// over raw sources only (D5), and the view is derived from already-graded data.
+///
+/// # Errors
+/// [`QueryError::InvalidDsl`] if the name cannot split into sound identifiers
+/// or the operator is not a numeric comparison (defence-in-depth; parse already
+/// rejects these).
+fn compile_feature(
+    name: &str,
+    op: Cmp,
+    value: f64,
+    base_key: &str,
+    params: &mut Vec<Value>,
+    alias: &str,
+) -> Result<String> {
+    let (family, short) =
+        split_feature_name(name).map_err(|e| QueryError::InvalidDsl(e.to_string()))?;
+    let cmp = cmp_symbol(op)?;
+    params.push(Value::Double(value));
+    Ok(format!(
+        "EXISTS (SELECT 1 FROM {alias}.feature_wide_{family} f WHERE f.user_id = base.{base_key} \
+         AND f.{short} {cmp} ?)"
+    ))
+}
+
+/// Map a numeric comparison operator to its SQL symbol.
+///
+/// # Errors
+/// [`QueryError::InvalidDsl`] for `In`/`NotIn`/`Like`/`NotLike` (not valid on
+/// a scalar feature value).
+fn cmp_symbol(op: Cmp) -> Result<&'static str> {
+    Ok(match op {
+        Cmp::Eq => "=",
+        Cmp::Ne => "<>",
+        Cmp::Lt => "<",
+        Cmp::Le => "<=",
+        Cmp::Gt => ">",
+        Cmp::Ge => ">=",
+        Cmp::In | Cmp::NotIn | Cmp::Like | Cmp::NotLike => {
+            return Err(QueryError::InvalidDsl(
+                "feature op must be a numeric comparison (eq/ne/lt/le/gt/ge)".into(),
+            ));
+        }
+    })
+}
+
 /// Map a [`SetOpKind`] to its SQL keyword.
 fn setop_keyword(k: SetOpKind) -> &'static str {
     match k {
@@ -446,6 +505,34 @@ mod tests {
         );
         // The read alias must not leak into the write-compiled SQL.
         assert!(!c.sql.contains("dro.raw_erp_orders"));
+    }
+
+    #[test]
+    fn test_should_compile_feature_as_exists_subquery() {
+        let q = orders(vec![Op::Feature {
+            name: "cadence.regularity".into(),
+            op: Cmp::Gt,
+            value: 0.7,
+        }]);
+        let c = compile(&q).expect("compile");
+        assert!(
+            c.sql
+                .contains("EXISTS (SELECT 1 FROM dro.feature_wide_cadence f"),
+            "expected feature_wide view exists-subquery: {}",
+            c.sql
+        );
+        assert!(
+            c.sql.contains("f.regularity > ?"),
+            "expected bound value on short name: {}",
+            c.sql
+        );
+        assert_eq!(c.params, vec![Value::Double(0.7)]);
+        // The feature view must NOT contribute to freshness sources (D5).
+        assert!(
+            c.sources.iter().all(|d| d.entity != "feature_wide_cadence"),
+            "feature view must not be a freshness source: {:?}",
+            c.sources
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! and rejection of the M1-unsupported variants (`Exclude`, F/J/S/P). Per
 //! AGENTS.md § Input Validation: reject, never sanitise.
 
-use consumer_engine_core::validate_ident;
+use consumer_engine_core::{split_feature_name, validate_ident};
 
 use crate::{
     ast::{Cmp, Dataset, Op, Predicate, SegmentQuery},
@@ -83,12 +83,32 @@ fn validate_op(op: &Op) -> Result<()> {
         }
         Op::SetOp { other, .. } => validate(other),
         Op::Exclude { .. } => Err(invalid(
-            "Exclude is not supported in M1 (requires the suppression table, phase 5)",
+            "Exclude is not supported in M3 (requires the suppression table, phase 5)",
         )),
-        Op::Feature | Op::Derive | Op::Similar | Op::Characterize => {
-            Err(invalid("this capability is not supported in M1"))
-        }
+        Op::Feature { name, op, .. } => validate_feature(name, op),
+        Op::Derive | Op::Similar | Op::Characterize => Err(invalid(
+            "Derive/Similar/Characterize are not supported in M3",
+        )),
     }
+}
+
+/// Validate a `Feature` op: the namespaced name must split into two sound
+/// identifiers (`family.short`), the operator must be a numeric comparison, and
+/// the value must be a JSON number (no strings/arrays/objects).
+fn validate_feature(name: &str, op: &Cmp) -> Result<()> {
+    // `split_feature_name` validates that the name has exactly one `.` and both
+    // parts are valid identifiers — the invariant the compiler relies on to map
+    // `family`→view and `short`→column.
+    split_feature_name(name).map_err(|e| invalid(format!("feature name: {e}")))?;
+    if !matches!(
+        op,
+        Cmp::Eq | Cmp::Ne | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge
+    ) {
+        return Err(invalid(
+            "feature op must be one of eq/ne/lt/le/gt/ge (no in/like)",
+        ));
+    }
+    Ok(())
 }
 
 /// Validate a dataset's identifiers.
@@ -181,7 +201,53 @@ mod tests {
 
     #[test]
     fn test_should_reject_unsupported_capability() {
-        let q = orders_q(vec![Op::Feature]);
+        // Derive/Similar/Characterize remain forward-contract stubs in M3.
+        let q = orders_q(vec![Op::Derive]);
+        assert!(matches!(validate(&q), Err(QueryError::InvalidDsl(_))));
+    }
+
+    #[test]
+    fn test_should_validate_feature_op() {
+        let q = orders_q(vec![Op::Feature {
+            name: "cadence.regularity".into(),
+            op: Cmp::Gt,
+            value: 0.7,
+        }]);
+        assert!(
+            validate(&q).is_ok(),
+            "a valid feature op must pass M3 validation"
+        );
+    }
+
+    #[test]
+    fn test_should_reject_feature_with_non_number_value() {
+        // `value` is typed `f64`, so a non-number is rejected at serde parse
+        // time with a clear InvalidDsl (not at validate()).
+        let json = serde_json::json!({
+            "source": {"system":"erp","entity":"orders"},
+            "key": "user_id",
+            "ops": [{"kind":"feature","name":"cadence.regularity","op":"gt","value":"high"}]
+        });
+        assert!(matches!(parse(json), Err(QueryError::InvalidDsl(_))));
+    }
+
+    #[test]
+    fn test_should_reject_feature_with_bad_op() {
+        let q = orders_q(vec![Op::Feature {
+            name: "cadence.regularity".into(),
+            op: Cmp::In,
+            value: 0.7,
+        }]);
+        assert!(matches!(validate(&q), Err(QueryError::InvalidDsl(_))));
+    }
+
+    #[test]
+    fn test_should_reject_feature_with_unnamespaced_name() {
+        let q = orders_q(vec![Op::Feature {
+            name: "regularity".into(),
+            op: Cmp::Gt,
+            value: 0.7,
+        }]);
         assert!(matches!(validate(&q), Err(QueryError::InvalidDsl(_))));
     }
 

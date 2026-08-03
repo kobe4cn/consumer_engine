@@ -14,11 +14,22 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
-use std::{collections::HashSet, path::PathBuf, thread};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    thread,
+};
 
-use consumer_engine_core::{BoxError, Error, Result, SnapshotSpec};
+use consumer_engine_core::{BoxError, CatalogRow, Error, FeatureRow, Result, SnapshotSpec};
 use consumer_engine_storage::Writer;
 use duckdb::types::Value;
+
+mod producer;
+mod producers;
+
+pub use producer::{FeatureProducer, ProducerOutput, ProducerRegistry};
+pub use producers::CadenceRegularityProducer;
 
 /// Commands sent to the writer thread.
 enum Cmd {
@@ -64,6 +75,21 @@ enum Cmd {
         /// Reply channel.
         reply: flume::Sender<Result<()>>,
     },
+    /// Append feature rows to `feature_store` and refresh the wide pivot views
+    /// for every distinct family touched (D9).
+    WriteFeatures {
+        /// The feature rows to append.
+        rows: Vec<FeatureRow>,
+        /// Reply channel carrying the inserted row count.
+        reply: flume::Sender<Result<usize>>,
+    },
+    /// Append semantic-catalog rows (Profiler output).
+    WriteCatalog {
+        /// The catalog rows to append.
+        rows: Vec<CatalogRow>,
+        /// Reply channel carrying the inserted row count.
+        reply: flume::Sender<Result<usize>>,
+    },
     /// Stop the writer thread.
     Shutdown,
 }
@@ -72,6 +98,7 @@ enum Cmd {
 #[derive(Clone)]
 pub struct IngestionHandle {
     tx: flume::Sender<Cmd>,
+    registry: Arc<ProducerRegistry>,
 }
 
 impl std::fmt::Debug for IngestionHandle {
@@ -81,18 +108,19 @@ impl std::fmt::Debug for IngestionHandle {
 }
 
 impl IngestionHandle {
-    /// Start the writer thread owning `writer`. Exactly one handle should be
-    /// built per catalog (the writer's file lock enforces singleness).
+    /// Start the writer thread owning `writer` and bound to `registry`. Exactly
+    /// one handle should be built per catalog (the writer's file lock enforces
+    /// singleness). The registry holds the Feature Store producers (D9).
     ///
     /// # Errors
     /// - [`Error::Ingestion`] if the thread cannot be spawned.
-    pub fn start(writer: Writer) -> Result<Self> {
+    pub fn start(writer: Writer, registry: Arc<ProducerRegistry>) -> Result<Self> {
         let (tx, rx) = flume::bounded::<Cmd>(64);
         thread::Builder::new()
             .name("ce-ingestion".into())
             .spawn(move || writer_loop(writer, rx))
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
-        Ok(Self { tx })
+        Ok(Self { tx, registry })
     }
 
     /// Ingest a batch into `raw_<system>_<entity>`. Returns the row count.
@@ -184,6 +212,51 @@ impl IngestionHandle {
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?
     }
 
+    /// Append feature rows to `feature_store` and refresh the wide pivot views
+    /// for every distinct family touched. Returns the row count written.
+    ///
+    /// # Errors
+    /// Propagates validation/storage errors from the writer.
+    pub async fn write_features(&self, rows: Vec<FeatureRow>) -> Result<usize> {
+        let (rtx, rrx) = flume::bounded(1);
+        self.tx
+            .send(Cmd::WriteFeatures { rows, reply: rtx })
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
+        rrx.recv_async()
+            .await
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?
+    }
+
+    /// Append semantic-catalog rows. Returns the row count written.
+    ///
+    /// # Errors
+    /// Propagates validation/storage errors from the writer.
+    pub async fn write_catalog(&self, rows: Vec<CatalogRow>) -> Result<usize> {
+        let (rtx, rrx) = flume::bounded(1);
+        self.tx
+            .send(Cmd::WriteCatalog { rows, reply: rtx })
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
+        rrx.recv_async()
+            .await
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?
+    }
+
+    /// Run the producer registered under `id` at `as_of` and persist its output
+    /// to `feature_store`. The producer reads on the caller's async task; only
+    /// the write crosses into the single writer thread (spec 20 I1).
+    ///
+    /// # Errors
+    /// - [`Error::InvalidInput`] if `id` is not a registered producer.
+    /// - Propagates producer read/compute and writer storage errors.
+    pub async fn run_producer(&self, id: &str, as_of: &str) -> Result<usize> {
+        let producer = self
+            .registry
+            .get(id)
+            .ok_or_else(|| Error::InvalidInput(format!("unknown producer {id:?}")))?;
+        let output = producer.run(as_of).await?;
+        self.write_features(output.rows).await
+    }
+
     /// Signal the writer thread to stop. Best-effort.
     pub fn shutdown(&self) {
         let _ = self.tx.send(Cmd::Shutdown);
@@ -240,9 +313,38 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>) {
                 let res = writer.export_snapshot_parquet(&snapshot_id, &dest);
                 let _ = reply.send(res);
             }
+            Cmd::WriteFeatures { rows, reply } => {
+                let res = write_features_and_refresh(&writer, &rows);
+                let _ = reply.send(res);
+            }
+            Cmd::WriteCatalog { rows, reply } => {
+                let res = writer.write_catalog_rows(&rows);
+                let _ = reply.send(res);
+            }
             Cmd::Shutdown => break,
         }
     }
+}
+
+/// Append feature rows and refresh the wide pivot view for every distinct
+/// family touched. The view is rebuilt with the **union** of the current batch's
+/// short names and those already stored for the family, so a partial batch never
+/// drops previously-written columns (specs/10 §2). A newer `as_of_ts` supersedes
+/// via the view (never overwrites).
+fn write_features_and_refresh(writer: &Writer, rows: &[FeatureRow]) -> Result<usize> {
+    let n = writer.write_feature_rows(rows)?;
+    let mut families: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for r in rows {
+        let (family, short) = consumer_engine_core::split_feature_name(&r.feature_name)?;
+        families.entry(family).or_default().insert(short);
+    }
+    for (family, batch_shorts) in families {
+        // Union with the short names already in `feature_store` for this family.
+        let mut all: BTreeSet<String> = writer.feature_short_names(&family)?.into_iter().collect();
+        all.extend(batch_shorts);
+        writer.refresh_feature_wide_view(&family, &all.into_iter().collect::<Vec<_>>())?;
+    }
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -272,7 +374,8 @@ mod tests {
             )
             .expect("ingest");
 
-        let handle = IngestionHandle::start(writer).expect("start handle");
+        let handle = IngestionHandle::start(writer, Arc::new(ProducerRegistry::new()))
+            .expect("start handle");
         let spec = SnapshotSpec {
             snapshot_id: uuid::Uuid::now_v7().to_string(),
             campaign_id: "c1".into(),
@@ -322,6 +425,130 @@ mod tests {
             "hit_reason must be non-null on every row"
         );
         assert_eq!(row.2, rows as i64, "features must be non-null on every row");
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_run_producer_writes_feature_store_and_view() {
+        use consumer_engine_core::Dataset;
+        use consumer_engine_execution::{Reader, ReaderLimits};
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        writer
+            .ingest_raw(
+                "erp",
+                "orders",
+                &["user_id".into(), "ts".into()],
+                &[
+                    vec![Some("reg".into()), Some("2025-01-01T00:00:00Z".into())],
+                    vec![Some("reg".into()), Some("2025-01-08T00:00:00Z".into())],
+                ],
+            )
+            .expect("ingest");
+
+        let read_conn = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let attach_sql = consumer_engine_storage::read_only_attach_sql(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        );
+        let reader = Reader::start(read_conn, attach_sql, ReaderLimits::default()).expect("reader");
+
+        let registry = Arc::new(ProducerRegistry::new());
+        registry
+            .register(Arc::new(CadenceRegularityProducer::new(
+                reader.clone(),
+                Dataset {
+                    system: "erp".into(),
+                    entity: "orders".into(),
+                },
+            )))
+            .expect("register producer");
+
+        let handle = IngestionHandle::start(writer, registry).expect("start handle");
+        let n = handle
+            .run_producer("cadence_sql", "2025-12-31T00:00:00Z")
+            .await
+            .expect("run");
+        assert_eq!(n, 1, "one feature row for the single regular buyer");
+
+        // The wide view must be readable via a fresh read-only attach (the
+        // load-bearing cross-alias resolution the compiler relies on).
+        let r = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let mut stmt = r
+            .prepare("SELECT count(*) FROM dro.feature_wide_cadence")
+            .expect("prepare wide view");
+        let count: i64 = stmt.query_row([], |row| row.get(0)).expect("count");
+        assert_eq!(count, 1, "wide view must expose the produced feature");
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_keep_existing_columns_on_partial_refresh() {
+        // Regression: a second batch emitting a *subset* of a family's features
+        // must NOT drop the previously-written columns from the wide view
+        // (specs/10 §2 — the wide pivot must cover all stored features).
+        use consumer_engine_core::FeatureRow;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        let handle = IngestionHandle::start(writer, Arc::new(ProducerRegistry::new()))
+            .expect("start handle");
+
+        // Batch 1: cadence.regularity only.
+        handle
+            .write_features(vec![FeatureRow {
+                user_id: "u1".into(),
+                feature_name: "cadence.regularity".into(),
+                num_value: 0.9,
+                as_of_ts: "2025-01-01T00:00:00Z".into(),
+                producer_id: "cadence_sql".into(),
+            }])
+            .await
+            .expect("write batch 1");
+
+        // Batch 2: cadence.volume only — a subset that omits regularity.
+        handle
+            .write_features(vec![FeatureRow {
+                user_id: "u1".into(),
+                feature_name: "cadence.volume".into(),
+                num_value: 5.0,
+                as_of_ts: "2025-01-01T00:00:00Z".into(),
+                producer_id: "cadence_sql".into(),
+            }])
+            .await
+            .expect("write batch 2");
+
+        // The wide view must still expose BOTH columns (union with stored names).
+        let r = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let mut stmt = r
+            .prepare("SELECT regularity, volume FROM dro.feature_wide_cadence")
+            .expect("both columns must survive the partial refresh");
+        let row: (Option<f64>, Option<f64>) = stmt
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query");
+        assert_eq!(
+            row.0,
+            Some(0.9),
+            "regularity (batch 1) must survive batch 2's partial refresh"
+        );
+        assert_eq!(row.1, Some(5.0), "volume (batch 2) must be present");
 
         handle.shutdown();
     }

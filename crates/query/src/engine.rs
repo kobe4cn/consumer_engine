@@ -4,15 +4,13 @@
 //! here we only do the materialise work and snapshot metadata read.
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicI64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use consumer_engine_core::{
-    BoxError, Error, Freshness, GuardrailConfig, SnapshotSpec, WRITE_CATALOG_ALIAS,
+    BoxError, Error, Freshness, FreshnessRegistry, GuardrailConfig, SnapshotSpec,
+    WRITE_CATALOG_ALIAS,
 };
 use consumer_engine_execution::{QueryResult, Reader, RowCells};
 use consumer_engine_ingestion::IngestionHandle;
@@ -33,7 +31,7 @@ pub struct QueryEngine {
     ingestion: IngestionHandle,
     guardrails: GuardrailConfig,
     inflight: Arc<Semaphore>,
-    last_ingest_epoch: Arc<AtomicI64>,
+    freshness: Arc<FreshnessRegistry>,
 }
 
 impl std::fmt::Debug for QueryEngine {
@@ -60,15 +58,15 @@ pub struct SyncResult {
 }
 
 impl QueryEngine {
-    /// Construct a query engine over `reader` with `guardrails`. The
-    /// `last_ingest_epoch` clock drives the freshness label. `ingestion` is the
+    /// Construct a query engine over `reader` with `guardrails`. `freshness`
+    /// drives the graded per-source freshness label (D5); `ingestion` is the
     /// single writer handle used by [`Self::materialize`].
     #[must_use]
     pub fn new(
         reader: Reader,
         ingestion: IngestionHandle,
         guardrails: GuardrailConfig,
-        last_ingest_epoch: Arc<AtomicI64>,
+        freshness: Arc<FreshnessRegistry>,
     ) -> Self {
         let permits = guardrails.threads.max(1);
         Self {
@@ -76,7 +74,7 @@ impl QueryEngine {
             ingestion,
             guardrails,
             inflight: Arc::new(Semaphore::new(permits)),
-            last_ingest_epoch,
+            freshness,
         }
     }
 
@@ -168,12 +166,12 @@ impl QueryEngine {
             });
         }
 
-        let lag = now_epoch() - self.last_ingest_epoch.load(Ordering::Relaxed);
+        let freshness = self.freshness.worst(&compiled.sources, now_epoch());
         Ok(SyncResult {
             columns,
             count: rows.len() as u64,
             rows,
-            freshness: Freshness::batch(lag),
+            freshness,
             query_id: format!("q_{}", uuid::Uuid::now_v7()),
         })
     }
@@ -290,9 +288,9 @@ fn now_epoch() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicI64};
+    use std::sync::Arc;
 
-    use consumer_engine_core::GuardrailConfig;
+    use consumer_engine_core::{FreshnessRegistry, GuardrailConfig};
     use consumer_engine_execution::{Reader, ReaderLimits};
 
     use super::*;
@@ -318,7 +316,11 @@ mod tests {
             )
             .expect("ingest");
 
-        let ingestion = consumer_engine_ingestion::IngestionHandle::start(writer).expect("start");
+        let ingestion = consumer_engine_ingestion::IngestionHandle::start(
+            writer,
+            Arc::new(consumer_engine_ingestion::ProducerRegistry::new()),
+        )
+        .expect("start");
         let read_conn = consumer_engine_storage::open_reader(
             &tmp.path().join("cat.db"),
             &tmp.path().join("data"),
@@ -334,7 +336,7 @@ mod tests {
             reader,
             ingestion.clone(),
             GuardrailConfig::default(),
-            Arc::new(AtomicI64::new(0)),
+            Arc::new(FreshnessRegistry::new()),
         );
 
         let q = crate::parse::parse(serde_json::json!({
@@ -361,6 +363,95 @@ mod tests {
         assert_eq!(meta.snapshot_id, bare);
         assert_eq!(meta.campaign_id, "c1");
         assert!(meta.row_count > 0, "row count must be > 0");
+
+        ingestion.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_report_worst_source_freshness() {
+        use consumer_engine_core::SourceType;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = consumer_engine_storage::Writer::attach(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("attach");
+        // Two sources: a stale batch source (orders) and a fresh cdc source
+        // (events).
+        writer
+            .ingest_raw(
+                "erp",
+                "orders",
+                &["user_id".into(), "sku".into()],
+                &[vec![Some("u1".into()), Some("A".into())]],
+            )
+            .expect("ingest orders");
+        writer
+            .ingest_raw(
+                "erp",
+                "events",
+                &["user_id".into(), "ts".into()],
+                &[vec![
+                    Some("u1".into()),
+                    Some(chrono::Utc::now().to_rfc3339()),
+                ]],
+            )
+            .expect("ingest events");
+
+        let ingestion = consumer_engine_ingestion::IngestionHandle::start(
+            writer,
+            Arc::new(consumer_engine_ingestion::ProducerRegistry::new()),
+        )
+        .expect("start");
+        let read_conn = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let attach_sql = consumer_engine_storage::read_only_attach_sql(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        );
+        let reader = Reader::start(read_conn, attach_sql, ReaderLimits::default()).expect("reader");
+
+        let freshness = Arc::new(FreshnessRegistry::new());
+        let base = now_epoch();
+        // Batch source is 100s staler than the cdc source.
+        freshness
+            .set("erp", "orders", SourceType::Batch, base - 100)
+            .expect("set orders");
+        freshness
+            .set("erp", "events", SourceType::Cdc, base)
+            .expect("set events");
+
+        let engine = QueryEngine::new(
+            reader,
+            ingestion.clone(),
+            GuardrailConfig::default(),
+            Arc::clone(&freshness),
+        );
+
+        // A query touching both sources (orders base intersect events).
+        let q = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"},
+            "key": "user_id",
+            "ops": [
+                {"kind":"setOp","op":"intersect",
+                 "other":{"source":{"system":"erp","entity":"events"},"key":"user_id","ops":[]}}
+            ]
+        }))
+        .expect("parse");
+        let res = engine.run_sync(&q).await.expect("run");
+        assert_eq!(
+            res.freshness.worst_source, "batch",
+            "the stale batch source must be reported as worst (graded freshness, D5)"
+        );
+        assert!(
+            res.freshness.lag_seconds >= 100,
+            "batch lag must reflect the stale epoch: {}",
+            res.freshness.lag_seconds
+        );
 
         ingestion.shutdown();
     }

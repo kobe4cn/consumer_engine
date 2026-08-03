@@ -16,8 +16,8 @@
 use std::path::Path;
 
 use consumer_engine_core::{
-    BoxError, Error, READ_ONLY_CATALOG_ALIAS, Result, SnapshotSpec, WRITE_CATALOG_ALIAS,
-    validate_ident,
+    BoxError, CatalogRow, Error, FeatureRow, READ_ONLY_CATALOG_ALIAS, Result, SnapshotSpec,
+    WRITE_CATALOG_ALIAS, validate_feature_name, validate_ident,
 };
 use duckdb::{Connection, types::Value};
 use fs2::FileExt;
@@ -96,6 +96,212 @@ impl Writer {
             conn,
             _lock: lock_file,
         })
+    }
+
+    /// Create the `feature_store` table if absent. No PRIMARY KEY — DuckLake
+    /// rejects constraints (`specs/10`, `specs/20 §4`); the store is append-only
+    /// by `as_of_ts` (a newer value supersedes, never overwrites).
+    pub fn ensure_feature_store_table(&self) -> Result<()> {
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.feature_store (user_id VARCHAR, \
+             feature_name VARCHAR, num_value DOUBLE, as_of_ts TIMESTAMPTZ, producer_id VARCHAR)"
+        );
+        self.conn
+            .execute_batch(&sql)
+            .map_err(|e| Error::Storage(BoxError::from(e)))
+    }
+
+    /// Create the `semantic_catalog` table if absent. M3 uses a variable-length
+    /// `FLOAT[]` embedding so brute-force cosine works without a fixed-size HNSW
+    /// index; a phase-2 migration to fixed `FLOAT[dim]` + HNSW is flagged in
+    /// `specs/93`.
+    pub fn ensure_semantic_catalog_table(&self) -> Result<()> {
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.semantic_catalog (entity_type \
+             VARCHAR, system VARCHAR, table_name VARCHAR, column_name VARCHAR, semantic_type \
+             VARCHAR, data_type VARCHAR, description VARCHAR, pii_flag BOOLEAN, sample_values \
+             JSON, embedding FLOAT[])"
+        );
+        self.conn
+            .execute_batch(&sql)
+            .map_err(|e| Error::Storage(BoxError::from(e)))
+    }
+
+    /// Append feature rows to `feature_store`. Append-only: a newer `as_of_ts`
+    /// supersedes via the wide view, never overwrites (I4). Validates each
+    /// `feature_name`/`producer_id` at the boundary. Returns rows inserted.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidInput`] on a bad feature name/producer id.
+    /// - [`Error::Storage`] on insert failure.
+    pub fn write_feature_rows(&self, rows: &[FeatureRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        for r in rows {
+            validate_feature_name(&r.feature_name)
+                .map_err(|e| Error::InvalidInput(format!("feature_name: {e}")))?;
+            validate_feature_name(&r.producer_id)
+                .map_err(|e| Error::InvalidInput(format!("producer_id: {e}")))?;
+        }
+        self.ensure_feature_store_table()?;
+        let insert =
+            format!("INSERT INTO {WRITE_CATALOG_ALIAS}.feature_store VALUES (?, ?, ?, ?, ?)");
+        let mut stmt = self
+            .conn
+            .prepare(&insert)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let mut written = 0usize;
+        for r in rows {
+            written += stmt
+                .execute(duckdb::params![
+                    r.user_id,
+                    r.feature_name,
+                    r.num_value,
+                    r.as_of_ts,
+                    r.producer_id
+                ])
+                .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        }
+        Ok(written)
+    }
+
+    /// Append catalog rows to `semantic_catalog`. The embedding is written via a
+    /// `list_value(?, ?, …)` constructor with one scalar placeholder per
+    /// dimension (DuckDB's Rust binding cannot bind a `List` parameter directly,
+    /// so each float is bound individually). All rows must share the same
+    /// embedding dimension. Returns rows inserted.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidInput`] if the rows' embedding dimensions disagree.
+    /// - [`Error::Storage`] on insert failure.
+    pub fn write_catalog_rows(&self, rows: &[CatalogRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_semantic_catalog_table()?;
+        let dim = rows[0].embedding.len();
+        for r in rows {
+            if r.embedding.len() != dim {
+                return Err(Error::InvalidInput(format!(
+                    "catalog embedding dimension mismatch: expected {dim}, got {}",
+                    r.embedding.len()
+                )));
+            }
+        }
+        let emb_expr = if dim == 0 {
+            "list_value()".to_string()
+        } else {
+            format!("list_value({})", vec!["?"; dim].join(", "))
+        };
+        let insert = format!(
+            "INSERT INTO {WRITE_CATALOG_ALIAS}.semantic_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?, \
+             CAST(? AS JSON), {emb_expr})"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&insert)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let mut written = 0usize;
+        for r in rows {
+            let sample = serde_json::to_string(&r.sample_values)
+                .map_err(|e| Error::Storage(BoxError::from(e)))?;
+            let mut params: Vec<Value> = vec![
+                Value::Text(r.entity_type.clone()),
+                Value::Text(r.system.clone()),
+                Value::Text(r.table_name.clone()),
+                r.column_name
+                    .clone()
+                    .map(Value::Text)
+                    .unwrap_or(Value::Null),
+                Value::Text(r.semantic_type.as_str().to_string()),
+                Value::Text(r.data_type.clone()),
+                Value::Text(r.description.clone()),
+                Value::Boolean(r.pii_flag),
+                Value::Text(sample),
+            ];
+            for f in &r.embedding {
+                params.push(Value::Float(*f));
+            }
+            written += stmt
+                .execute(duckdb::params_from_iter(params.iter()))
+                .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        }
+        Ok(written)
+    }
+
+    /// Read the distinct feature short names already stored for `family`
+    /// (`feature_name` values `family.<short>`). Used by the ingestion writer to
+    /// rebuild a wide view that unions the current batch with everything
+    /// previously written (so a partial batch never drops columns from the
+    /// view — `specs/10 §2`). `family` is validated; the prefix is bound as a
+    /// parameter and matched with `starts_with` (no LIKE wildcard pitfalls).
+    ///
+    /// # Errors
+    /// - [`Error::InvalidInput`] on a bad `family`.
+    /// - [`Error::Storage`] on read failure.
+    pub fn feature_short_names(&self, family: &str) -> Result<Vec<String>> {
+        validate_ident(family)?;
+        self.ensure_feature_store_table()?;
+        let prefix = format!("{family}.");
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT DISTINCT feature_name FROM {WRITE_CATALOG_ALIAS}.feature_store WHERE \
+                 starts_with(feature_name, ?)"
+            ))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let rows = stmt
+            .query_map([&prefix], |r| r.get::<_, String>(0))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let mut shorts: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for name in rows {
+            let name = name.map_err(|e| Error::Storage(BoxError::from(e)))?;
+            if let Some((_, short)) = name.split_once('.') {
+                shorts.insert(short.to_string());
+            }
+        }
+        Ok(shorts.into_iter().collect())
+    }
+
+    /// Create or replace the wide pivot view `feature_wide_{family}` with one
+    /// `arg_max(num_value, as_of_ts)` column per short name (latest value wins
+    /// by `as_of_ts`). `family` and each short name are validated identifiers
+    /// (interpolated into the view name/columns — defense-in-depth).
+    ///
+    /// # Errors
+    /// - [`Error::InvalidInput`] on a bad `family`/short name.
+    /// - [`Error::Storage`] on view failure.
+    pub fn refresh_feature_wide_view(
+        &self,
+        family: &str,
+        feature_short_names: &[String],
+    ) -> Result<()> {
+        validate_ident(family)?;
+        if feature_short_names.is_empty() {
+            return Ok(());
+        }
+        self.ensure_feature_store_table()?;
+        let mut cols = Vec::with_capacity(feature_short_names.len() + 1);
+        cols.push("user_id".to_string());
+        for short in feature_short_names {
+            validate_ident(short)?;
+            // Constant string literal: validated identifier parts only, so the
+            // FILTER literal cannot inject (no quotes/semicolons possible).
+            cols.push(format!(
+                "arg_max(num_value, as_of_ts) FILTER (WHERE feature_name = '{family}.{short}') AS \
+                 {short}"
+            ));
+        }
+        let select = cols.join(", ");
+        let sql = format!(
+            "CREATE OR REPLACE VIEW {WRITE_CATALOG_ALIAS}.feature_wide_{family} AS SELECT \
+             {select} FROM {WRITE_CATALOG_ALIAS}.feature_store WHERE feature_name LIKE \
+             '{family}.%' GROUP BY user_id"
+        );
+        self.conn
+            .execute_batch(&sql)
+            .map_err(|e| Error::Storage(BoxError::from(e)))
     }
 
     /// Create `raw_<system>_<entity>` with the given VARCHAR columns if absent,
@@ -364,5 +570,115 @@ mod tests {
             .expect("prepare");
         let n: i64 = stmt.query_row([], |row| row.get(0)).expect("count");
         assert_eq!(n, 2);
+    }
+
+    fn feature_row(user: &str, value: f64, as_of: &str) -> consumer_engine_core::FeatureRow {
+        consumer_engine_core::FeatureRow {
+            user_id: user.into(),
+            feature_name: "cadence.regularity".into(),
+            num_value: value,
+            as_of_ts: as_of.into(),
+            producer_id: "cadence_sql".into(),
+        }
+    }
+
+    #[test]
+    fn test_should_write_and_read_feature_store() {
+        let (_tmp, w) = tmp_writer();
+        let rows = vec![
+            feature_row("u1", 0.9, "2025-01-01T00:00:00Z"),
+            feature_row("u2", 0.2, "2025-01-01T00:00:00Z"),
+        ];
+        let n = w.write_feature_rows(&rows).expect("write features");
+        assert_eq!(n, 2);
+        let count: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM dl.feature_store", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_should_reject_bad_feature_name() {
+        let (_tmp, w) = tmp_writer();
+        let mut r = feature_row("u1", 0.9, "2025-01-01T00:00:00Z");
+        r.feature_name = "cadence; DROP".into();
+        assert!(matches!(
+            w.write_feature_rows(&[r]),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn test_should_refresh_feature_wide_view() {
+        let (_tmp, w) = tmp_writer();
+        // Two users; a newer as_of_ts supersedes for u1.
+        let rows = vec![
+            feature_row("u1", 0.5, "2025-01-01T00:00:00Z"),
+            feature_row("u1", 0.9, "2025-01-02T00:00:00Z"),
+            feature_row("u2", 0.2, "2025-01-01T00:00:00Z"),
+        ];
+        w.write_feature_rows(&rows).expect("write");
+        w.refresh_feature_wide_view("cadence", &["regularity".into()])
+            .expect("refresh view");
+        // Latest value wins for u1 (0.9).
+        let mut stmt = w
+            .conn
+            .prepare("SELECT user_id, regularity FROM dl.feature_wide_cadence ORDER BY user_id")
+            .expect("prepare");
+        let rows: Vec<(String, f64)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "u1");
+        assert!((rows[0].1 - 0.9).abs() < 1e-9, "latest value must win");
+        assert!((rows[1].1 - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_should_reader_resolves_writer_wide_view() {
+        // The load-bearing cross-alias test: a view created on the writer (`dl`)
+        // must resolve when read via a fresh `open_reader` under `dro.*`.
+        let (tmp, w) = tmp_writer();
+        let rows = vec![
+            feature_row("u1", 0.9, "2025-01-01T00:00:00Z"),
+            feature_row("u2", 0.2, "2025-01-01T00:00:00Z"),
+        ];
+        w.write_feature_rows(&rows).expect("write");
+        w.refresh_feature_wide_view("cadence", &["regularity".into()])
+            .expect("refresh view");
+        let r =
+            open_reader(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("read attach");
+        let mut stmt = r
+            .prepare("SELECT count(*) FROM dro.feature_wide_cadence")
+            .expect("prepare");
+        let n: i64 = stmt.query_row([], |row| row.get(0)).expect("count");
+        assert_eq!(n, 2, "reader must resolve the writer-created wide view");
+    }
+
+    #[test]
+    fn test_should_write_catalog_rows() {
+        let (_tmp, w) = tmp_writer();
+        let row = consumer_engine_core::CatalogRow {
+            entity_type: "column".into(),
+            system: "erp".into(),
+            table_name: "orders".into(),
+            column_name: Some("user_id".into()),
+            semantic_type: consumer_engine_core::SemanticType::Identifier,
+            data_type: "VARCHAR".into(),
+            description: "user id".into(),
+            pii_flag: false,
+            sample_values: serde_json::json!(["u1", "u2"]),
+            embedding: vec![0.1, 0.2, 0.3],
+        };
+        let n = w.write_catalog_rows(&[row]).expect("write catalog");
+        assert_eq!(n, 1);
+        let count: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM dl.semantic_catalog", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1);
     }
 }

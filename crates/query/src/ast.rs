@@ -6,17 +6,10 @@
 //! `Lapsed`, `SetOp`. `Exclude` and the F/J/S/P variants are forward-contract
 //! stubs the parser/validator rejects in M1 with a clear "not supported" error.
 
+// Re-export the shared `Dataset` from the dependency root (DRY: it is the unit
+// both the compiler and the freshness registry read over; spec 10 §2).
+pub use consumer_engine_core::Dataset;
 use serde::{Deserialize, Serialize};
-
-/// A source table: compiles to `dro.raw_{system}_{entity}`.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Dataset {
-    /// Source system identifier (validated).
-    pub system: String,
-    /// Source entity (table) identifier (validated).
-    pub entity: String,
-}
 
 /// A segment query: a set of `key` values from `source`, narrowed by `ops`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -84,8 +77,22 @@ pub enum Op {
         /// Campaign id.
         campaign_id: String,
     },
-    /// Feature predicate (F) — phase T4.
-    Feature,
+    /// Feature predicate (F): a comparison against a computed feature value
+    /// in the wide pivot view `feature_wide_{family}`. The feature `name` is
+    /// namespaced `family.short` (e.g. `"cadence.regularity"`) so it maps to the
+    /// view `feature_wide_{family}` and column `{short}`. Only the numeric
+    /// comparison operators are permitted (no `in`/`like`), and `value` is a
+    /// number — validated in [`crate::parse`] and rendered with a bound
+    /// parameter in [`crate::compiler`].
+    #[serde(rename_all = "camelCase")]
+    Feature {
+        /// Namespaced feature name `family.short`.
+        name: String,
+        /// Comparison operator (only `eq`/`ne`/`lt`/`le`/`gt`/`ge`).
+        op: Cmp,
+        /// Comparison value (a JSON number, deserialised to `f64`).
+        value: f64,
+    },
     /// JIT derive (J) — phase T7a.
     Derive,
     /// Similarity / lookalike (S) — phase 2.

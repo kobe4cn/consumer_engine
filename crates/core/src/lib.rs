@@ -10,16 +10,22 @@
 
 pub mod catalog;
 pub mod config;
+mod dataset;
 mod error;
+mod feature;
 pub mod freshness;
 pub mod ident;
+pub mod semantic;
 pub mod snapshot;
 
 pub use catalog::{READ_ONLY_CATALOG_ALIAS, WRITE_CATALOG_ALIAS};
 pub use config::{EngineConfig, GuardrailConfig};
+pub use dataset::Dataset;
 pub use error::{Error, Result};
-pub use freshness::Freshness;
-pub use ident::validate_ident;
+pub use feature::{FeatureRow, split_feature_name};
+pub use freshness::{Freshness, FreshnessRegistry, SourceMeta, SourceType};
+pub use ident::{validate_feature_name, validate_ident};
+pub use semantic::{CatalogHit, CatalogRow, SemanticType};
 pub use snapshot::SnapshotSpec;
 
 /// Boxed, source-preserving error carrying crate, used to embed an upstream

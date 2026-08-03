@@ -7,16 +7,14 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
-use std::{
-    sync::{Arc, atomic::AtomicI64},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::Router;
-use consumer_engine_core::{BoxError, EngineConfig, Error, Result};
+use consumer_engine_core::{BoxError, Dataset, EngineConfig, Error, FreshnessRegistry, Result};
 use consumer_engine_execution::{Reader, ReaderLimits};
-use consumer_engine_ingestion::IngestionHandle;
+use consumer_engine_ingestion::{CadenceRegularityProducer, IngestionHandle, ProducerRegistry};
 use consumer_engine_ingress::{AppState, JobRegistry, router};
+use consumer_engine_semantic::{IntentRag, Profiler, StubEmbed, StubLlm};
 use consumer_engine_storage::{self as storage, Writer};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -28,7 +26,9 @@ pub struct Engine {
     ingestion: IngestionHandle,
     reader: Reader,
     #[allow(dead_code)]
-    last_ingest_epoch: Arc<AtomicI64>,
+    freshness: Arc<FreshnessRegistry>,
+    #[allow(dead_code)]
+    registry: Arc<ProducerRegistry>,
     compaction: JoinHandle<()>,
 }
 
@@ -53,6 +53,10 @@ impl Engine {
         // materialise (the writer creates it lazily too, but a startup init keeps
         // reads clean).
         writer.ensure_audience_snapshot_table()?;
+        // Initialise the Feature Store + semantic catalog tables at startup so a
+        // producer run / profile never races a lazy DDL (D9 / spec 13).
+        writer.ensure_feature_store_table()?;
+        writer.ensure_semantic_catalog_table()?;
         let read_conn = storage::open_reader(&config.catalog_path, &config.data_path)?;
         let attach_sql = storage::read_only_attach_sql(&config.catalog_path, &config.data_path);
         let limits = ReaderLimits {
@@ -60,9 +64,30 @@ impl Engine {
             threads: config.guardrails.threads,
         };
         let reader = Reader::start(read_conn, attach_sql, limits)?;
-        let ingestion = IngestionHandle::start(writer)?;
 
-        let last_ingest_epoch = Arc::new(AtomicI64::new(0));
+        // Graded per-source freshness registry (D5).
+        let freshness = Arc::new(FreshnessRegistry::new());
+
+        // Semantic layer (M3 stub clients: deterministic, no network).
+        let embed: Arc<dyn consumer_engine_semantic::EmbeddingModel> =
+            Arc::new(StubEmbed::default());
+        let llm: Arc<dyn consumer_engine_semantic::LlmClient> = Arc::new(StubLlm);
+        let profiler = Arc::new(Profiler::new(reader.clone(), llm, Arc::clone(&embed)));
+        let intent_rag = Arc::new(IntentRag::new(reader.clone(), Arc::clone(&embed)));
+
+        // Feature Store producers (D9). M3 wires the PRD demo cadence producer
+        // over `erp.orders`; producer wiring becomes config-driven in a later
+        // phase.
+        let registry = Arc::new(ProducerRegistry::new());
+        registry.register(Arc::new(CadenceRegularityProducer::new(
+            reader.clone(),
+            Dataset {
+                system: "erp".into(),
+                entity: "orders".into(),
+            },
+        )))?;
+
+        let ingestion = IngestionHandle::start(writer, Arc::clone(&registry))?;
         // M2 signing key: 32 bytes of OS randomness (AGENTS.md § Crypto forbids
         // thread_rng for secrets; getrandom is the OsRng-equivalent source).
         let mut signing_key = [0u8; 32];
@@ -71,7 +96,7 @@ impl Engine {
             reader.clone(),
             ingestion.clone(),
             config.guardrails.clone(),
-            Arc::clone(&last_ingest_epoch),
+            Arc::clone(&freshness),
         );
         let compaction = tokio::spawn(supervise_compaction(
             ingestion.clone(),
@@ -82,7 +107,9 @@ impl Engine {
         let state = AppState {
             ingestion: ingestion.clone(),
             query_engine,
-            last_ingest_epoch: Arc::clone(&last_ingest_epoch),
+            freshness: Arc::clone(&freshness),
+            profiler,
+            intent_rag,
             jobs: Arc::clone(&jobs),
             signing_key: Arc::new(signing_key),
         };
@@ -90,7 +117,8 @@ impl Engine {
         let engine = Engine {
             ingestion,
             reader,
-            last_ingest_epoch,
+            freshness,
+            registry,
             compaction,
         };
         Ok((router, engine))

@@ -58,12 +58,15 @@ large segment materialises to `audience_snapshot` (async job) with frozen
 features + hit_reason; `/audience/:id` returns a presigned Parquet URL; a
 delivery client pulls and decodes it.
 
-### M3 — Feature Store (F) + semantic layer (L0/L1)
+### M3 — Feature Store (F) + semantic layer (L0/L1) — ✅ CLOSED
 
 **Specs touched**: 13, 20 (producers). **Exit**: a SQL producer writes
 `cadence_regularity`; `Feature` predicate filters on it ("periodic buyers"
-example resolves); L0 profiles a new table and L1 retrieval returns bounded
-candidate columns to the agent. G5 (new table queryable < 30 min) holds.
+example resolves end-to-end: onboard → producer → `Feature` compile → query →
+materialise); L0 profiles a new table and L1 retrieval returns bounded
+candidate columns to the agent. G5 (new table queryable < 30 min) holds. Graded
+per-source freshness (`worstSource`) is reported on every query. All covered by
+`tests/e2e.rs` M3 exit tests + per-crate unit tests; full gate green.
 
 ### M4 — Closed suppression loop
 

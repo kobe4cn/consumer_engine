@@ -288,6 +288,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-trait"
+version = "0.1.91"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -485,6 +496,7 @@ name = "consumer_engine-core"
 version = "0.1.0"
 dependencies = [
  "config",
+ "dashmap",
  "once_cell",
  "regex",
  "serde",
@@ -509,11 +521,15 @@ dependencies = [
 name = "consumer_engine-ingestion"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "consumer_engine-core",
+ "consumer_engine-execution",
  "consumer_engine-storage",
+ "dashmap",
  "duckdb",
  "flume",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -525,10 +541,12 @@ name = "consumer_engine-ingress"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "consumer_engine-core",
  "consumer_engine-execution",
  "consumer_engine-ingestion",
  "consumer_engine-query",
+ "consumer_engine-semantic",
  "dashmap",
  "hmac",
  "serde",
@@ -560,6 +578,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "consumer_engine-semantic"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "consumer_engine-core",
+ "consumer_engine-execution",
+ "consumer_engine-storage",
+ "duckdb",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "consumer_engine-server"
 version = "0.1.0"
 dependencies = [
@@ -572,6 +607,7 @@ dependencies = [
  "consumer_engine-ingestion",
  "consumer_engine-ingress",
  "consumer_engine-query",
+ "consumer_engine-semantic",
  "consumer_engine-storage",
  "getrandom 0.3.4",
  "parquet",
@@ -591,6 +627,7 @@ dependencies = [
  "consumer_engine-core",
  "duckdb",
  "fs2",
+ "serde_json",
  "tempfile",
  "tracing",
 ]

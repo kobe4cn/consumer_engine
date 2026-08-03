@@ -27,6 +27,7 @@ depends on. File *types* (per AGENTS.md) are noted in the Type column.
 | 90 | [90-roadmap.md](./90-roadmap.md) | roadmap | Milestones M0–M5 (+ phase 2), exit criteria, calendar |
 | 91 | [91-impl-plan.md](./91-impl-plan.md) | impl-plan | Phase 0 (spikes) → Phase 6, dependency-ordered, effort |
 | t3 | [t3-materialize-plan.md](./t3-materialize-plan.md) | impl-plan (detail) | T3 materialise — Phase A done (`09cb979`); Phases B–H pending (expands 91 §6) |
+| t4 | [t4-feature-store-semantic-plan.md](./t4-feature-store-semantic-plan.md) | impl-plan (detail) | T4 Feature Store + semantic layer — Phase 4 detail (expands 91 §7; closes M3) |
 | 93 | [93-improvements-review.md](./93-improvements-review.md) | review | Deferred-findings backlog (impl skill appends here) |
 | 99 | [99-key-decisions.md](./99-key-decisions.md) | decisions | D1–D16, alternatives + why + reverse pointers |
 
