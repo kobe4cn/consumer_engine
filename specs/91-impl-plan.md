@@ -91,6 +91,10 @@ touched crates.
 
 ## 6. Phase 3 — materialised audiences + delivery pull (closes M2)
 
+> **Detailed plan:** [`t3-materialize-plan.md`](./t3-materialize-plan.md) (file-by-
+> file, 8 phases A–H). **Phase A done** (`09cb979`: catalog aliases +
+> `SnapshotSpec` + storage snapshot methods); resume from Phase B.
+
 | #   | Task | Spec | Effort |
 | --- | ---- | ---- | ------ |
 | 3.1 | Async job model: `/jobs`, `/jobs/:id`, Q2 materialise path | [12 §4](./12-query-engine.md), [21](./21-rest-api.md) | 2d |

@@ -26,6 +26,7 @@ depends on. File *types* (per AGENTS.md) are noted in the Type column.
 | 80 | [80-glossary.md](./80-glossary.md) | doc | Segment vs snapshot; B/F/J/S/P; producer; freshness; trust boundaries |
 | 90 | [90-roadmap.md](./90-roadmap.md) | roadmap | Milestones M0–M5 (+ phase 2), exit criteria, calendar |
 | 91 | [91-impl-plan.md](./91-impl-plan.md) | impl-plan | Phase 0 (spikes) → Phase 6, dependency-ordered, effort |
+| t3 | [t3-materialize-plan.md](./t3-materialize-plan.md) | impl-plan (detail) | T3 materialise — Phase A done (`09cb979`); Phases B–H pending (expands 91 §6) |
 | 93 | [93-improvements-review.md](./93-improvements-review.md) | review | Deferred-findings backlog (impl skill appends here) |
 | 99 | [99-key-decisions.md](./99-key-decisions.md) | decisions | D1–D16, alternatives + why + reverse pointers |
 
