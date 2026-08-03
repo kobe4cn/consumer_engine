@@ -13,9 +13,10 @@ use consumer_engine_execution::{QueryResult, Reader, RowCells};
 use tokio::sync::Semaphore;
 
 use crate::{
+    ast::SegmentQuery,
     compiler::{CompiledQuery, compile},
     error::{QueryError, Result},
-    guardrail::{Estimate, enforce},
+    guardrail::{Mode, Plan, enforce, explain_cost},
 };
 
 /// The query engine. Cheap to share via `Arc`.
@@ -77,17 +78,39 @@ impl QueryEngine {
         self.run_sync(&q).await
     }
 
-    /// Compile + best-effort estimate a plan (M1 always returns mode `Sync`;
-    /// EXPLAIN-based async promotion is deferred — see `specs/93`).
+    /// Compile + best-effort EXPLAIN estimate a plan, enforcing row budgets
+    /// **before execution** (AC#3). M1 promotes to [`Mode::Async`] when the
+    /// estimated rows exceed `sync_row_cap` (then `run_sync` rejects it).
     ///
     /// # Errors
     /// Propagates compile/guardrail errors.
-    pub async fn plan(&self, q: &crate::ast::SegmentQuery) -> Result<CompiledQuery> {
+    pub async fn plan(&self, q: &SegmentQuery) -> Result<Plan> {
+        let (plan, _compiled) = self.prepare(q).await?;
+        Ok(plan)
+    }
+
+    /// Compile, run the EXPLAIN pre-flight, enforce budgets, and choose a mode.
+    /// Returns the [`Plan`] and the [`CompiledQuery`] (for execution).
+    ///
+    /// # Errors
+    /// Propagates compile/guardrail errors.
+    async fn prepare(&self, q: &SegmentQuery) -> Result<(Plan, CompiledQuery)> {
         let compiled = compile(q)?;
-        // M1: no EXPLAIN estimate — unknown, so `enforce` passes; runtime guards
-        // (timeout, fetch cap) do the real work.
-        enforce(&Estimate::unknown(), &self.guardrails)?;
-        Ok(compiled)
+        let est = explain_cost(&self.reader, &compiled).await;
+        enforce(&est, &self.guardrails)?;
+        let mode = if est.est_rows > self.guardrails.sync_row_cap {
+            Mode::Async
+        } else {
+            Mode::Sync
+        };
+        Ok((
+            Plan {
+                mode,
+                est,
+                sources: compiled.sources.clone(),
+            },
+            compiled,
+        ))
     }
 
     /// Run a parsed segment query synchronously under all guardrails.
@@ -96,10 +119,8 @@ impl QueryEngine {
     /// [`QueryError::Guardrail`] on timeout or output-row cap;
     /// [`QueryError::TooLarge`] if the plan is async (not in M1);
     /// [`QueryError::Execution`] on reader failure.
-    pub async fn run_sync(&self, q: &crate::ast::SegmentQuery) -> Result<SyncResult> {
-        let compiled = self.plan(q).await?;
-
-        // Concurrency cap.
+    pub async fn run_sync(&self, q: &SegmentQuery) -> Result<SyncResult> {
+        // Concurrency cap (acquired before the EXPLAIN pre-flight + execute).
         let _permit = self
             .inflight
             .acquire()
@@ -107,6 +128,13 @@ impl QueryEngine {
             .map_err(|e| QueryError::Execution {
                 source: Error::Execution(BoxError::from(e)),
             })?;
+
+        // Pre-flight: compile + EXPLAIN + enforce budgets (AC#3: over-budget is
+        // rejected here, before the query executes).
+        let (plan, compiled) = self.prepare(q).await?;
+        if plan.mode == Mode::Async {
+            return Err(QueryError::TooLarge);
+        }
 
         // Statement timeout.
         let timeout = Duration::from_secs(self.guardrails.statement_timeout_secs);

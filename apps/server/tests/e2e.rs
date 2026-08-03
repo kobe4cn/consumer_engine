@@ -17,11 +17,17 @@ use serde_json::Value;
 /// outlive the test's requests — a test's HTTP traffic is bounded and the
 /// process exits when the test binary does.
 async fn spawn() -> String {
+    spawn_guardrails(consumer_engine_core::GuardrailConfig::default()).await
+}
+
+/// Like [`spawn`] but with custom guardrail budgets.
+async fn spawn_guardrails(guardrails: consumer_engine_core::GuardrailConfig) -> String {
     let tmp = tempfile::tempdir().expect("tmp");
     let cfg = EngineConfig {
         catalog_path: tmp.path().join("cat.db"),
         data_path: tmp.path().join("data"),
         compaction_interval_secs: 0, // disable periodic compaction in tests
+        guardrails,
         ..EngineConfig::default()
     };
     let (router, engine) = Engine::build(&cfg).expect("build engine");
@@ -114,6 +120,52 @@ async fn test_should_reject_invalid_dsl() {
         .await
         .expect("query");
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_should_reject_over_budget_query_pre_execution() {
+    // Tiny sync_row_cap: a query whose EXPLAIN estimate exceeds it is rejected
+    // BEFORE it executes (AC#3 pre-flight).
+    let base = spawn_guardrails(consumer_engine_core::GuardrailConfig {
+        sync_row_cap: 5,
+        ..consumer_engine_core::GuardrailConfig::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    // 200 rows (~50 distinct users) so EXPLAIN estimates well above 5.
+    let rows: Vec<serde_json::Value> = (0..200)
+        .map(|i| serde_json::json!([format!("u{}", i % 50)]))
+        .collect();
+    let onb = client
+        .post(format!("{base}/sources/onboard"))
+        .json(&serde_json::json!({
+            "system": "erp", "entity": "users",
+            "columns": ["user_id"], "rows": rows
+        }))
+        .send()
+        .await
+        .expect("onboard");
+    assert!(onb.status().is_success(), "onboard failed");
+
+    // DSL: distinct user_id (no filter) — EXPLAIN estimates tens/hundreds.
+    let resp = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({
+            "dsl": {
+                "source": {"system":"erp","entity":"users"},
+                "key": "user_id", "ops": []
+            }
+        }))
+        .send()
+        .await
+        .expect("query");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "over-budget query must be rejected pre-execution (AC#3): {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]

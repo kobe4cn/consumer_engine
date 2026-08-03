@@ -1,16 +1,21 @@
 //! Query guardrails.
 //!
-//! M1's hard DoS defenses are runtime guards enforced in
-//! [`crate::engine::QueryEngine::run_sync`]: a per-query `tokio::time::timeout`,
-//! an output row cap at fetch, an in-flight `Semaphore`, and DuckDB
-//! `memory_limit`/`threads` PRAGMAs set on the reader. [`enforce`] is the
-//! deterministic check over a cost [`Estimate`] (populated by a future
-//! EXPLAIN-based pre-flight; M1 estimates are unknown, so `enforce` passes and
-//! the runtime guards do the work — see `specs/93` for the EXPLAIN follow-up).
+//! Two layers: (1) [`explain_cost`] runs `EXPLAIN (FORMAT JSON)` pre-flight
+//! and [`enforce`] rejects row-budget overruns **before execution** (AC#3);
+//! (2) runtime guards in [`crate::engine::QueryEngine::run_sync`] — a
+//! `tokio::time::timeout`, an output-row fetch cap, an in-flight `Semaphore`,
+//! and DuckDB `memory_limit`/`threads` PRAGMAs. EXPLAIN does not expose
+//! bytes-scanned or memory, so those budgets remain runtime-only (DuckDB
+//! limitation; see `specs/93`).
 
 use consumer_engine_core::GuardrailConfig;
+use consumer_engine_execution::{QueryResult, Reader};
 
-use crate::error::{QueryError, Result};
+use crate::{
+    ast::Dataset,
+    compiler::CompiledQuery,
+    error::{QueryError, Result},
+};
 
 /// A best-effort cost estimate. Unknown fields are `0` (no signal).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -76,6 +81,89 @@ fn bytes_of(s: &str) -> u64 {
         _ => return u64::MAX,
     };
     n.saturating_mul(factor)
+}
+
+/// Execution mode chosen by [`QueryEngine::plan`](crate::engine::QueryEngine::plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Synchronous execution.
+    Sync,
+    /// Too large for sync — `run_sync` rejects it as [`QueryError::TooLarge`].
+    Async,
+}
+
+/// A compiled-and-costed plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    /// Chosen execution mode.
+    pub mode: Mode,
+    /// Best-effort cost estimate (rows from EXPLAIN; bytes/memory unknown).
+    pub est: Estimate,
+    /// Source datasets the query touches.
+    pub sources: Vec<Dataset>,
+}
+
+/// Best-effort EXPLAIN-based cost estimate (AC#3 pre-flight).
+///
+/// Runs `EXPLAIN (FORMAT JSON) <sql>` and parses the maximum `Estimated
+/// Cardinality` across plan nodes into `est_rows`. **Bytes-scanned and memory
+/// are not exposed by EXPLAIN** (DuckDB limitation), so those stay `0` and are
+/// bounded at runtime by the `memory_limit` PRAGMA + statement timeout. Any
+/// EXPLAIN/parse failure degrades to [`Estimate::unknown`] so the runtime
+/// guards still apply. EXPLAIN only plans (never executes), so it is not
+/// itself wrapped in a timeout.
+#[must_use]
+pub async fn explain_cost(reader: &Reader, compiled: &CompiledQuery) -> Estimate {
+    let sql = format!("EXPLAIN (FORMAT JSON) {}", compiled.sql);
+    let qr = match reader
+        .query_with_params(&sql, compiled.params.clone())
+        .await
+    {
+        Ok(qr) => qr,
+        Err(_) => return Estimate::unknown(),
+    };
+    match max_cardinality(&qr) {
+        Some(rows) => Estimate {
+            est_rows: rows,
+            ..Estimate::unknown()
+        },
+        None => Estimate::unknown(),
+    }
+}
+
+/// Extract the maximum `Estimated Cardinality` from an EXPLAIN JSON result.
+/// Returns `None` if no cardinality was found.
+fn max_cardinality(qr: &QueryResult) -> Option<u64> {
+    // EXPLAIN (FORMAT JSON) yields one row: ["physical_plan", "<json array>"].
+    let json_text = qr.rows.first()?.get(1)?.as_str()?;
+    let parsed: serde_json::Value = serde_json::from_str(json_text).ok()?;
+    let mut max: u64 = 0;
+    walk_cardinality(&parsed, &mut max);
+    (max > 0).then_some(max)
+}
+
+/// Recursively collect the largest `Estimated Cardinality` across plan nodes.
+fn walk_cardinality(v: &serde_json::Value, max: &mut u64) {
+    if let Some(arr) = v.as_array() {
+        for e in arr {
+            walk_cardinality(e, max);
+        }
+        return;
+    }
+    if let Some(card) = v
+        .get("extra_info")
+        .and_then(|e| e.get("Estimated Cardinality"))
+        .and_then(serde_json::Value::as_str)
+        && let Ok(n) = card.parse::<u64>()
+        && n > *max
+    {
+        *max = n;
+    }
+    if let Some(children) = v.get("children").and_then(serde_json::Value::as_array) {
+        for c in children {
+            walk_cardinality(c, max);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -168,11 +168,13 @@ pub struct ReaderLimits {
 
 impl Default for ReaderLimits {
     fn default() -> Self {
+        let threads = match std::thread::available_parallelism() {
+            Ok(n) => n.get(),
+            Err(_) => 8,
+        };
         Self {
             memory_limit: "8GB".to_string(),
-            threads: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(8),
+            threads,
         }
     }
 }

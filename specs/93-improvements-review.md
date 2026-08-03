@@ -145,18 +145,18 @@ Append-only.
 
 ### Deferred (Phase-2, tracked here so the code's "see specs/93" citations hold)
 
-- **P2-EXPLAIN — EXPLAIN-based cost pre-flight (AC#3 partial).** Issue #3 AC#3
-  literally requires an over-budget query to be rejected via EXPLAIN *before it
-  executes* ("never executes"). M1 ships **runtime** guards instead —
-  `statement_timeout`, an output-row fetch cap, and DuckDB `memory_limit`/
-  `threads` PRAGMAs — so a runaway query is bounded (it cannot run away) but it
-  is not rejected pre-execution. `enforce()` over a cost `Estimate` is
-  implemented and unit-tested, but `plan()` feeds `Estimate::unknown()` (EXPLAIN
-  parsing is intentionally deferred — DuckDB EXPLAIN text is not a stable
-  contract). `max_bytes_scanned` is configured but not enforced (no robust
-  DuckDB knob). Decision: this is a deliberate planner choice (runtime guards >
-  fragile EXPLAIN); revisit when a stable cost signal exists or AC#3's literal
-  "never executes" becomes a hard requirement.
+- **P2-EXPLAIN — EXPLAIN-based cost pre-flight (AC#3 — implemented for rows).**
+  Issue #3 AC#3 requires an over-budget query rejected *before it executes*.
+  **Implemented** (post-review): `guardrail::explain_cost` runs
+  `EXPLAIN (FORMAT JSON)` and parses the max `Estimated Cardinality` into
+  `est_rows`; `QueryEngine::prepare` enforces row budgets (`max_output_rows`,
+  and `sync_row_cap` → `Mode::Async` → `run_sync` rejects `TooLarge`) **before**
+  the query runs. Pinned by `test_should_reject_over_budget_query_pre_execution`.
+  **Remaining (DuckDB limitation, runtime-only):** EXPLAIN does not expose
+  bytes-scanned or memory, so `max_bytes_scanned` / `memory_limit` are not
+  pre-flighted — they are bounded at runtime by the `memory_limit` PRAGMA and
+  the statement timeout. `enforce()` over an `Estimate` remains unit-tested for
+  those fields for when a stable cost signal exists.
 - **P2-FRESH — per-source freshness grading (AC#4/I4 partial).** `CompiledQuery.sources`
   is collected but unused; M1 emits `Freshness::batch(lag)` from one global
   clock because only batch sources exist. Per-source grading needs source-type

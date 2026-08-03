@@ -14,10 +14,10 @@ use crate::Result;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EngineConfig {
-    /// Filesystem path to the DuckLake catalogue database (a DuckDB file for
-    /// single-process operation; Postgres DSN when multi-writer is needed).
+    /// Filesystem path to the `DuckLake` catalogue database (a `DuckDB` file for
+    /// single-process operation; `Postgres` DSN when multi-writer is needed).
     pub catalog_path: PathBuf,
-    /// Filesystem path (or object-storage prefix) where DuckLake writes Parquet.
+    /// Filesystem path (or object-storage prefix) where `DuckLake` writes `Parquet`.
     pub data_path: PathBuf,
     /// How often the compaction task runs, in seconds.
     #[serde(default = "default_compaction_interval")]
@@ -50,10 +50,10 @@ fn default_bind() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GuardrailConfig {
-    /// Per-query DuckDB memory limit, e.g. `"8GB"`.
+    /// Per-query `DuckDB` memory limit, e.g. `"8GB"`.
     #[serde(default = "default_memory_limit")]
     pub memory_limit: String,
-    /// DuckDB thread count (default: physical cores).
+    /// `DuckDB` thread count (default: physical cores).
     #[serde(default = "default_threads")]
     pub threads: usize,
     /// Hard per-statement timeout in seconds.
@@ -81,9 +81,10 @@ fn default_memory_limit() -> String {
 }
 
 fn default_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8)
+    match std::thread::available_parallelism() {
+        Ok(n) => n.get(),
+        Err(_) => 8,
+    }
 }
 
 const fn default_statement_timeout() -> u64 {
