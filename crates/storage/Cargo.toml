@@ -15,8 +15,6 @@ homepage.workspace = true
 consumer_engine-core.workspace = true
 duckdb.workspace = true
 tracing.workspace = true
-regex = "1"
-once_cell = "1"
 fs2 = "0.4"
 
 [dev-dependencies]

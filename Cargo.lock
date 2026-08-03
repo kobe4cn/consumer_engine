@@ -410,6 +410,8 @@ name = "consumer_engine-core"
 version = "0.1.0"
 dependencies = [
  "config",
+ "once_cell",
+ "regex",
  "serde",
  "serde_json",
  "thiserror",
@@ -447,8 +449,6 @@ dependencies = [
  "consumer_engine-core",
  "consumer_engine-execution",
  "consumer_engine-ingestion",
- "once_cell",
- "regex",
  "serde",
  "serde_json",
  "tokio",
@@ -481,8 +481,6 @@ dependencies = [
  "consumer_engine-core",
  "duckdb",
  "fs2",
- "once_cell",
- "regex",
  "tempfile",
  "tracing",
 ]

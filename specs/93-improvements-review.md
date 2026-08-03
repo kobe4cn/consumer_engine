@@ -63,3 +63,44 @@ Append-only.
   synchronous startup op outside the async runtime. `#[allow(clippy::
   disallowed_types)]` is scoped here with that justification.
 - **Fix shape**: none unless the lock mechanism changes; keep the allow + comment.
+
+## From the T1 code review (self-review pass)
+
+### P3-7 — Newtype domain primitives
+
+- **Citation**: `crates/ingress/src/lib.rs` (`system`/`entity`/`sql` as bare
+  `String`); `crates/storage/src/lib.rs`.
+- **Finding**: AGENTS.md § Type Design says "newtype every domain primitive";
+  `system`/`entity`/`sql` are raw `String`.
+- **Fix shape**: introduce `System`/`Entity` (private field + fallible
+  constructor reusing `core::validate_ident`) and a `Sql` bound type when the
+  DSL (T2) stabilises the query surface. Fold into T2.
+
+### P3-8 — `CatalogPaths` data clump
+
+- **Citation**: `(catalog_path, data_path)` repeated in `Writer::attach`,
+  `open_reader`, `read_only_attach_sql`, `Engine::build`.
+- **Finding**: the pair travels together — a `CatalogPaths` type wants to be
+  born.
+- **Fix shape**: introduce `CatalogPaths { catalog, data }` in `core`, pass it
+  through; do when a 3rd caller appears or during T2.
+
+### P3-9 — `AppState`/`EngineConfig` not `#[non_exhaustive]`
+
+- **Citation**: `crates/ingress/src/lib.rs` (`AppState`),
+  `crates/core/src/config.rs` (`EngineConfig`).
+- **Finding**: `Error` and `QueryResult` were made non-exhaustive in the review
+  pass, but `AppState` (constructed cross-crate by the server) and
+  `EngineConfig` (constructed via struct literal in tests) were left exhaustive
+  to avoid forcing constructors.
+- **Fix shape**: add `#[non_exhaustive]` plus a constructor (`AppState::new`,
+  `EngineConfig::new`/builder) when the surface is otherwise stable.
+
+### P3-10 — Acceptance #5 not demonstrated at engine level
+
+- **Citation**: `crates/storage/src/lib.rs` (`test_should_persist_across_restart`
+  is storage-level).
+- **Finding**: restart durability is proven at the storage layer (DuckLake
+  persists), not via a full `Engine::build → drop → Engine::build` cycle.
+- **Fix shape**: add an e2e restart test once the engine owns restorable state
+  (it currently owns none beyond DuckLake); low priority.

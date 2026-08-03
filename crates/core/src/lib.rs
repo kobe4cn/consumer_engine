@@ -10,11 +10,13 @@
 
 pub mod config;
 mod error;
-mod freshness;
+pub mod freshness;
+pub mod ident;
 
 pub use config::EngineConfig;
 pub use error::{Error, Result};
 pub use freshness::Freshness;
+pub use ident::validate_ident;
 
 /// Boxed, source-preserving error carrying crate, used to embed an upstream
 /// failure (e.g. a `duckdb` error) inside [`Error`] without `core` depending on

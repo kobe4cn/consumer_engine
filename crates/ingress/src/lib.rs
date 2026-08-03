@@ -3,9 +3,9 @@
 //! Exposes the T1 stand-in surface: `POST /sources/onboard` (batch ingest into
 //! `raw_*`), `POST /query` (a trivial read-only SQL-over-REST, replaced by the
 //! DSL in T2), and `GET /healthz`. Every value crossing this boundary is
-//! validated (identifiers against `^[a-zA-Z0-9_-]{1,64}$`, lengths capped) per
-//! `AGENTS.md` § Input Validation. Query results carry a graded `freshness`
-//! label (decision D5).
+//! validated — identifiers against `^[a-zA-Z0-9_-]{1,64}$`, and every external
+//! string capped in bytes (AGENTS.md § Input Validation) — and query results
+//! carry a graded `freshness` label (decision D5).
 
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
@@ -25,21 +25,22 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use consumer_engine_core::{Error, Freshness};
+use consumer_engine_core::{Error, Freshness, validate_ident};
 use consumer_engine_execution::{QueryResult, Reader};
 use consumer_engine_ingestion::IngestionHandle;
-use once_cell::sync::Lazy;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
-
-// Hardcoded valid pattern; failure is a programmer error, not external input.
-#[allow(clippy::expect_used)]
-static IDENT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").expect("valid static regex"));
 
 /// Maximum rows accepted in a single onboard request (defense against memory
 /// exhaustion — a full body-size limit also applies via the router layer).
 const MAX_ONBOARD_ROWS: usize = 200_000;
+
+/// Maximum size of a `POST /query` SQL string, in bytes. DoS bound on the T1
+/// stand-in query surface (the DSL in T2 replaces free SQL).
+const MAX_SQL_BYTES: usize = 8_192;
+
+/// Maximum size of a single onboarded cell value, in bytes. Per AGENTS.md § Input
+/// Validation, every external string needs an explicit byte cap.
+const MAX_CELL_BYTES: usize = 4_096;
 
 /// Shared state injected into handlers.
 #[derive(Clone, Debug)]
@@ -126,6 +127,14 @@ async fn onboard(
             ))
             .into());
         }
+        for cell in row.iter().flatten() {
+            if cell.len() > MAX_CELL_BYTES {
+                return Err(Error::InvalidInput(format!(
+                    "row {i} cell exceeds {MAX_CELL_BYTES} bytes"
+                ))
+                .into());
+            }
+        }
     }
     let n = state
         .ingestion
@@ -142,24 +151,16 @@ async fn query(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
-    let QueryResult { columns, rows } = state.reader.query(req.sql).await?;
+    if req.sql.len() > MAX_SQL_BYTES {
+        return Err(Error::InvalidInput(format!("sql exceeds {MAX_SQL_BYTES} bytes")).into());
+    }
+    let QueryResult { columns, rows, .. } = state.reader.query(req.sql).await?;
     let lag = now_epoch() - state.last_ingest_epoch.load(Ordering::Relaxed);
     Ok(Json(QueryResponse {
         columns,
         rows,
         freshness: Freshness::batch(lag),
     }))
-}
-
-/// Validate an identifier against the boundary allowlist.
-fn validate_ident(name: &str) -> Result<(), Error> {
-    if IDENT_RE.is_match(name) {
-        Ok(())
-    } else {
-        Err(Error::InvalidInput(format!(
-            "invalid identifier {name:?}: must match ^[a-zA-Z0-9_-]{{1,64}}$"
-        )))
-    }
 }
 
 /// Current epoch seconds. Falls back to 0 if the clock is before the epoch

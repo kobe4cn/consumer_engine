@@ -10,6 +10,7 @@ use crate::BoxError;
 
 /// The single error type surfaced by every engine crate.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// A failure in the storage layer (DuckLake attach, DDL, writes).
     #[error("storage failure: {0}")]
@@ -23,10 +24,6 @@ pub enum Error {
     #[error("ingestion failure: {0}")]
     Ingestion(#[source] BoxError),
 
-    /// A failure in the ingress layer (HTTP, serialization).
-    #[error("ingress failure: {0}")]
-    Ingress(#[source] BoxError),
-
     /// A second writer was attempted against an already-held catalog.
     #[error("writer already held: a single IngestionActor owns the catalog")]
     WriterAlreadyHeld,
@@ -34,10 +31,6 @@ pub enum Error {
     /// Caller-supplied input failed validation at the trust boundary.
     #[error("invalid input: {0}")]
     InvalidInput(String),
-
-    /// A query was rejected or failed at the engine level.
-    #[error("query failure: {0}")]
-    Query(String),
 }
 
 /// Convenience `Result` alias used throughout the engine.

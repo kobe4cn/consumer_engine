@@ -58,19 +58,22 @@ fn load_config() -> Result<EngineConfig> {
     }
 }
 
-/// Wait for Ctrl-C / SIGTERM.
+/// Wait for Ctrl-C / SIGTERM. Signal-install failures are logged, not fatal —
+/// the server still serves; it simply loses graceful shutdown on that signal.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("install ctrl-c handler");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "ctrl_c signal install failed");
+        }
     };
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install terminate handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => tracing::warn!(error = %e, "SIGTERM handler install failed"),
+        }
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();

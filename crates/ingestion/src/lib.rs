@@ -34,15 +34,6 @@ enum Cmd {
         /// Reply channel carrying the inserted row count.
         reply: flume::Sender<Result<usize>>,
     },
-    /// Compact one table.
-    Compact {
-        /// Source system.
-        system: String,
-        /// Source entity.
-        entity: String,
-        /// Reply channel.
-        reply: flume::Sender<Result<()>>,
-    },
     /// Compact every table this actor has ingested.
     CompactAll {
         /// Reply channel.
@@ -105,28 +96,6 @@ impl IngestionHandle {
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?
     }
 
-    /// Compact a single table.
-    ///
-    /// # Errors
-    /// Propagates storage errors from the writer.
-    pub async fn compact(
-        &self,
-        system: impl Into<String>,
-        entity: impl Into<String>,
-    ) -> Result<()> {
-        let (rtx, rrx) = flume::bounded(1);
-        self.tx
-            .send(Cmd::Compact {
-                system: system.into(),
-                entity: entity.into(),
-                reply: rtx,
-            })
-            .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
-        rrx.recv_async()
-            .await
-            .map_err(|e| Error::Ingestion(BoxError::from(e)))?
-    }
-
     /// Compact every table ingested so far (best-effort; last error wins).
     ///
     /// # Errors
@@ -164,13 +133,6 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>) {
                     known.insert((system, entity));
                 }
                 let _ = reply.send(res);
-            }
-            Cmd::Compact {
-                system,
-                entity,
-                reply,
-            } => {
-                let _ = reply.send(writer.compact(&system, &entity));
             }
             Cmd::CompactAll { reply } => {
                 let mut last: Result<()> = Ok(());

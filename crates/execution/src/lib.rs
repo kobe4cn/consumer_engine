@@ -24,6 +24,7 @@ pub type RowCells = Vec<serde_json::Value>;
 /// The result of a read query: column names plus rows (each a vector of JSON
 /// cells in column order).
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[non_exhaustive]
 pub struct QueryResult {
     /// Column names in order.
     pub columns: Vec<String>,
@@ -39,14 +40,6 @@ enum Cmd {
         sql: String,
         /// Reply channel for the result.
         reply: flume::Sender<Result<QueryResult>>,
-    },
-    /// Run a batch of statements (used by read-only probes). On a read-only
-    /// attach, write statements error.
-    ExecuteBatch {
-        /// SQL to execute.
-        sql: String,
-        /// Reply channel.
-        reply: flume::Sender<Result<()>>,
     },
     /// Stop the reader thread.
     Shutdown,
@@ -100,24 +93,6 @@ impl Reader {
             .map_err(|e| Error::Execution(BoxError::from(e)))?
     }
 
-    /// Run a batch of statements (e.g. a read-only probe). Write statements
-    /// error on a read-only attach.
-    ///
-    /// # Errors
-    /// Propagates [`Error::Execution`] on failure.
-    pub async fn execute_batch(&self, sql: impl Into<String>) -> Result<()> {
-        let (rtx, rrx) = flume::bounded(1);
-        self.tx
-            .send(Cmd::ExecuteBatch {
-                sql: sql.into(),
-                reply: rtx,
-            })
-            .map_err(|e| Error::Execution(BoxError::from(e)))?;
-        rrx.recv_async()
-            .await
-            .map_err(|e| Error::Execution(BoxError::from(e)))?
-    }
-
     /// Signal the reader thread to stop. Best-effort; the thread exits after
     /// draining in-flight commands.
     pub fn shutdown(&self) {
@@ -139,13 +114,6 @@ fn reader_loop(conn: Connection, rx: flume::Receiver<Cmd>, attach_sql: String) {
                     Ok(()) => run_query(&conn, &sql),
                     Err(e) => Err(e),
                 };
-                let _ = reply.send(res);
-            }
-            Cmd::ExecuteBatch { sql, reply } => {
-                let res = conn
-                    .execute_batch(&refresh)
-                    .and_then(|()| conn.execute_batch(&sql))
-                    .map_err(|e| Error::Execution(BoxError::from(e)));
                 let _ = reply.send(res);
             }
             Cmd::Shutdown => break,

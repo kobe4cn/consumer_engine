@@ -15,38 +15,17 @@
 
 use std::path::Path;
 
-use consumer_engine_core::{BoxError, Error, Result};
+use consumer_engine_core::{BoxError, Error, Result, validate_ident};
 use duckdb::Connection;
 use fs2::FileExt;
-use once_cell::sync::Lazy;
-use regex::Regex;
 
 /// The DuckLake catalog is always attached under this alias.
 const CATALOG_ALIAS: &str = "dl";
 
-// Hardcoded valid pattern; failure here is a programmer error, not external
-// input, so `expect` is acceptable at this one static-init site.
-#[allow(clippy::expect_used)]
-static IDENT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").expect("valid static regex"));
-
-/// Validate an identifier (table system/entity or column name) against the
-/// allowlist. Defense in depth: ingress also validates, but storage never
-/// trusts it.
-fn validate_ident(kind: &str, name: &str) -> Result<()> {
-    if IDENT_RE.is_match(name) {
-        Ok(())
-    } else {
-        Err(Error::InvalidInput(format!(
-            "invalid {kind} identifier {name:?}: must match ^[a-zA-Z0-9_-]{{1,64}}$"
-        )))
-    }
-}
-
 /// Build the qualified raw table name `raw_<system>_<entity>` (validated).
 fn raw_table_name(system: &str, entity: &str) -> Result<String> {
-    validate_ident("system", system)?;
-    validate_ident("entity", entity)?;
+    validate_ident(system)?;
+    validate_ident(entity)?;
     Ok(format!("raw_{system}_{entity}"))
 }
 
@@ -138,7 +117,7 @@ impl Writer {
             return Err(Error::InvalidInput("columns must not be empty".into()));
         }
         for c in columns {
-            validate_ident("column", c)?;
+            validate_ident(c)?;
         }
         let table = raw_table_name(system, entity)?;
         let cols_names = columns.join(", ");

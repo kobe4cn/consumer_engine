@@ -142,3 +142,36 @@ async fn test_should_reject_invalid_onboard_input() {
         .expect("req");
     assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn test_should_reject_oversized_sql() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    // 8193 bytes > MAX_SQL_BYTES (8192); the byte cap fires before the reader.
+    let oversize = format!("SELECT {}", "x".repeat(8_193));
+    let r = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({ "sql": oversize }))
+        .send()
+        .await
+        .expect("req");
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_should_reject_oversized_cell() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    // 4097 bytes > MAX_CELL_BYTES (4096).
+    let big = "y".repeat(4_097);
+    let r = client
+        .post(format!("{base}/sources/onboard"))
+        .json(&serde_json::json!({
+            "system": "erp", "entity": "users",
+            "columns": ["id"], "rows": [[big]]
+        }))
+        .send()
+        .await
+        .expect("req");
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+}
