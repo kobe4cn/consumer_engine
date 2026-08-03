@@ -177,12 +177,26 @@ fn main() {
     ingestion.shutdown();
 }
 
-/// Run `dsl` `n` times synchronously, recording each wall-clock latency.
+/// Run `dsl` `n` times synchronously, recording each wall-clock latency. A
+/// warm-up run precedes the samples so first-query cold costs (DuckLake attach,
+/// EXPLAIN, catalogue probes) don't skew P50/P99; every result must return at
+/// least one row or the sample is invalid (an empty segment is not a query
+/// latency worth calibrating).
 async fn sample(engine: &QueryEngine, dsl: &serde_json::Value, n: usize) -> Vec<Duration> {
+    // Warm-up: one run, assert a non-empty result.
+    let warm = engine.run(dsl.clone()).await.expect("warm-up query");
+    assert!(
+        !warm.rows.is_empty(),
+        "warm-up query returned no rows — the calibration would be meaningless"
+    );
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let t = Instant::now();
-        engine.run(dsl.clone()).await.expect("query");
+        let res = engine.run(dsl.clone()).await.expect("query");
+        assert!(
+            !res.rows.is_empty(),
+            "query returned no rows during sampling"
+        );
         out.push(t.elapsed());
     }
     out

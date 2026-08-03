@@ -388,4 +388,41 @@ mod tests {
             "marker must be present: {debug}"
         );
     }
+
+    #[test]
+    fn test_should_not_leak_token_in_formatted_log_output() {
+        // specs/70 I5: no auth token in *formatted log output*. Capture tracing
+        // output while an error is logged with the request's Debug and assert
+        // the token value is absent.
+        struct VecWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for VecWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = std::sync::Arc::clone(&buf);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || VecWriter(std::sync::Arc::clone(&writer)))
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let req = QueryRequest {
+            dsl: None,
+            sql: None,
+            approval_token: Some("tok-leak-check-9876".into()),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(request = ?req, "handler rejected request");
+        });
+        let out = String::from_utf8(buf.lock().expect("buf").clone()).expect("utf8");
+        assert!(
+            !out.contains("tok-leak-check-9876"),
+            "token must not appear in formatted log output: {out}"
+        );
+        assert!(out.contains("[REDACTED]"), "marker must appear: {out}");
+    }
 }

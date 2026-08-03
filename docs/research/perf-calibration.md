@@ -37,6 +37,23 @@ cargo run --release -p consumer_engine-query --example query_latency
   budgets**, not achieved latency — the harness is the calibration tool that
   shows the gap.
 
+## Compaction reality (issue #10 AC2)
+
+- DuckLake in this build **inlines small writes** (`ducklake_list_files` = 0)
+  and `ducklake_rewrite_data_files` is threshold-gated: it returned `0
+  processed` even with 3000 files and `ducklake_target_file_size` set — its
+  threshold could not be made to fire here.
+- The effective compaction is `ducklake_merge_adjacent_files` (3000 files → 1,
+  rows intact). The writer sets `ducklake_default_data_inlining_row_limit = 0`
+  + `ducklake_target_file_size = '1MB'` at attach so micro-batches accumulate
+  small files, and `Writer::compact` uses the merge procedure.
+- **Reading a table at a historical snapshot is not resolvable in this build**
+  (`AS OF` and `ducklake_scan` version signatures reject; similar to spike R3).
+  The time-travel proxy asserted is that compaction **retains the snapshot
+  history** (`ducklake_snapshots` count never shrinks) — old snapshots stay
+  readable-in-principle; the read-at-version API is tracked for a DuckLake
+  upgrade.
+
 ## What unlocks the targets (later phase, tracked)
 
 1. **Fix P1-1** (the re-attach workaround): a small read-connection pool that

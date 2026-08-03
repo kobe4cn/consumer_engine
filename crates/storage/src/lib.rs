@@ -671,18 +671,23 @@ mod tests {
         let files = |w: &Writer| -> i64 {
             w.conn
                 .query_row(
-                    "SELECT count(*) FROM ducklake_list_files('dl','raw_erp_evt')",
+                    &format!(
+                        "SELECT count(*) FROM ducklake_list_files('{WRITE_CATALOG_ALIAS}', \
+                         'raw_erp_evt')"
+                    ),
                     [],
                     |r| r.get(0),
                 )
-                .unwrap_or(-1)
+                .expect("list files")
         };
         let before = files(&w);
         let snapshots_before: i64 = w
             .conn
-            .query_row("SELECT count(*) FROM ducklake_snapshots('dl')", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                &format!("SELECT count(*) FROM ducklake_snapshots('{WRITE_CATALOG_ALIAS}')"),
+                [],
+                |r| r.get(0),
+            )
             .expect("snapshots");
         assert!(
             before >= 20,
@@ -703,12 +708,18 @@ mod tests {
             .expect("rows");
         assert_eq!(rows, 1000, "all 20*50 rows must survive compaction");
         // The snapshot history (time-travel window) is retained: compaction
-        // must not expire the pre-merge snapshots.
+        // must not expire the pre-merge snapshots. (Reading a table AT a
+        // historical snapshot is not resolvable in this DuckLake build — the
+        // `AS OF` / `ducklake_scan` version APIs reject — so retention of the
+        // snapshot list is the observable time-travel proxy; see
+        // docs/research/perf-calibration.md.)
         let snapshots_after: i64 = w
             .conn
-            .query_row("SELECT count(*) FROM ducklake_snapshots('dl')", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                &format!("SELECT count(*) FROM ducklake_snapshots('{WRITE_CATALOG_ALIAS}')"),
+                [],
+                |r| r.get(0),
+            )
             .expect("snapshots");
         assert!(
             snapshots_after >= snapshots_before,

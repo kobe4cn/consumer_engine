@@ -555,6 +555,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
