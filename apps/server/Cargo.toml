@@ -16,6 +16,7 @@ consumer_engine-execution.workspace = true
 consumer_engine-ingestion.workspace = true
 consumer_engine-ingress.workspace = true
 consumer_engine-query.workspace = true
+getrandom.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 axum.workspace = true
@@ -27,3 +28,7 @@ reqwest = { version = "0.12", features = ["json"] }
 tempfile = "3"
 tokio.workspace = true
 serde_json.workspace = true
+bytes = "1"
+arrow = "58"
+parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
+uuid = { workspace = true }

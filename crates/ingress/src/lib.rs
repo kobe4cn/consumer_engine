@@ -30,6 +30,12 @@ use consumer_engine_ingestion::IngestionHandle;
 use consumer_engine_query::{QueryEngine, QueryError};
 use serde::{Deserialize, Serialize};
 
+pub mod audience;
+pub mod jobs;
+pub mod presign;
+
+pub use jobs::{JobRegistry, JobStatus};
+
 /// Maximum rows accepted in a single onboard request.
 const MAX_ONBOARD_ROWS: usize = 200_000;
 /// Maximum number of columns in an onboard request.
@@ -50,6 +56,11 @@ pub struct AppState {
     pub query_engine: QueryEngine,
     /// Epoch seconds of the last successful ingest (drives the freshness label).
     pub last_ingest_epoch: Arc<AtomicI64>,
+    /// Async-job registry for `POST /jobs` / `GET /jobs/:id`.
+    pub jobs: Arc<JobRegistry>,
+    /// HMAC-SHA256 signing key for presigned export URLs (32 bytes of OS
+    /// randomness; minted once at server startup).
+    pub signing_key: Arc<[u8; 32]>,
 }
 
 /// `POST /sources/onboard` request body.
@@ -106,6 +117,10 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/sources/onboard", post(onboard))
         .route("/query", post(query))
+        .route("/jobs", post(jobs::post_jobs))
+        .route("/jobs/{id}", get(jobs::get_job))
+        .route("/audience/{snapshot_id}", get(audience::get_audience))
+        .route("/audience/{snapshot_id}/export", get(audience::get_export))
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
 }
@@ -213,6 +228,12 @@ pub enum ApiError {
     Core(Error),
     /// A query-engine error.
     Query(QueryError),
+    /// The requested resource does not exist (job, snapshot).
+    NotFound,
+    /// Authentication / authorization failed (e.g. invalid presigned token).
+    Unauthorized,
+    /// The requested export format is not supported.
+    UnsupportedFormat,
 }
 
 impl IntoResponse for ApiError {
@@ -241,7 +262,13 @@ impl IntoResponse for ApiError {
                 "execution failure".into(),
             ),
             // QueryError is non_exhaustive; future variants map to 500.
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, "query failure".into()),
+            ApiError::Query(_) => (StatusCode::INTERNAL_SERVER_ERROR, "query failure".into()),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
+            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".into()),
+            ApiError::UnsupportedFormat => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported format".into(),
+            ),
         };
         (code, msg).into_response()
     }

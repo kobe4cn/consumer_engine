@@ -14,7 +14,7 @@
 
 use std::thread;
 
-use consumer_engine_core::{BoxError, Error, Result};
+use consumer_engine_core::{BoxError, Error, READ_ONLY_CATALOG_ALIAS, Result};
 use duckdb::{Connection, types::Value};
 use serde::Serialize;
 
@@ -62,7 +62,7 @@ impl std::fmt::Debug for Reader {
 
 impl Reader {
     /// Start the reader thread owning `conn`, already attached read-only.
-    /// `attach_sql` is re-issued (as `DETACH dro; <attach_sql>`) before every
+    /// `attach_sql` is re-issued (as `DETACH <alias>; <attach_sql>`) before every
     /// query so the reader sees commits made after its initial attach — a
     /// long-lived read-only DuckLake attach is otherwise pinned to the snapshot
     /// at attach time. `limits` are applied as DuckDB PRAGMAs once at thread
@@ -134,7 +134,7 @@ fn reader_loop(
     if let Err(e) = conn.execute_batch(&pragma) {
         tracing::warn!(error = %e, "reader PRAGMA setup failed; using DuckDB defaults");
     }
-    let refresh = format!("DETACH dro; {attach_sql}");
+    let refresh = format!("DETACH {READ_ONLY_CATALOG_ALIAS}; {attach_sql}");
     for cmd in rx.iter() {
         match cmd {
             Cmd::Query { sql, params, reply } => {

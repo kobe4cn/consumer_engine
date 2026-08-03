@@ -13,10 +13,10 @@ use std::{
 };
 
 use axum::Router;
-use consumer_engine_core::{EngineConfig, Result};
+use consumer_engine_core::{BoxError, EngineConfig, Error, Result};
 use consumer_engine_execution::{Reader, ReaderLimits};
 use consumer_engine_ingestion::IngestionHandle;
-use consumer_engine_ingress::{AppState, router};
+use consumer_engine_ingress::{AppState, JobRegistry, router};
 use consumer_engine_storage::{self as storage, Writer};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -48,6 +48,11 @@ impl Engine {
     /// Propagates storage/execution/ingestion setup errors.
     pub fn build(config: &EngineConfig) -> Result<(Router, Engine)> {
         let writer = Writer::attach(&config.catalog_path, &config.data_path)?;
+        // Initialise the materialise schema up front so read-only `snapshot_meta`
+        // queries never hit a missing `audience_snapshot` table before the first
+        // materialise (the writer creates it lazily too, but a startup init keeps
+        // reads clean).
+        writer.ensure_audience_snapshot_table()?;
         let read_conn = storage::open_reader(&config.catalog_path, &config.data_path)?;
         let attach_sql = storage::read_only_attach_sql(&config.catalog_path, &config.data_path);
         let limits = ReaderLimits {
@@ -58,8 +63,13 @@ impl Engine {
         let ingestion = IngestionHandle::start(writer)?;
 
         let last_ingest_epoch = Arc::new(AtomicI64::new(0));
+        // M2 signing key: 32 bytes of OS randomness (AGENTS.md § Crypto forbids
+        // thread_rng for secrets; getrandom is the OsRng-equivalent source).
+        let mut signing_key = [0u8; 32];
+        getrandom::fill(&mut signing_key).map_err(|e| Error::Execution(BoxError::from(e)))?;
         let query_engine = consumer_engine_query::QueryEngine::new(
             reader.clone(),
+            ingestion.clone(),
             config.guardrails.clone(),
             Arc::clone(&last_ingest_epoch),
         );
@@ -68,10 +78,13 @@ impl Engine {
             config.compaction_interval_secs,
         ));
 
+        let jobs = Arc::new(JobRegistry::new());
         let state = AppState {
             ingestion: ingestion.clone(),
             query_engine,
             last_ingest_epoch: Arc::clone(&last_ingest_epoch),
+            jobs: Arc::clone(&jobs),
+            signing_key: Arc::new(signing_key),
         };
         let router = router(state);
         let engine = Engine {

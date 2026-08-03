@@ -172,3 +172,68 @@ Append-only.
   `max_concurrent_queries`); reader `std::thread` has no restart-on-panic
   supervision (pre-existing T1 surface); escape-hatch returns `QueryError::InvalidDsl`
   (minor category drift); wire emits `lagSeconds` vs spec's `lagHours` (T1 drift).
+
+## From Phase 3 / T3 (M2) — materialised audiences + delivery pull
+
+### P3-SUPPLY — `paste` unmaintained advisory allowlisted
+
+- **Citation**: `deny.toml` `[advisories].ignore` (RUSTSEC-2024-0436); pulled in
+  transitively by `parquet` v58, a **test-only** dev-dep of `consumer_engine-server`
+  (decodes snapshot exports in the e2e suite).
+- **Finding**: `paste` is an unmaintained proc-macro helper — not a security
+  vulnerability — with no safe upgrade while parquet 58 depends on it.
+  `cargo audit` treats it as a warning (exit 0); `cargo deny check` fails on
+  unmaintained advisories by default, so it is explicitly allowlisted.
+- **Fix shape (later)**: revisit when parquet drops `paste`, or replace the
+  parquet-decode test path (e.g. DuckDB-side row verification) so `parquet`/`arrow`
+  leave the lockfile.
+
+### P3-PEDANTIC — pedantic-as-error gate unachievable (pre-existing core debt)
+
+- **Citation**: `crates/{core,storage,execution}/src/*.rs` (~33 `clippy::pedantic`
+  warnings: `doc_markdown` missing backticks, `LazyLock` superseded
+  `once_cell`-style type, `manual_map_or`, `manual_unwrap_or`, `let_and_return`,
+  `redundant_closure`, `match_same_arms`, `cast_possible_wrap`).
+- **Finding**: the AGENTS.md "stricter linting" gate
+  (`-D warnings -W clippy::pedantic -W clippy::unwrap_used/expect_used/indexing_slicing/panic`)
+  cannot pass today because `consumer_engine-core` alone emits 7 pedantic
+  *errors* under `-D warnings`. These pre-date Phase 3 and are out of its scope
+  (refactor-smear). The **binding** gate `cargo clippy --workspace --all-targets
+  -- -D warnings` is green; Phase 3's *new* production code (`presign`/`jobs`/
+  `audience`/`engine::materialize`/`ingestion` arms) introduces no
+  `unwrap`/`expect`/`panic`/indexing in non-test paths.
+- **Fix shape (later)**: a dedicated "pedantic sweep" pass across core/storage/
+  execution (backticks, `LazyLock`, `map_or`, `let-else`, `NonZeroU32` for
+  `within_days`, dedup `now_epoch`). Not coupled to any feature phase.
+
+### T4-I3 — point-in-time bounding deferred (by design, M2 scope)
+
+- **Citation**: `crates/query/src/engine.rs` (`materialize`: `as_of_ts = now()`).
+- **Finding**: I3 (`audience_snapshot.as_of_ts` ≤ every feature/raw row's
+  `as_of_ts`) is **not** enforceable in M2 — raw tables are `VARCHAR`-only and
+  the Feature Store (the typed producer path) lands in T4. M2 sets
+  `as_of_ts = materialisation time` (documented). The exit test asserts I2
+  atomicity + non-null `hit_reason`/`features`, **not** the leak invariant.
+- **Fix shape (T4)**: once Feature Store write paths + typed `TIMESTAMPTZ` raw
+  columns exist, bound `as_of_ts` to the min source freshness and test the leak.
+
+### T4-HITREASON / T4-FEATURES — snapshot payload placeholders (by design)
+
+- **Citation**: `crates/query/src/engine.rs` (`features = "{}"`, `hit_reason =
+  serde_json::to_string(q)`).
+- **Finding**: `features` is the non-null placeholder (Feature Store is T4);
+  `hit_reason` is the whole validated DSL JSON — a faithful per-row reason for
+  B-only segments, to be refined to per-predicate when `Filter`-nesting/F/J ops
+  land (T4/T5). Both satisfy I2 (non-null) today.
+- **Fix shape (T4/T5)**: populate `features` from the frozen feature pivot;
+  refine `hit_reason` to the selecting predicate chain.
+
+### P3-DEPS — Phase-E dependency list deviation (justified, no action)
+
+- **Citation**: `Cargo.toml` `[workspace.dependencies]`, `apps/server/Cargo.toml`.
+- **Finding**: the plan listed workspace deps `rand, tokio-util, bytes`; the
+  implementation used `getrandom` (OsRng-equivalent; lighter than `rand` and
+  matching AGENTS.md § Crypto), omitted `tokio-util` (export streaming uses
+  `axum::body::Body::from(Vec<u8>)` directly), and `bytes` is a server
+  **test-only** dev-dep (in-memory `parquet` decode via `ChunkReader for Bytes`,
+  avoiding disallowed blocking `std::fs`). All strictly cleaner than the plan.

@@ -16,6 +16,6 @@ pub mod error;
 pub mod guardrail;
 pub mod parse;
 
-pub use compiler::CompiledQuery;
-pub use engine::{QueryEngine, SyncResult};
+pub use compiler::{CompiledQuery, compile_with_alias};
+pub use engine::{QueryEngine, SnapshotMeta, SyncResult};
 pub use error::{QueryError, Result};

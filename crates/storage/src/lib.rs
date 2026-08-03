@@ -168,8 +168,10 @@ impl Writer {
     }
 
     /// Create the `audience_snapshot` table if absent. No PRIMARY KEY/UNIQUE —
-    /// DuckLake rejects them (`specs/10`, `specs/20 §4`).
-    fn ensure_audience_snapshot_table(&self) -> Result<()> {
+    /// DuckLake rejects them (`specs/10`, `specs/20 §4`). Called at materialise
+    /// time (defensive) and at engine startup so reads never hit a missing
+    /// table.
+    pub fn ensure_audience_snapshot_table(&self) -> Result<()> {
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.audience_snapshot (snapshot_id \
              UUID, campaign_id VARCHAR, as_of_ts TIMESTAMPTZ, user_id VARCHAR, features JSON, \

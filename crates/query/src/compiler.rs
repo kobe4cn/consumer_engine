@@ -7,6 +7,7 @@
 //! (invariant I1, `specs/12-query-engine.md`). Temporal windows use integer
 //! `INTERVAL '<n>' DAY` constants only.
 
+use consumer_engine_core::READ_ONLY_CATALOG_ALIAS;
 use duckdb::types::Value;
 
 use crate::{
@@ -26,20 +27,34 @@ pub struct CompiledQuery {
     pub sources: Vec<Dataset>,
 }
 
-/// Compile a validated segment query.
+/// Compile a validated segment query against the **read-only** catalog alias
+/// (`dro`). This is the read path used by `EXPLAIN` and the synchronous query
+/// runner; it is unchanged in behaviour from M1.
 ///
 /// # Errors
 /// [`QueryError::InvalidDsl`] for M1-unsupported op orderings (e.g. an op after
 /// a `SetOp`, or a second `SetOp`).
 pub fn compile(q: &SegmentQuery) -> Result<CompiledQuery> {
-    compile_at(q, 0)
+    compile_with_alias(q, READ_ONLY_CATALOG_ALIAS)
+}
+
+/// Compile a validated segment query against an explicit catalog alias. The
+/// write path (`materialize`) passes [`consumer_engine_core::WRITE_CATALOG_ALIAS`]
+/// so the writer's `INSERT … SELECT` runs under the writable `dl` attach while
+/// the reader EXPLAINs under the read-only `dro` attach.
+///
+/// # Errors
+/// [`QueryError::InvalidDsl`] for M1-unsupported op orderings (e.g. an op after
+/// a `SetOp`, or a second `SetOp`).
+pub fn compile_with_alias(q: &SegmentQuery, alias: &str) -> Result<CompiledQuery> {
+    compile_at(q, 0, alias)
 }
 
 /// Maximum SetOp nesting depth (defense-in-depth beyond serde_json's parse
 /// recursion limit; AGENTS.md § Resource Limits — set explicit depth limits).
 const MAX_NESTING: u8 = 8;
 
-fn compile_at(q: &SegmentQuery, depth: u8) -> Result<CompiledQuery> {
+fn compile_at(q: &SegmentQuery, depth: u8, alias: &str) -> Result<CompiledQuery> {
     if depth > MAX_NESTING {
         return Err(QueryError::InvalidDsl(format!(
             "segment nesting exceeds depth limit of {MAX_NESTING}"
@@ -79,6 +94,7 @@ fn compile_at(q: &SegmentQuery, depth: u8) -> Result<CompiledQuery> {
                     *within_days,
                     predicate.as_ref(),
                     &mut params,
+                    alias,
                 )?);
             }
             Op::Lapsed {
@@ -97,6 +113,7 @@ fn compile_at(q: &SegmentQuery, depth: u8) -> Result<CompiledQuery> {
                     *within_days,
                     predicate.as_ref(),
                     &mut params,
+                    alias,
                 )?);
             }
             Op::SetOp { op, other } => {
@@ -114,10 +131,10 @@ fn compile_at(q: &SegmentQuery, depth: u8) -> Result<CompiledQuery> {
     // Reject any op appearing after the SetOp (the loop above sets `setop`; if a
     // later iteration added a conjunct, that's an op-after-setop).
     if let Some((kind, other)) = setop {
-        let other_c = compile_at(other, depth + 1)?;
+        let other_c = compile_at(other, depth + 1, alias)?;
         let kw = setop_keyword(*kind);
         sources.extend(other_c.sources);
-        let this_sql = base_select(&q.source, &q.key, &conjuncts);
+        let this_sql = base_select(&q.source, &q.key, &conjuncts, alias);
         let mut all_params = params;
         all_params.extend(other_c.params);
         let sql = format!("({this_sql}) {kw} ({})", other_c.sql);
@@ -127,7 +144,7 @@ fn compile_at(q: &SegmentQuery, depth: u8) -> Result<CompiledQuery> {
             sources,
         })
     } else {
-        let sql = base_select(&q.source, &q.key, &conjuncts);
+        let sql = base_select(&q.source, &q.key, &conjuncts, alias);
         Ok(CompiledQuery {
             sql,
             params,
@@ -136,9 +153,9 @@ fn compile_at(q: &SegmentQuery, depth: u8) -> Result<CompiledQuery> {
     }
 }
 
-/// Build `SELECT DISTINCT <key> FROM dro.raw_<s>_<e> base [WHERE <conjuncts>]`.
-fn base_select(source: &Dataset, key: &str, conjuncts: &[String]) -> String {
-    let table = raw_table(source);
+/// Build `SELECT DISTINCT <key> FROM <alias>.raw_<s>_<e> base [WHERE <conjuncts>]`.
+fn base_select(source: &Dataset, key: &str, conjuncts: &[String], alias: &str) -> String {
+    let table = raw_table(source, alias);
     if conjuncts.is_empty() {
         format!("SELECT DISTINCT base.{key} FROM {table} base")
     } else {
@@ -149,9 +166,9 @@ fn base_select(source: &Dataset, key: &str, conjuncts: &[String]) -> String {
     }
 }
 
-/// Qualified raw table name `dro.raw_<system>_<entity>` (idents pre-validated).
-fn raw_table(d: &Dataset) -> String {
-    format!("dro.raw_{}_{}", d.system, d.entity)
+/// Qualified raw table name `<alias>.raw_<system>_<entity>` (idents pre-validated).
+fn raw_table(d: &Dataset, alias: &str) -> String {
+    format!("{alias}.raw_{}_{}", d.system, d.entity)
 }
 
 /// Render a predicate on alias `rel` (e.g. `base` or `e`), pushing its value(s)
@@ -236,8 +253,9 @@ fn compile_recency(
     within_days: u32,
     predicate: Option<&Predicate>,
     params: &mut Vec<Value>,
+    alias: &str,
 ) -> Result<String> {
-    let table = raw_table(event);
+    let table = raw_table(event, alias);
     let mut where_parts = vec![format!("e.{user_key} = base.{base_key}")];
     if let Some(p) = predicate {
         where_parts.push(compile_predicate("e", p, params)?);
@@ -261,8 +279,9 @@ fn compile_lapsed(
     within_days: u32,
     predicate: Option<&Predicate>,
     params: &mut Vec<Value>,
+    alias: &str,
 ) -> Result<String> {
-    let table = raw_table(event);
+    let table = raw_table(event, alias);
     let mut before_parts = vec![format!("e.{user_key} = base.{base_key}")];
     if let Some(p) = predicate {
         before_parts.push(compile_predicate("e", p, params)?);
@@ -408,6 +427,25 @@ mod tests {
             },
         ]);
         assert!(matches!(compile(&q), Err(QueryError::InvalidDsl(_))));
+    }
+
+    #[test]
+    fn test_should_compile_with_write_alias() {
+        let q = orders(vec![Op::Filter {
+            predicate: Predicate {
+                column: "sku".into(),
+                op: Cmp::Eq,
+                value: serde_json::json!("A"),
+            },
+        }]);
+        let c = compile_with_alias(&q, consumer_engine_core::WRITE_CATALOG_ALIAS).expect("compile");
+        assert!(
+            c.sql.contains("dl.raw_erp_orders"),
+            "write alias must appear: {}",
+            c.sql
+        );
+        // The read alias must not leak into the write-compiled SQL.
+        assert!(!c.sql.contains("dro.raw_erp_orders"));
     }
 
     #[test]

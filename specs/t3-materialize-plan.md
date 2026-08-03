@@ -1,8 +1,9 @@
 # T3 — Materialise Audience Snapshots + Delivery Pull (detailed plan)
 
-Status: **Phase A done** (commit `09cb979`); Phases B–H pending. This is the
-detailed expansion of `91-impl-plan.md` Phase 3 (issue #4). A fresh session can
-resume from Phase B using this file.
+Status: **Phases A–H done** — Phase 3 (T3) complete; M2 exit criteria met
+(`test_should_materialise_snapshot_atomically_with_hit_reason` green; full gate
+set green). Phase A landed in `09cb979`; Phases B–H landed in the Phase 3 commit.
+This is the detailed expansion of `91-impl-plan.md` Phase 3 (issue #4).
 
 Origin: an isolated scout→planner agent chain (see `docs/agents/`); the planner
 read the codebase + `specs/{10,12,21}` and produced this file-by-file plan.

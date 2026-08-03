@@ -1,4 +1,7 @@
-//! The query engine: parse → compile → guard → run (sync).
+//! The query engine: parse → compile → guard → run (sync), plus the Q2
+//! materialise bridge (`materialize` → `snap_<uuid>`). The job lifecycle
+//! (jobId mint, poll) lives in the ingress layer (`consumer_engine-ingress`);
+//! here we only do the materialise work and snapshot metadata read.
 
 use std::{
     sync::{
@@ -8,13 +11,17 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use consumer_engine_core::{BoxError, Error, Freshness, GuardrailConfig};
+use consumer_engine_core::{
+    BoxError, Error, Freshness, GuardrailConfig, SnapshotSpec, WRITE_CATALOG_ALIAS,
+};
 use consumer_engine_execution::{QueryResult, Reader, RowCells};
+use consumer_engine_ingestion::IngestionHandle;
+use duckdb::types::Value;
 use tokio::sync::Semaphore;
 
 use crate::{
     ast::SegmentQuery,
-    compiler::{CompiledQuery, compile},
+    compiler::{CompiledQuery, compile, compile_with_alias},
     error::{QueryError, Result},
     guardrail::{Mode, Plan, enforce, explain_cost},
 };
@@ -23,6 +30,7 @@ use crate::{
 #[derive(Clone)]
 pub struct QueryEngine {
     reader: Reader,
+    ingestion: IngestionHandle,
     guardrails: GuardrailConfig,
     inflight: Arc<Semaphore>,
     last_ingest_epoch: Arc<AtomicI64>,
@@ -53,16 +61,19 @@ pub struct SyncResult {
 
 impl QueryEngine {
     /// Construct a query engine over `reader` with `guardrails`. The
-    /// `last_ingest_epoch` clock drives the freshness label.
+    /// `last_ingest_epoch` clock drives the freshness label. `ingestion` is the
+    /// single writer handle used by [`Self::materialize`].
     #[must_use]
     pub fn new(
         reader: Reader,
+        ingestion: IngestionHandle,
         guardrails: GuardrailConfig,
         last_ingest_epoch: Arc<AtomicI64>,
     ) -> Self {
         let permits = guardrails.threads.max(1);
         Self {
             reader,
+            ingestion,
             guardrails,
             inflight: Arc::new(Semaphore::new(permits)),
             last_ingest_epoch,
@@ -166,6 +177,107 @@ impl QueryEngine {
             query_id: format!("q_{}", uuid::Uuid::now_v7()),
         })
     }
+
+    /// Materialise a validated DSL segment into `audience_snapshot` via the
+    /// single writer, returning the opaque snapshot id `snap_<uuidv7>`.
+    ///
+    /// This is the Q2 work half of the async path; the REST job lifecycle
+    /// (jobId mint/poll) lives in `consumer_engine-ingress`. Guardrails are
+    /// **not** enforced here — a large result set is the whole point of
+    /// materialising — but the T2 `EXPLAIN` is run best-effort so a malformed
+    /// segment fails fast with a clear error (`specs/20 I4`).
+    ///
+    /// `as_of_ts` is materialisation time in M2 (true I3 point-in-time bounding
+    /// lands in T4); `features` is the non-null placeholder `{}` (Feature Store
+    /// is T4); `hit_reason` is the serialised validated DSL — a faithful
+    /// per-row selection reason for B-only segments.
+    ///
+    /// # Errors
+    /// - [`QueryError::InvalidDsl`] if the segment fails to compile or the DSL cannot be serialised
+    ///   as `hit_reason`.
+    /// - [`QueryError::Execution`] propagating ingestion/storage failures.
+    pub async fn materialize(&self, q: &SegmentQuery, campaign_id: &str) -> Result<String> {
+        // Best-effort EXPLAIN: validates the segment compiles under the read
+        // alias and surfaces a bad-DSL failure early, but does NOT enforce row
+        // budgets (large is the point of materialising). Errors from EXPLAIN
+        // (a real compile error) are surfaced via `compile` below.
+        let compiled = compile(q)?;
+        let est = explain_cost(&self.reader, &compiled).await;
+        tracing::info!(est_rows = est.est_rows, "materialise estimate");
+
+        // Scalars.
+        let snapshot_id = uuid::Uuid::now_v7().to_string();
+        let as_of_ts = chrono::Utc::now().to_rfc3339();
+        let features = "{}".to_string();
+        let hit_reason = serde_json::to_string(q)
+            .map_err(|e| QueryError::InvalidDsl(format!("serialize hit_reason: {e}")))?;
+
+        // Write path: recompile under the writable alias so the writer's
+        // `INSERT … SELECT` resolves `dl.raw_*`.
+        let write = compile_with_alias(q, WRITE_CATALOG_ALIAS)?;
+        let spec = SnapshotSpec {
+            snapshot_id: snapshot_id.clone(),
+            campaign_id: campaign_id.to_string(),
+            as_of_ts,
+            features,
+            hit_reason,
+        };
+        self.ingestion
+            .materialize_snapshot(&write.sql, write.params, &q.key, spec)
+            .await?;
+        Ok(format!("snap_{snapshot_id}"))
+    }
+
+    /// Read a snapshot's metadata via the read-only reader. Returns `None` if no
+    /// rows exist for `snap_uuid`. `as_of_ts` and the JSON columns are cast to
+    /// `VARCHAR` because `execution::value_to_json` maps TIMESTAMPTZ/JSON to
+    /// null today.
+    ///
+    /// # Errors
+    /// [`QueryError::Execution`] on reader failure.
+    pub async fn snapshot_meta(&self, snap_uuid: &str) -> Result<Option<SnapshotMeta>> {
+        const SQL: &str = "SELECT campaign_id, CAST(as_of_ts AS VARCHAR), count(*) FROM \
+                           dro.audience_snapshot WHERE snapshot_id = CAST(? AS UUID) GROUP BY \
+                           campaign_id, as_of_ts";
+        let qr = self
+            .reader
+            .query_with_params(SQL, vec![Value::Text(snap_uuid.to_string())])
+            .await?;
+        let row = match qr.rows.into_iter().next() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let campaign_id = row
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default();
+        let as_of_ts = row
+            .get(1)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default();
+        let row_count = row.get(2).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        Ok(Some(SnapshotMeta {
+            snapshot_id: snap_uuid.to_string(),
+            campaign_id,
+            as_of_ts,
+            row_count,
+        }))
+    }
+}
+
+/// Metadata for one materialised snapshot, read back via the read-only reader.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotMeta {
+    /// The bare snapshot UUID (no `snap_` prefix).
+    pub snapshot_id: String,
+    /// Caller-supplied campaign id.
+    pub campaign_id: String,
+    /// Data cut-off reflected (ISO-8601 UTC string).
+    pub as_of_ts: String,
+    /// Number of users in the snapshot.
+    pub row_count: u64,
 }
 
 /// Current epoch seconds (0 if the clock is before the epoch).
@@ -174,4 +286,82 @@ fn now_epoch() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, atomic::AtomicI64};
+
+    use consumer_engine_core::GuardrailConfig;
+    use consumer_engine_execution::{Reader, ReaderLimits};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_should_materialize_returns_snapshot_id() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = consumer_engine_storage::Writer::attach(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("attach");
+        writer
+            .ingest_raw(
+                "erp",
+                "orders",
+                &["user_id".into(), "sku".into()],
+                &[
+                    vec![Some("u1".into()), Some("A".into())],
+                    vec![Some("u2".into()), Some("A".into())],
+                    vec![Some("u3".into()), Some("B".into())],
+                ],
+            )
+            .expect("ingest");
+
+        let ingestion = consumer_engine_ingestion::IngestionHandle::start(writer).expect("start");
+        let read_conn = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let attach_sql = consumer_engine_storage::read_only_attach_sql(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        );
+        let reader = Reader::start(read_conn, attach_sql, ReaderLimits::default()).expect("reader");
+
+        let engine = QueryEngine::new(
+            reader,
+            ingestion.clone(),
+            GuardrailConfig::default(),
+            Arc::new(AtomicI64::new(0)),
+        );
+
+        let q = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"},
+            "key": "user_id",
+            "ops": [
+                {"kind":"filter","predicate":{"column":"sku","op":"eq","value":"A"}}
+            ]
+        }))
+        .expect("parse");
+
+        let snap = engine.materialize(&q, "c1").await.expect("materialize");
+        assert!(
+            snap.starts_with("snap_"),
+            "snapshot id must be snap_-prefixed: {snap}"
+        );
+
+        let bare = snap.strip_prefix("snap_").expect("snap_ prefix");
+        let meta = engine
+            .snapshot_meta(bare)
+            .await
+            .expect("snapshot_meta")
+            .expect("snapshot exists");
+        assert_eq!(meta.snapshot_id, bare);
+        assert_eq!(meta.campaign_id, "c1");
+        assert!(meta.row_count > 0, "row count must be > 0");
+
+        ingestion.shutdown();
+    }
 }

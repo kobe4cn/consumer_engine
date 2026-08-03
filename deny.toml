@@ -70,7 +70,13 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
-  # "RUSTSEC-2024-0436",
+  # `paste` (RUSTSEC-2024-0436, unmaintained) is a proc-macro helper pulled
+  # in transitively by `parquet` v58, which is a *test-only* dev-dependency of
+  # `consumer_engine-server` (used to decode snapshot exports in the Phase 3
+  # e2e suite). It is not a security vulnerability — only an unmaintained-crate
+  # advisory — and there is no safe upgrade path while parquet 58 depends on it.
+  # Revisit when parquet drops `paste` or the parquet-decode path is replaced.
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro helper via test-only parquet dev-dep; no safe upgrade while parquet 58 depends on paste" },
   #"RUSTSEC-0000-0000",
   #{ id = "RUSTSEC-0000-0000", reason = "you can specify a reason the advisory is ignored" },
   #"a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish

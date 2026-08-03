@@ -14,10 +14,11 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
-use std::{collections::HashSet, thread};
+use std::{collections::HashSet, path::PathBuf, thread};
 
-use consumer_engine_core::{BoxError, Error, Result};
+use consumer_engine_core::{BoxError, Error, Result, SnapshotSpec};
 use consumer_engine_storage::Writer;
+use duckdb::types::Value;
 
 /// Commands sent to the writer thread.
 enum Cmd {
@@ -36,6 +37,30 @@ enum Cmd {
     },
     /// Compact every table this actor has ingested.
     CompactAll {
+        /// Reply channel.
+        reply: flume::Sender<Result<()>>,
+    },
+    /// Atomically materialise a DSL segment into `audience_snapshot` via the
+    /// single writer (one catalog transaction ⇒ a partial snapshot is never
+    /// observable, `specs/20 I4`).
+    Materialize {
+        /// The materialise subquery SQL (must reference the **write** alias).
+        subquery_sql: String,
+        /// Bound parameters for the subquery's `?` placeholders.
+        subquery_params: Vec<Value>,
+        /// The key column projected by the subquery (validated).
+        key_column: String,
+        /// The snapshot's scalar row payload.
+        spec: SnapshotSpec,
+        /// Reply channel carrying the inserted row count.
+        reply: flume::Sender<Result<u64>>,
+    },
+    /// Export a snapshot to a Parquet file (server-controlled path).
+    ExportParquet {
+        /// The bare snapshot UUID.
+        snapshot_id: String,
+        /// Destination Parquet file.
+        dest: PathBuf,
         /// Reply channel.
         reply: flume::Sender<Result<()>>,
     },
@@ -110,6 +135,55 @@ impl IngestionHandle {
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?
     }
 
+    /// Atomically materialise `subquery_sql` into `audience_snapshot`, returning
+    /// the number of rows written. The subquery must reference the **write**
+    /// alias (`dl.raw_*`); its `?` placeholders are bound by `subquery_params`.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidInput`] on a bad key column.
+    /// - [`Error::Ingestion`] if the writer thread has exited.
+    /// - [`Error::Storage`] on table/insert failure.
+    pub async fn materialize_snapshot(
+        &self,
+        subquery_sql: &str,
+        subquery_params: Vec<Value>,
+        key_column: &str,
+        spec: SnapshotSpec,
+    ) -> Result<u64> {
+        let (rtx, rrx) = flume::bounded(1);
+        self.tx
+            .send(Cmd::Materialize {
+                subquery_sql: subquery_sql.to_string(),
+                subquery_params,
+                key_column: key_column.to_string(),
+                spec,
+                reply: rtx,
+            })
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
+        rrx.recv_async()
+            .await
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?
+    }
+
+    /// Export a snapshot to a Parquet file at `dest` (server-controlled path).
+    ///
+    /// # Errors
+    /// - [`Error::Ingestion`] if the writer thread has exited.
+    /// - [`Error::Storage`] on export failure.
+    pub async fn export_parquet(&self, snapshot_id: &str, dest: PathBuf) -> Result<()> {
+        let (rtx, rrx) = flume::bounded(1);
+        self.tx
+            .send(Cmd::ExportParquet {
+                snapshot_id: snapshot_id.to_string(),
+                dest,
+                reply: rtx,
+            })
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
+        rrx.recv_async()
+            .await
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?
+    }
+
     /// Signal the writer thread to stop. Best-effort.
     pub fn shutdown(&self) {
         let _ = self.tx.send(Cmd::Shutdown);
@@ -143,7 +217,112 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>) {
                 }
                 let _ = reply.send(last);
             }
+            Cmd::Materialize {
+                subquery_sql,
+                subquery_params,
+                key_column,
+                spec,
+                reply,
+            } => {
+                let res = writer.materialize_snapshot(
+                    &subquery_sql,
+                    &subquery_params,
+                    &key_column,
+                    &spec,
+                );
+                let _ = reply.send(res);
+            }
+            Cmd::ExportParquet {
+                snapshot_id,
+                dest,
+                reply,
+            } => {
+                let res = writer.export_snapshot_parquet(&snapshot_id, &dest);
+                let _ = reply.send(res);
+            }
             Cmd::Shutdown => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use consumer_engine_core::SnapshotSpec;
+    use consumer_engine_storage::Writer;
+    use duckdb::types::Value;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_should_materialize_via_handle() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        // Seed rows so two distinct users match `sku = 'A'`.
+        writer
+            .ingest_raw(
+                "erp",
+                "orders",
+                &["user_id".into(), "sku".into()],
+                &[
+                    vec![Some("u1".into()), Some("A".into())],
+                    vec![Some("u2".into()), Some("A".into())],
+                    vec![Some("u3".into()), Some("B".into())],
+                ],
+            )
+            .expect("ingest");
+
+        let handle = IngestionHandle::start(writer).expect("start handle");
+        let spec = SnapshotSpec {
+            snapshot_id: uuid::Uuid::now_v7().to_string(),
+            campaign_id: "c1".into(),
+            as_of_ts: chrono::Utc::now().to_rfc3339(),
+            features: "{}".into(),
+            hit_reason: "{}".into(),
+        };
+        let rows = handle
+            .materialize_snapshot(
+                "SELECT DISTINCT base.user_id FROM dl.raw_erp_orders base WHERE base.sku = ?",
+                vec![Value::Text("A".into())],
+                "user_id",
+                spec.clone(),
+            )
+            .await
+            .expect("materialize");
+        assert!(
+            rows >= 2,
+            "expected at least 2 distinct users matching sku=A, got {rows}"
+        );
+
+        // Verify the snapshot is observable read-only with non-null
+        // hit_reason/features (atomicity + D11). A fresh read-only attach sees
+        // the committed rows (DuckLake durability).
+        let r = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let mut stmt = r
+            .prepare(
+                "SELECT count(*), count(hit_reason), count(features) FROM dro.audience_snapshot \
+                 WHERE snapshot_id = CAST(? AS UUID)",
+            )
+            .expect("prepare");
+        let row: (i64, i64, i64) = stmt
+            .query_row(duckdb::params![&spec.snapshot_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("query");
+        assert_eq!(
+            row.0, rows as i64,
+            "row count must match materialise result"
+        );
+        assert_eq!(
+            row.1, rows as i64,
+            "hit_reason must be non-null on every row"
+        );
+        assert_eq!(row.2, rows as i64, "features must be non-null on every row");
+
+        handle.shutdown();
     }
 }
