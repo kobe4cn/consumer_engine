@@ -133,3 +133,42 @@ Append-only.
   DSL + guardrails phase (`91-impl-plan` Phase 2 / T2).
 - **criterion 6 micro-batch** — already P3-4; the independent review confirms
   `micro_batch_flush_rows` is dead config until the CDC adapter.
+
+## From the T2 independent two-axis review (parallel sub-agents)
+
+### Fixed in this pass
+
+- **SetOp recursion depth** (Standards HARD, DoS): `compile()` now caps SetOp
+  nesting at `MAX_NESTING = 8` via `compile_at(q, depth)` (AGENTS.md § Resource
+  Limits — explicit depth limits for nested parsing). Pinned by
+  `test_should_reject_deeply_nested_setop`.
+
+### Deferred (Phase-2, tracked here so the code's "see specs/93" citations hold)
+
+- **P2-EXPLAIN — EXPLAIN-based cost pre-flight (AC#3 partial).** Issue #3 AC#3
+  literally requires an over-budget query to be rejected via EXPLAIN *before it
+  executes* ("never executes"). M1 ships **runtime** guards instead —
+  `statement_timeout`, an output-row fetch cap, and DuckDB `memory_limit`/
+  `threads` PRAGMAs — so a runaway query is bounded (it cannot run away) but it
+  is not rejected pre-execution. `enforce()` over a cost `Estimate` is
+  implemented and unit-tested, but `plan()` feeds `Estimate::unknown()` (EXPLAIN
+  parsing is intentionally deferred — DuckDB EXPLAIN text is not a stable
+  contract). `max_bytes_scanned` is configured but not enforced (no robust
+  DuckDB knob). Decision: this is a deliberate planner choice (runtime guards >
+  fragile EXPLAIN); revisit when a stable cost signal exists or AC#3's literal
+  "never executes" becomes a hard requirement.
+- **P2-FRESH — per-source freshness grading (AC#4/I4 partial).** `CompiledQuery.sources`
+  is collected but unused; M1 emits `Freshness::batch(lag)` from one global
+  clock because only batch sources exist. Per-source grading needs source-type
+  metadata, which lands with the CDC adapter.
+- **P2-DISTINCT — `Op::Distinct` AST node absent.** Spec 10 §3 lists `Distinct { key }`;
+  M1 instead puts `key` top-level on `SegmentQuery` (implicit `SELECT DISTINCT`).
+  Functionally equivalent for M1; reconcile the AST with the spec when a use
+  case needs distinct over a non-key projection.
+- **P3 smells (judgement)**: `now_epoch()`/`available_parallelism()` duplicated
+  across crates (→ `core`); `memory_limit: String` parsed in two places (→
+  `MemoryLimit` newtype); `within_days: u32` → `NonZeroU32`; `guardrails.threads`
+  conflates DuckDB threads with the in-flight query `Semaphore` (→ separate
+  `max_concurrent_queries`); reader `std::thread` has no restart-on-panic
+  supervision (pre-existing T1 surface); escape-hatch returns `QueryError::InvalidDsl`
+  (minor category drift); wire emits `lagSeconds` vs spec's `lagHours` (T1 drift).

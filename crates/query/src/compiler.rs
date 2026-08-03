@@ -32,6 +32,19 @@ pub struct CompiledQuery {
 /// [`QueryError::InvalidDsl`] for M1-unsupported op orderings (e.g. an op after
 /// a `SetOp`, or a second `SetOp`).
 pub fn compile(q: &SegmentQuery) -> Result<CompiledQuery> {
+    compile_at(q, 0)
+}
+
+/// Maximum SetOp nesting depth (defense-in-depth beyond serde_json's parse
+/// recursion limit; AGENTS.md § Resource Limits — set explicit depth limits).
+const MAX_NESTING: u8 = 8;
+
+fn compile_at(q: &SegmentQuery, depth: u8) -> Result<CompiledQuery> {
+    if depth > MAX_NESTING {
+        return Err(QueryError::InvalidDsl(format!(
+            "segment nesting exceeds depth limit of {MAX_NESTING}"
+        )));
+    }
     let mut params: Vec<Value> = Vec::new();
     let mut sources: Vec<Dataset> = vec![q.source.clone()];
     let mut conjuncts: Vec<String> = Vec::new();
@@ -101,7 +114,7 @@ pub fn compile(q: &SegmentQuery) -> Result<CompiledQuery> {
     // Reject any op appearing after the SetOp (the loop above sets `setop`; if a
     // later iteration added a conjunct, that's an op-after-setop).
     if let Some((kind, other)) = setop {
-        let other_c = compile(other)?;
+        let other_c = compile_at(other, depth + 1)?;
         let kw = setop_keyword(*kind);
         sources.extend(other_c.sources);
         let this_sql = base_select(&q.source, &q.key, &conjuncts);
@@ -395,5 +408,25 @@ mod tests {
             },
         ]);
         assert!(matches!(compile(&q), Err(QueryError::InvalidDsl(_))));
+    }
+
+    #[test]
+    fn test_should_reject_deeply_nested_setop() {
+        // 10 levels of SetOp nesting > MAX_NESTING (8).
+        let mut inner = orders(vec![]);
+        for _ in 0..10 {
+            inner = SegmentQuery {
+                source: Dataset {
+                    system: "erp".into(),
+                    entity: "orders".into(),
+                },
+                key: "user_id".into(),
+                ops: vec![Op::SetOp {
+                    op: SetOpKind::Intersect,
+                    other: Box::new(inner),
+                }],
+            };
+        }
+        assert!(matches!(compile(&inner), Err(QueryError::InvalidDsl(_))));
     }
 }
