@@ -11,7 +11,7 @@ use std::{
 
 use consumer_engine_core::{
     BoxError, Error, Freshness, FreshnessRegistry, GuardrailConfig, READ_ONLY_CATALOG_ALIAS,
-    SnapshotSpec, WRITE_CATALOG_ALIAS,
+    SnapshotSpec, SuppressionRules, WRITE_CATALOG_ALIAS,
 };
 use consumer_engine_execution::{QueryResult, Reader, RowCells};
 use consumer_engine_ingestion::IngestionHandle;
@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 
 use crate::{
     ast::SegmentQuery,
-    compiler::{CompiledQuery, compile, compile_with_alias},
+    compiler::{CompileOptions, CompiledQuery, compile_with_opts},
     error::{QueryError, Result},
     guardrail::{Mode, Plan, enforce, explain_cost},
 };
@@ -33,6 +33,7 @@ pub struct QueryEngine {
     guardrails: GuardrailConfig,
     inflight: Arc<Semaphore>,
     freshness: Arc<FreshnessRegistry>,
+    suppression: SuppressionRules,
 }
 
 impl std::fmt::Debug for QueryEngine {
@@ -68,6 +69,7 @@ impl QueryEngine {
         ingestion: IngestionHandle,
         guardrails: GuardrailConfig,
         freshness: Arc<FreshnessRegistry>,
+        suppression: SuppressionRules,
     ) -> Self {
         let permits = guardrails.threads.max(1);
         Self {
@@ -76,6 +78,7 @@ impl QueryEngine {
             guardrails,
             inflight: Arc::new(Semaphore::new(permits)),
             freshness,
+            suppression,
         }
     }
 
@@ -105,11 +108,86 @@ impl QueryEngine {
 
     /// Compile a segment and run the catalogue guardrail (spec 13 §1). Shared by
     /// the sync path (`prepare`) and the materialise path so both enforce
-    /// equally (a materialise IS a query, spec 12 §2a).
+    /// equally (a materialise IS a query, spec 12 §2a). Compiles with the
+    /// engine's suppression rules so `Exclude` anti-joins honour the configured
+    /// frequency cap (specs/20 §5). A terminal `Derive` is compiled with the
+    /// survivor-set `LIMIT` from the prior B/F stages' EXPLAIN (specs/12 §4).
     async fn compile_and_check(&self, q: &SegmentQuery) -> Result<CompiledQuery> {
-        let compiled = compile(q)?;
         self.enforce_catalogue(q).await?;
-        Ok(compiled)
+        let base = CompileOptions {
+            alias: READ_ONLY_CATALOG_ALIAS,
+            suppression: &self.suppression,
+            derive_limit: None,
+        };
+        if has_derive(q) {
+            let limit = self.derive_survivor_limit(q).await?;
+            return compile_with_opts(
+                q,
+                &CompileOptions {
+                    derive_limit: Some(limit),
+                    ..base
+                },
+            );
+        }
+        compile_with_opts(q, &base)
+    }
+
+    /// Plan the prior B/F narrowing of a `Derive` segment, EXPLAIN it, and
+    /// return the survivor-set `LIMIT` to inject into the CTE — rejecting when
+    /// the estimated survivor count exceeds `j_survivor_cap` (specs/12 §4 I5:
+    /// narrow first or precompute as F). When EXPLAIN yields no estimate, the
+    /// cap itself is used so the inner LIMIT still bounds the set.
+    async fn derive_survivor_limit(&self, q: &SegmentQuery) -> Result<u64> {
+        let narrowing = strip_derive(q);
+        let c = compile_with_opts(
+            &narrowing,
+            &CompileOptions {
+                alias: READ_ONLY_CATALOG_ALIAS,
+                suppression: &self.suppression,
+                derive_limit: None,
+            },
+        )?;
+        let est = explain_cost(&self.reader, &c).await;
+        let est_rows = est.est_rows;
+        if est_rows > self.guardrails.j_survivor_cap {
+            return Err(QueryError::SurvivorUnbounded);
+        }
+        Ok(if est_rows == 0 {
+            self.guardrails.j_survivor_cap
+        } else {
+            est_rows
+        })
+    }
+
+    /// Run a terminal `Characterize` segment (P): compile the three profile
+    /// queries, run them read-only under the statement-timeout, and assemble a
+    /// structured segment-vs-baseline profile (specs/12 §4, issue #9).
+    async fn run_characterize(&self, q: &SegmentQuery) -> Result<SyncResult> {
+        self.enforce_catalogue(q).await?;
+        let opts = CompileOptions {
+            alias: READ_ONLY_CATALOG_ALIAS,
+            suppression: &self.suppression,
+            derive_limit: None,
+        };
+        let queries = crate::compiler::compile_characterize(q, &opts)?;
+        let metrics = self
+            .timed_read(&queries.metrics.sql, queries.metrics.params)
+            .await?;
+        let recency = self
+            .timed_read(&queries.recency.sql, queries.recency.params)
+            .await?;
+        let categories = self
+            .timed_read(&queries.categories.sql, queries.categories.params)
+            .await?;
+        let profile = assemble_profile(&metrics, &recency, &categories);
+        let freshness = self.freshness.worst(&queries.metrics.sources, now_epoch());
+        Ok(SyncResult {
+            columns: vec!["profile".to_string()],
+            rows: vec![vec![profile]],
+            count: 1,
+            freshness,
+            query_id: format!("q_{}", uuid::Uuid::now_v7()),
+        })
     }
 
     /// Reject a segment that references a raw column absent from the
@@ -232,6 +310,12 @@ impl QueryEngine {
                 source: Error::Execution(BoxError::from(e)),
             })?;
 
+        // A terminal Characterize emits a structured profile, not rows — run
+        // the profile path instead of the row pipeline.
+        if has_characterize(q) {
+            return self.run_characterize(q).await;
+        }
+
         // Pre-flight: compile + EXPLAIN + enforce budgets (AC#3: over-budget is
         // rejected here, before the query executes).
         let (plan, compiled) = self.prepare(q).await?;
@@ -289,6 +373,18 @@ impl QueryEngine {
     ///   as `hit_reason`.
     /// - [`QueryError::Execution`] propagating ingestion/storage failures.
     pub async fn materialize(&self, q: &SegmentQuery, campaign_id: &str) -> Result<String> {
+        // A JIT Derive emits a metric, not a key set — it cannot materialise.
+        if has_derive(q) {
+            return Err(QueryError::InvalidDsl(
+                "a JIT Derive returns a metric, not a segment; it cannot be materialised".into(),
+            ));
+        }
+        // A Characterize emits a profile, not a key set — it cannot materialise.
+        if has_characterize(q) {
+            return Err(QueryError::InvalidDsl(
+                "a Characterize returns a profile, not a segment; it cannot be materialised".into(),
+            ));
+        }
         // Best-effort EXPLAIN: validates the segment compiles under the read
         // alias and surfaces a bad-DSL failure early, but does NOT enforce row
         // budgets (large is the point of materialising). Errors from EXPLAIN
@@ -306,7 +402,14 @@ impl QueryEngine {
 
         // Write path: recompile under the writable alias so the writer's
         // `INSERT … SELECT` resolves `dl.raw_*`.
-        let write = compile_with_alias(q, WRITE_CATALOG_ALIAS)?;
+        let write = compile_with_opts(
+            q,
+            &CompileOptions {
+                alias: WRITE_CATALOG_ALIAS,
+                suppression: &self.suppression,
+                derive_limit: None,
+            },
+        )?;
         let spec = SnapshotSpec {
             snapshot_id: snapshot_id.clone(),
             campaign_id: campaign_id.to_string(),
@@ -372,6 +475,114 @@ pub struct SnapshotMeta {
     pub row_count: u64,
 }
 
+/// Does the segment end in a JIT `Derive`?
+fn has_derive(q: &SegmentQuery) -> bool {
+    q.ops
+        .iter()
+        .any(|op| matches!(op, crate::ast::Op::Derive { .. }))
+}
+
+/// Does the segment end in a terminal `Characterize`?
+fn has_characterize(q: &SegmentQuery) -> bool {
+    q.ops
+        .iter()
+        .any(|op| matches!(op, crate::ast::Op::Characterize { .. }))
+}
+
+/// Assemble the structured profile JSON from the three characterize query
+/// results: `{ segment, baseline, ratios }` covering monetary (AOV), frequency,
+/// recency (days since last event) and category mix (specs/12 §4). Nulls are
+/// treated as 0; ratios guard division by zero.
+fn assemble_profile(
+    metrics: &QueryResult,
+    recency: &QueryResult,
+    categories: &QueryResult,
+) -> serde_json::Value {
+    use serde_json::json;
+
+    let cell = |row: &RowCells, i: usize| -> f64 {
+        row.get(i)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    };
+    let m = metrics.rows.first().cloned().unwrap_or_default();
+    let r = recency.rows.first().cloned().unwrap_or_default();
+    let seg_users = cell(&m, 0) as u64;
+    let base_users = cell(&m, 1) as u64;
+    let seg_aov = cell(&m, 2);
+    let base_aov = cell(&m, 3);
+    let seg_freq = cell(&m, 4);
+    let base_freq = cell(&m, 5);
+    let seg_recency = cell(&r, 0);
+    let base_recency = cell(&r, 1);
+
+    // Category mix: shares of the top categories (by segment count).
+    let mut seg_cat_total = 0.0_f64;
+    let mut base_cat_total = 0.0_f64;
+    let mut seg_mix: Vec<serde_json::Value> = Vec::new();
+    let mut base_mix: Vec<serde_json::Value> = Vec::new();
+    for row in &categories.rows {
+        let category = row
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let seg_n = cell(row, 1);
+        let base_n = cell(row, 2);
+        seg_cat_total += seg_n;
+        base_cat_total += base_n;
+        seg_mix.push(json!({ "category": category, "orders": seg_n }));
+        base_mix.push(json!({ "category": category, "orders": base_n }));
+    }
+    let share = |n: f64, total: f64| if total > 0.0 { n / total } else { 0.0 };
+    for v in seg_mix.iter_mut() {
+        let orders = v["orders"].as_f64().unwrap_or(0.0);
+        v["share"] = json!(share(orders, seg_cat_total));
+    }
+    for v in base_mix.iter_mut() {
+        let orders = v["orders"].as_f64().unwrap_or(0.0);
+        v["share"] = json!(share(orders, base_cat_total));
+    }
+
+    let ratio = |seg: f64, base: f64| if base != 0.0 { seg / base } else { 0.0 };
+    json!({
+        "segment": {
+            "users": seg_users,
+            "averageOrderValue": seg_aov,
+            "frequency": seg_freq,
+            "recencyDays": seg_recency,
+            "categoryMix": seg_mix,
+        },
+        "baseline": {
+            "users": base_users,
+            "averageOrderValue": base_aov,
+            "frequency": base_freq,
+            "recencyDays": base_recency,
+            "categoryMix": base_mix,
+        },
+        "ratios": {
+            "averageOrderValue": ratio(seg_aov, base_aov),
+            "frequency": ratio(seg_freq, base_freq),
+            "recencyDays": ratio(seg_recency, base_recency),
+        },
+    })
+}
+
+/// The narrowing segment: `q` with its terminal `Derive` op removed (parse
+/// enforces the Derive is last, so this is the preceding B/F narrowing).
+fn strip_derive(q: &SegmentQuery) -> SegmentQuery {
+    SegmentQuery {
+        source: q.source.clone(),
+        key: q.key.clone(),
+        ops: q
+            .ops
+            .iter()
+            .filter(|op| !matches!(op, crate::ast::Op::Derive { .. }))
+            .cloned()
+            .collect(),
+    }
+}
+
 /// Current epoch seconds (0 if the clock is before the epoch).
 fn now_epoch() -> i64 {
     SystemTime::now()
@@ -384,7 +595,7 @@ fn now_epoch() -> i64 {
 mod tests {
     use std::sync::Arc;
 
-    use consumer_engine_core::{FreshnessRegistry, GuardrailConfig};
+    use consumer_engine_core::{FreshnessRegistry, GuardrailConfig, SuppressionRules};
     use consumer_engine_execution::{Reader, ReaderLimits};
 
     use super::*;
@@ -434,6 +645,7 @@ mod tests {
                 ..GuardrailConfig::default()
             },
             Arc::new(FreshnessRegistry::new()),
+            SuppressionRules::default(),
         );
 
         let q = crate::parse::parse(serde_json::json!({
@@ -530,6 +742,7 @@ mod tests {
                 ..GuardrailConfig::default()
             },
             Arc::clone(&freshness),
+            SuppressionRules::default(),
         );
 
         // A query touching both sources (orders base intersect events).
@@ -638,6 +851,7 @@ mod tests {
             ingestion.clone(),
             guardrails,
             Arc::new(FreshnessRegistry::new()),
+            SuppressionRules::default(),
         );
         (tmp, ingestion, engine)
     }
@@ -717,6 +931,317 @@ mod tests {
         assert!(
             matches!(err, QueryError::InvalidDsl(_)),
             "expected InvalidDsl, got {err:?}"
+        );
+        ingestion.shutdown();
+    }
+
+    /// A JIT-derive fixture: `erp.orders` (user_id, amount) with `amount`
+    /// catalogued (plus a `sku` column for narrowing filters, also catalogued).
+    #[allow(clippy::type_complexity)]
+    async fn derive_engine(
+        guardrails: GuardrailConfig,
+    ) -> (
+        tempfile::TempDir,
+        consumer_engine_ingestion::IngestionHandle,
+        QueryEngine,
+    ) {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = consumer_engine_storage::Writer::attach(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("attach");
+        writer
+            .ingest_raw(
+                "erp",
+                "orders",
+                &["user_id".into(), "sku".into(), "amount".into()],
+                &[
+                    vec![Some("u1".into()), Some("A".into()), Some("10".into())],
+                    vec![Some("u1".into()), Some("A".into()), Some("20".into())],
+                ],
+            )
+            .expect("ingest");
+        let mut catalog = Vec::new();
+        for col in ["user_id", "sku", "amount"] {
+            catalog.push(consumer_engine_core::CatalogRow {
+                entity_type: "column".into(),
+                system: "erp".into(),
+                table_name: "orders".into(),
+                column_name: Some(col.into()),
+                semantic_type: consumer_engine_core::SemanticType::Identifier,
+                data_type: "VARCHAR".into(),
+                description: format!("column {col}"),
+                pii_flag: false,
+                sample_values: serde_json::json!([]),
+                embedding: vec![0.0; 4],
+            });
+        }
+        writer.write_catalog_rows(&catalog).expect("write catalog");
+        let ingestion = consumer_engine_ingestion::IngestionHandle::start(
+            writer,
+            Arc::new(consumer_engine_ingestion::ProducerRegistry::new()),
+        )
+        .expect("start");
+        let read_conn = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let attach_sql = consumer_engine_storage::read_only_attach_sql(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        );
+        let reader = Reader::start(read_conn, attach_sql, ReaderLimits::default()).expect("reader");
+        let engine = QueryEngine::new(
+            reader,
+            ingestion.clone(),
+            guardrails,
+            Arc::new(FreshnessRegistry::new()),
+            SuppressionRules::default(),
+        );
+        (tmp, ingestion, engine)
+    }
+
+    #[tokio::test]
+    async fn test_should_run_jit_derive_over_survivors() {
+        let (_tmp, ingestion, engine) = derive_engine(GuardrailConfig::default()).await;
+        let q = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"},
+            "key": "user_id",
+            "ops": [
+                {"kind":"filter","predicate":{"column":"sku","op":"eq","value":"A"}},
+                {"kind":"derive","name":"total_revenue",
+                 "metric":{"kind":"sum","event":{"system":"erp","entity":"orders"},"column":"amount"}}
+            ]
+        }))
+        .expect("parse");
+        let res = engine.run_sync(&q).await.expect("run");
+        // One row: [name, value]; the single survivor u1's amounts 10+20 = 30
+        // (the survivor LIMIT may be 1 for a tiny table, so keep one survivor
+        // to make the assertion deterministic).
+        assert_eq!(res.columns, vec!["name", "value"]);
+        assert_eq!(res.rows.len(), 1);
+        assert_eq!(res.rows[0][0], serde_json::json!("total_revenue"));
+        assert_eq!(res.rows[0][1], serde_json::json!(30.0));
+        ingestion.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_reject_derive_over_j_survivor_cap() {
+        // 100 rows / 50 distinct users: EXPLAIN estimates > 1 survivor, so a
+        // cap of 1 must reject the Derive (narrow first or precompute as F).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = consumer_engine_storage::Writer::attach(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("attach");
+        let rows: Vec<Vec<Option<String>>> = (0..100)
+            .map(|i| {
+                vec![
+                    Some(format!("u{}", i % 50)),
+                    Some("A".into()),
+                    Some("10".into()),
+                ]
+            })
+            .collect();
+        writer
+            .ingest_raw(
+                "erp",
+                "orders",
+                &["user_id".into(), "sku".into(), "amount".into()],
+                &rows,
+            )
+            .expect("ingest");
+        let mut catalog = Vec::new();
+        for col in ["user_id", "sku", "amount"] {
+            catalog.push(consumer_engine_core::CatalogRow {
+                entity_type: "column".into(),
+                system: "erp".into(),
+                table_name: "orders".into(),
+                column_name: Some(col.into()),
+                semantic_type: consumer_engine_core::SemanticType::Identifier,
+                data_type: "VARCHAR".into(),
+                description: format!("column {col}"),
+                pii_flag: false,
+                sample_values: serde_json::json!([]),
+                embedding: vec![0.0; 4],
+            });
+        }
+        writer.write_catalog_rows(&catalog).expect("write catalog");
+        let ingestion = consumer_engine_ingestion::IngestionHandle::start(
+            writer,
+            Arc::new(consumer_engine_ingestion::ProducerRegistry::new()),
+        )
+        .expect("start");
+        let read_conn = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let attach_sql = consumer_engine_storage::read_only_attach_sql(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        );
+        let reader = Reader::start(read_conn, attach_sql, ReaderLimits::default()).expect("reader");
+        let engine = QueryEngine::new(
+            reader,
+            ingestion.clone(),
+            GuardrailConfig {
+                j_survivor_cap: 1,
+                ..GuardrailConfig::default()
+            },
+            Arc::new(FreshnessRegistry::new()),
+            SuppressionRules::default(),
+        );
+        // Narrowing + derive over ~50 survivors with cap=1 must reject.
+        let q2 = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"},
+            "key": "user_id",
+            "ops": [
+                {"kind":"filter","predicate":{"column":"sku","op":"eq","value":"A"}},
+                {"kind":"derive","name":"total_revenue",
+                 "metric":{"kind":"sum","event":{"system":"erp","entity":"orders"},"column":"amount"}}
+            ]
+        }))
+        .expect("parse");
+        let err = engine
+            .run_sync(&q2)
+            .await
+            .expect_err("derive over 2 survivors with cap=1 must be rejected");
+        assert!(
+            matches!(err, QueryError::SurvivorUnbounded),
+            "expected SurvivorUnbounded, got {err:?}"
+        );
+        ingestion.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_emit_comparative_profile() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = consumer_engine_storage::Writer::attach(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("attach");
+        // u1 is a high spender (2 orders, one recent); u2 is baseline-only.
+        writer
+            .ingest_raw(
+                "erp",
+                "orders",
+                &[
+                    "user_id".into(),
+                    "ts".into(),
+                    "amount".into(),
+                    "category".into(),
+                ],
+                &[
+                    vec![
+                        Some("u1".into()),
+                        Some("2025-01-01T00:00:00Z".into()),
+                        Some("100".into()),
+                        Some("A".into()),
+                    ],
+                    vec![
+                        Some("u1".into()),
+                        Some("2025-01-02T00:00:00Z".into()),
+                        Some("200".into()),
+                        Some("B".into()),
+                    ],
+                    vec![
+                        Some("u2".into()),
+                        Some("2025-01-01T00:00:00Z".into()),
+                        Some("10".into()),
+                        Some("A".into()),
+                    ],
+                ],
+            )
+            .expect("ingest");
+        let mut catalog = Vec::new();
+        for col in ["user_id", "ts", "amount", "category"] {
+            catalog.push(consumer_engine_core::CatalogRow {
+                entity_type: "column".into(),
+                system: "erp".into(),
+                table_name: "orders".into(),
+                column_name: Some(col.into()),
+                semantic_type: consumer_engine_core::SemanticType::Identifier,
+                data_type: "VARCHAR".into(),
+                description: format!("column {col}"),
+                pii_flag: false,
+                sample_values: serde_json::json!([]),
+                embedding: vec![0.0; 4],
+            });
+        }
+        writer.write_catalog_rows(&catalog).expect("write catalog");
+        let ingestion = consumer_engine_ingestion::IngestionHandle::start(
+            writer,
+            Arc::new(consumer_engine_ingestion::ProducerRegistry::new()),
+        )
+        .expect("start");
+        let read_conn = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let attach_sql = consumer_engine_storage::read_only_attach_sql(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        );
+        let reader = Reader::start(read_conn, attach_sql, ReaderLimits::default()).expect("reader");
+        let engine = QueryEngine::new(
+            reader,
+            ingestion.clone(),
+            GuardrailConfig::default(),
+            Arc::new(FreshnessRegistry::new()),
+            SuppressionRules::default(),
+        );
+
+        // Segment = users with an order on/after 2025-01-02 (only u1); the
+        // profile compares u1 to the whole population (u1 + u2).
+        let q = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"},
+            "key": "user_id",
+            "ops": [
+                {"kind":"filter","predicate":{"column":"ts","op":"ge","value":"2025-01-02T00:00:00Z"}},
+                {"kind":"characterize",
+                 "event":{"system":"erp","entity":"orders"},
+                 "tsColumn":"ts","monetaryColumn":"amount","categoryColumn":"category"}
+            ]
+        }))
+        .expect("parse");
+        let res = engine.run_sync(&q).await.expect("run");
+        assert_eq!(res.columns, vec!["profile"]);
+        let p = &res.rows[0][0];
+        // Segment = {u1}; baseline = {u1, u2}.
+        assert_eq!(p["segment"]["users"], serde_json::json!(1));
+        assert_eq!(p["baseline"]["users"], serde_json::json!(2));
+        // AOV: segment (100+200)/2 = 150; baseline (100+200+10)/3 ~ 103.33.
+        assert!(
+            (p["segment"]["averageOrderValue"].as_f64().unwrap() - 150.0).abs() < 0.01,
+            "segment AOV: {}",
+            p["segment"]["averageOrderValue"]
+        );
+        assert!((p["baseline"]["averageOrderValue"].as_f64().unwrap() - 103.3333).abs() < 0.01);
+        // Ratio: 150 / 103.33 ~ 1.45x the baseline.
+        assert!(
+            (p["ratios"]["averageOrderValue"].as_f64().unwrap() - 1.4516).abs() < 0.01,
+            "aov ratio: {}",
+            p["ratios"]["averageOrderValue"]
+        );
+        // Frequency: segment 2 orders / 1 user = 2; baseline 3/2 = 1.5.
+        assert!((p["segment"]["frequency"].as_f64().unwrap() - 2.0).abs() < 0.01);
+        assert!((p["baseline"]["frequency"].as_f64().unwrap() - 1.5).abs() < 0.01);
+        // Category mix is non-empty with shares summing to 1.
+        let seg_mix = p["segment"]["categoryMix"].as_array().expect("mix");
+        assert!(!seg_mix.is_empty());
+        let share_sum: f64 = seg_mix
+            .iter()
+            .map(|v| v["share"].as_f64().unwrap_or(0.0))
+            .sum();
+        assert!(
+            (share_sum - 1.0).abs() < 0.01,
+            "segment category shares must sum to 1: {seg_mix:?}"
         );
         ingestion.shutdown();
     }

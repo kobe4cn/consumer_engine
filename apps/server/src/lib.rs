@@ -97,6 +97,7 @@ impl Engine {
             ingestion.clone(),
             config.guardrails.clone(),
             Arc::clone(&freshness),
+            config.suppression.clone(),
         );
         let compaction = tokio::spawn(supervise_compaction(
             ingestion.clone(),

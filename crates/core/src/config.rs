@@ -31,6 +31,9 @@ pub struct EngineConfig {
     /// Query guardrail budgets (see `specs/71-performance-budgets.md`).
     #[serde(default)]
     pub guardrails: GuardrailConfig,
+    /// Suppression rules consumed by the `Exclude` capability (specs/20 §5).
+    #[serde(default)]
+    pub suppression: SuppressionRules,
 }
 
 const fn default_compaction_interval() -> u64 {
@@ -138,6 +141,45 @@ impl Default for GuardrailConfig {
     }
 }
 
+/// Suppression rules consumed by the `Exclude` capability (specs/20 §5). Rules
+/// are config, not code; both toggles below are runtime-tunable YAML.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SuppressionRules {
+    /// Exclude a user from a campaign if they have any `targeted`/`delivered`
+    /// writeback for it (default on).
+    #[serde(default = "default_per_campaign_no_repeat")]
+    pub per_campaign_no_repeat: bool,
+    /// Global frequency cap: exclude a user with `>= max_contacts`
+    /// `targeted`/`delivered` writebacks in the last `window_days` days across
+    /// campaigns. `None` disables the cap (default).
+    #[serde(default)]
+    pub frequency_cap: Option<FrequencyCap>,
+}
+
+/// The global frequency cap: `N` contacts in `D` days (specs/20 §5).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FrequencyCap {
+    /// Maximum contacts (`N`).
+    pub max_contacts: u32,
+    /// The window, in days (`D`).
+    pub window_days: u32,
+}
+
+const fn default_per_campaign_no_repeat() -> bool {
+    true
+}
+
+impl Default for SuppressionRules {
+    fn default() -> Self {
+        Self {
+            per_campaign_no_repeat: default_per_campaign_no_repeat(),
+            frequency_cap: None,
+        }
+    }
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -147,6 +189,7 @@ impl Default for EngineConfig {
             micro_batch_flush_rows: default_micro_batch_rows(),
             bind: default_bind(),
             guardrails: GuardrailConfig::default(),
+            suppression: SuppressionRules::default(),
         }
     }
 }

@@ -7,13 +7,28 @@
 //! (invariant I1, `specs/12-query-engine.md`). Temporal windows use integer
 //! `INTERVAL '<n>' DAY` constants only.
 
-use consumer_engine_core::{READ_ONLY_CATALOG_ALIAS, split_feature_name};
+use consumer_engine_core::{READ_ONLY_CATALOG_ALIAS, SuppressionRules, split_feature_name};
 use duckdb::types::Value;
 
 use crate::{
-    ast::{Cmp, Dataset, Op, Predicate, SegmentQuery, SetOpKind},
+    ast::{Cmp, Dataset, JitMetric, Op, Predicate, SegmentQuery, SetOpKind},
     error::{QueryError, Result},
 };
+
+/// Compilation context: the catalog alias to render, the suppression rules for
+/// `Exclude` anti-joins (specs/20 §5), and the survivor-set `LIMIT` injected
+/// into a `Derive` CTE (specs/12 §4; set by the engine from the prior B/F
+/// stages' EXPLAIN).
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct CompileOptions<'a> {
+    /// The catalog alias to render (`dro` for reads, `dl` for the write path).
+    pub alias: &'a str,
+    /// Suppression rules governing `Exclude`.
+    pub suppression: &'a SuppressionRules,
+    /// Survivor-set count for a `Derive` CTE `LIMIT` (`None` = no Derive).
+    pub derive_limit: Option<u64>,
+}
 
 /// A compiled query: SQL text, bound parameters (in placeholder order), and the
 /// source datasets touched (for the freshness label, D5).
@@ -35,26 +50,50 @@ pub struct CompiledQuery {
 /// [`QueryError::InvalidDsl`] for M1-unsupported op orderings (e.g. an op after
 /// a `SetOp`, or a second `SetOp`).
 pub fn compile(q: &SegmentQuery) -> Result<CompiledQuery> {
-    compile_with_alias(q, READ_ONLY_CATALOG_ALIAS)
+    compile_with_opts(
+        q,
+        &CompileOptions {
+            alias: READ_ONLY_CATALOG_ALIAS,
+            suppression: &SuppressionRules::default(),
+            derive_limit: None,
+        },
+    )
 }
 
 /// Compile a validated segment query against an explicit catalog alias. The
 /// write path (`materialize`) passes [`consumer_engine_core::WRITE_CATALOG_ALIAS`]
 /// so the writer's `INSERT … SELECT` runs under the writable `dl` attach while
-/// the reader EXPLAINs under the read-only `dro` attach.
+/// the reader EXPLAINs under the read-only `dro` attach. Uses default
+/// suppression rules.
 ///
 /// # Errors
-/// [`QueryError::InvalidDsl`] for M1-unsupported op orderings (e.g. an op after
-/// a `SetOp`, or a second `SetOp`).
+/// [`QueryError::InvalidDsl`] for unsupported op orderings.
 pub fn compile_with_alias(q: &SegmentQuery, alias: &str) -> Result<CompiledQuery> {
-    compile_at(q, 0, alias)
+    compile_with_opts(
+        q,
+        &CompileOptions {
+            alias,
+            suppression: &SuppressionRules::default(),
+            derive_limit: None,
+        },
+    )
+}
+
+/// Compile a validated segment query with a full [`CompileOptions`] (the engine
+/// passes its suppression rules and, for a `Derive`, the survivor-set limit).
+///
+/// # Errors
+/// [`QueryError::InvalidDsl`] for unsupported op orderings.
+pub fn compile_with_opts(q: &SegmentQuery, opts: &CompileOptions<'_>) -> Result<CompiledQuery> {
+    compile_at(q, 0, opts)
 }
 
 /// Maximum SetOp nesting depth (defense-in-depth beyond serde_json's parse
 /// recursion limit; AGENTS.md § Resource Limits — set explicit depth limits).
 const MAX_NESTING: u8 = 8;
 
-fn compile_at(q: &SegmentQuery, depth: u8, alias: &str) -> Result<CompiledQuery> {
+fn compile_at(q: &SegmentQuery, depth: u8, opts: &CompileOptions<'_>) -> Result<CompiledQuery> {
+    let alias = opts.alias;
     if depth > MAX_NESTING {
         return Err(QueryError::InvalidDsl(format!(
             "segment nesting exceeds depth limit of {MAX_NESTING}"
@@ -129,10 +168,40 @@ fn compile_at(q: &SegmentQuery, depth: u8, alias: &str) -> Result<CompiledQuery>
             Op::SetOp { op, other } => {
                 setop = Some((op, other));
             }
-            // parse::validate rejects these for M3; defensive double-check.
-            Op::Exclude { .. } | Op::Derive | Op::Similar | Op::Characterize => {
+            // Exclude: anti-join against `suppression` (specs/20 §5).
+            Op::Exclude { campaign_id } => {
+                conjuncts.push(compile_exclude(campaign_id, &q.key, opts, &mut params)?);
+            }
+            // JIT Derive: terminal — wraps the survivor set in a CTE with an
+            // inner LIMIT (the survivor count from the prior B/F stages' plan)
+            // and computes the metric over the survivors' event rows.
+            Op::Derive { name, metric } => {
+                let limit = opts.derive_limit.ok_or_else(|| {
+                    QueryError::InvalidDsl(
+                        "Derive requires the survivor count; the engine must plan the prior B/F \
+                         stages first"
+                            .into(),
+                    )
+                })?;
+                let survivor = survivor_cte(&q.source, &q.key, &conjuncts, alias, limit);
+                let sql = compile_derive_metric(&survivor, name, metric, &mut params, alias)?;
+                return Ok(CompiledQuery {
+                    sql,
+                    params,
+                    sources,
+                });
+            }
+            // parse::validate rejects these until their phases land;
+            // defensive double-check.
+            Op::Similar => {
                 return Err(QueryError::InvalidDsl(
-                    "capability not supported in M3".into(),
+                    "capability not supported yet".into(),
+                ));
+            }
+            // Characterize is compiled by `compile_characterize`, not here.
+            Op::Characterize { .. } => {
+                return Err(QueryError::InvalidDsl(
+                    "Characterize must go through the profile path".into(),
                 ));
             }
         }
@@ -141,7 +210,7 @@ fn compile_at(q: &SegmentQuery, depth: u8, alias: &str) -> Result<CompiledQuery>
     // Reject any op appearing after the SetOp (the loop above sets `setop`; if a
     // later iteration added a conjunct, that's an op-after-setop).
     if let Some((kind, other)) = setop {
-        let other_c = compile_at(other, depth + 1, alias)?;
+        let other_c = compile_at(other, depth + 1, opts)?;
         let kw = setop_keyword(*kind);
         sources.extend(other_c.sources);
         let this_sql = base_select(&q.source, &q.key, &conjuncts, alias);
@@ -324,6 +393,211 @@ fn compile_lapsed(
 /// [`QueryError::InvalidDsl`] if the name cannot split into sound identifiers
 /// or the operator is not a numeric comparison (defence-in-depth; parse already
 /// rejects these).
+/// Build `SELECT DISTINCT base.<key> AS user_id FROM <alias>.raw_<s>_<e> base
+/// [WHERE <conjuncts>] LIMIT <limit>` — the survivor CTE a `Derive` computes
+/// over (specs/12 §4: inner LIMIT = survivor count).
+fn survivor_cte(
+    source: &Dataset,
+    key: &str,
+    conjuncts: &[String],
+    alias: &str,
+    limit: u64,
+) -> String {
+    let table = raw_table(source, alias);
+    let where_sql = if conjuncts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conjuncts.join(" AND "))
+    };
+    format!("SELECT DISTINCT base.{key} AS user_id FROM {table} base{where_sql} LIMIT {limit}")
+}
+
+/// Build the `Derive` metric SELECT over the survivor CTE: the event table
+/// joins survivors on `user_id` and aggregates per the metric. Emits one row
+/// `(name, value)`.
+///
+/// # Errors
+/// [`QueryError::InvalidDsl`] for an unsupported metric variant (defensive;
+/// parse validates the closed set).
+fn compile_derive_metric(
+    survivor: &str,
+    name: &str,
+    metric: &JitMetric,
+    params: &mut Vec<Value>,
+    alias: &str,
+) -> Result<String> {
+    let (event, agg): (&Dataset, String) = match metric {
+        JitMetric::Count { event } => (event, "count(*)".to_string()),
+        // Raw tables store every column as VARCHAR (ingest_raw), so numeric
+        // columns are cast to DOUBLE for aggregation.
+        JitMetric::Sum { event, column } => (event, format!("sum(CAST(e.{column} AS DOUBLE))")),
+        JitMetric::Avg { event, column } => (event, format!("avg(CAST(e.{column} AS DOUBLE))")),
+        JitMetric::Min { event, column } => (event, format!("min(CAST(e.{column} AS DOUBLE))")),
+        JitMetric::Max { event, column } => (event, format!("max(CAST(e.{column} AS DOUBLE))")),
+    };
+    // Bind the metric name (I1: no interpolated user values).
+    params.push(Value::Text(name.to_string()));
+    let table = raw_table(event, alias);
+    Ok(format!(
+        "WITH survivor AS ({survivor}) SELECT ? AS name, {agg} AS value FROM survivor s JOIN \
+         {table} e ON e.user_id = s.user_id",
+    ))
+}
+
+/// The three SQL queries a `Characterize` segment runs (P, specs/12 §4):
+/// row-level numeric metrics, per-user recency, and the category mix. Each
+/// embeds the same `segment` CTE (the survivors of the preceding ops) left-joined
+/// to the event table with an `in_seg` flag; the event table defines the
+/// population (baseline).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CharacterizeQueries {
+    /// Row-level aggregates: seg/base users, AOV, frequency.
+    pub metrics: CompiledQuery,
+    /// Per-user recency (avg days since last event) for segment vs baseline.
+    pub recency: CompiledQuery,
+    /// Category counts for segment vs baseline (ordered by segment count).
+    pub categories: CompiledQuery,
+}
+
+/// Compile a terminal `Characterize` segment into its three profile queries.
+/// The segment CTE is the preceding narrowing compile; columns are validated
+/// identifiers; timestamps are cast to `TIMESTAMP` for interval arithmetic
+/// (DuckDB lacks `TIMESTAMPTZ - TIMESTAMPTZ`).
+///
+/// # Errors
+/// [`QueryError::InvalidDsl`] if the segment does not end in `Characterize`.
+pub fn compile_characterize(
+    q: &SegmentQuery,
+    opts: &CompileOptions<'_>,
+) -> Result<CharacterizeQueries> {
+    let Some(Op::Characterize {
+        event,
+        ts_column,
+        monetary_column,
+        category_column,
+    }) = q.ops.last()
+    else {
+        return Err(QueryError::InvalidDsl(
+            "segment does not end in Characterize".into(),
+        ));
+    };
+
+    // The segment CTE = the narrowing part's compiled SQL (`SELECT DISTINCT …`).
+    let narrowing = strip_last_op(q);
+    let seg = compile_with_opts(&narrowing, opts)?;
+    let with_seg = format!("WITH segment AS ({})", seg.sql);
+    let event_table = raw_table(event, opts.alias);
+    let params = seg.params.clone();
+    let mut sources = seg.sources.clone();
+    sources.push(event.clone());
+
+    // Row-level metrics: users, AOV (avg amount), frequency (events per user).
+    let metrics = CompiledQuery {
+        sql: format!(
+            "{with_seg}, ev AS (SELECT e.user_id, CAST(e.{monetary_column} AS DOUBLE) AS amount, \
+             (s.user_id IS NOT NULL) AS in_seg FROM {event_table} e LEFT JOIN segment s ON \
+             s.user_id = e.user_id) SELECT (SELECT count(*) FROM segment) AS seg_users, (SELECT \
+             count(DISTINCT user_id) FROM ev) AS base_users, (SELECT sum(amount) FROM ev WHERE \
+             in_seg) * 1.0 / NULLIF((SELECT count(*) FROM ev WHERE in_seg), 0) AS seg_aov, \
+             (SELECT sum(amount) FROM ev) * 1.0 / NULLIF((SELECT count(*) FROM ev), 0) AS \
+             base_aov, (SELECT count(*) FROM ev WHERE in_seg) * 1.0 / NULLIF((SELECT \
+             count(DISTINCT user_id) FROM ev WHERE in_seg), 0) AS seg_freq, (SELECT count(*) FROM \
+             ev) * 1.0 / NULLIF((SELECT count(DISTINCT user_id) FROM ev), 0) AS base_freq",
+        ),
+        params: params.clone(),
+        sources: sources.clone(),
+    };
+
+    // Per-user recency: avg days since each user's last event.
+    let recency = CompiledQuery {
+        sql: format!(
+            "{with_seg}, ev AS (SELECT e.user_id, CAST(e.{ts_column} AS TIMESTAMP) AS ts, \
+             (s.user_id IS NOT NULL) AS in_seg FROM {event_table} e LEFT JOIN segment s ON \
+             s.user_id = e.user_id), per_user AS (SELECT user_id, bool_or(in_seg) AS in_seg, \
+             max(ts) AS last_ts FROM ev GROUP BY user_id) SELECT avg(extract(epoch FROM \
+             (CAST(now() AS TIMESTAMP) - last_ts)) / 86400.0) FILTER (WHERE in_seg) AS \
+             seg_recency_days, avg(extract(epoch FROM (CAST(now() AS TIMESTAMP) - last_ts)) / \
+             86400.0) AS base_recency_days FROM per_user",
+        ),
+        params: params.clone(),
+        sources: sources.clone(),
+    };
+
+    // Category mix: per-category counts for segment vs baseline (top by segment).
+    let categories = CompiledQuery {
+        sql: format!(
+            "{with_seg}, ev AS (SELECT e.user_id, e.{category_column} AS category, (s.user_id IS \
+             NOT NULL) AS in_seg FROM {event_table} e LEFT JOIN segment s ON s.user_id = \
+             e.user_id) SELECT category, count(*) FILTER (WHERE in_seg) AS seg_n, count(*) AS \
+             base_n FROM ev GROUP BY category ORDER BY seg_n DESC LIMIT 3",
+        ),
+        params,
+        sources,
+    };
+
+    Ok(CharacterizeQueries {
+        metrics,
+        recency,
+        categories,
+    })
+}
+
+/// The narrowing segment: `q` with its terminal op removed.
+fn strip_last_op(q: &SegmentQuery) -> SegmentQuery {
+    SegmentQuery {
+        source: q.source.clone(),
+        key: q.key.clone(),
+        ops: q
+            .ops
+            .iter()
+            .take(q.ops.len().saturating_sub(1))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Compile an `Exclude` op into anti-join conjuncts against `suppression`,
+/// governed by the suppression rules (specs/20 §5):
+/// - **per-campaign no-repeat** (default on): a user with any `targeted`/ `delivered` writeback for
+///   `campaign_id` is excluded from that campaign.
+/// - **global frequency cap** (configurable): a user with `>= max_contacts` `targeted`/`delivered`
+///   writebacks in the last `window_days` days across campaigns is excluded.
+///
+/// With both rules disabled the conjunct is a tautology (`1=1`). Values are
+/// bound; the action set and window are fixed validated constants.
+fn compile_exclude(
+    campaign_id: &str,
+    base_key: &str,
+    opts: &CompileOptions<'_>,
+    params: &mut Vec<Value>,
+) -> Result<String> {
+    let mut clauses: Vec<String> = Vec::new();
+    if opts.suppression.per_campaign_no_repeat {
+        params.push(Value::Text(campaign_id.to_string()));
+        clauses.push(format!(
+            "NOT EXISTS (SELECT 1 FROM {alias}.suppression s WHERE s.user_id = base.{base_key} \
+             AND s.campaign_id = ? AND s.action IN ('targeted', 'delivered'))",
+            alias = opts.alias,
+        ));
+    }
+    if let Some(cap) = opts.suppression.frequency_cap {
+        let (n, d) = (cap.max_contacts, cap.window_days);
+        params.push(Value::BigInt(i64::from(n)));
+        clauses.push(format!(
+            "NOT EXISTS (SELECT 1 FROM {alias}.suppression s WHERE s.user_id = base.{base_key} \
+             AND s.action IN ('targeted', 'delivered') AND s.occurred_ts >= CAST(CAST(now() AS \
+             TIMESTAMP) - INTERVAL '{d}' DAY AS TIMESTAMPTZ) GROUP BY s.user_id HAVING count(*) \
+             >= ?)",
+            alias = opts.alias,
+        ));
+    }
+    if clauses.is_empty() {
+        return Ok("1=1".to_string());
+    }
+    Ok(clauses.join(" AND "))
+}
+
 fn compile_feature(
     name: &str,
     op: Cmp,
@@ -533,6 +807,177 @@ mod tests {
             "feature view must not be a freshness source: {:?}",
             c.sources
         );
+    }
+
+    #[test]
+    fn test_should_compile_exclude_as_anti_join() {
+        use consumer_engine_core::SuppressionRules;
+        let q = orders(vec![Op::Exclude {
+            campaign_id: "c1".into(),
+        }]);
+        let c = compile_with_opts(
+            &q,
+            &CompileOptions {
+                alias: READ_ONLY_CATALOG_ALIAS,
+                suppression: &SuppressionRules::default(),
+                derive_limit: None,
+            },
+        )
+        .expect("compile");
+        assert!(
+            c.sql
+                .contains("NOT EXISTS (SELECT 1 FROM dro.suppression s"),
+            "expected anti-join against suppression: {}",
+            c.sql
+        );
+        assert!(c.sql.contains("s.campaign_id = ?"), "{}", c.sql);
+        assert!(
+            c.sql.contains("'targeted', 'delivered'"),
+            "no-repeat action set must be targeted/delivered: {}",
+            c.sql
+        );
+        assert_eq!(c.params, vec![Value::Text("c1".into())]);
+        // suppression must not become a freshness source.
+        assert!(c.sources.iter().all(|d| d.entity != "suppression"));
+    }
+
+    #[test]
+    fn test_should_compile_frequency_cap_when_configured() {
+        use consumer_engine_core::{FrequencyCap, SuppressionRules};
+        let q = orders(vec![Op::Exclude {
+            campaign_id: "c1".into(),
+        }]);
+        let c = compile_with_opts(
+            &q,
+            &CompileOptions {
+                alias: READ_ONLY_CATALOG_ALIAS,
+                suppression: &SuppressionRules {
+                    per_campaign_no_repeat: true,
+                    frequency_cap: Some(FrequencyCap {
+                        max_contacts: 3,
+                        window_days: 30,
+                    }),
+                },
+                derive_limit: None,
+            },
+        )
+        .expect("compile");
+        assert!(
+            c.sql.contains("INTERVAL '30' DAY"),
+            "frequency window must be injected: {}",
+            c.sql
+        );
+        assert!(
+            c.sql.contains("HAVING count(*) >= ?"),
+            "cap threshold must be bound: {}",
+            c.sql
+        );
+        // campaign_id + max_contacts bound.
+        assert_eq!(c.params.len(), 2);
+    }
+
+    #[test]
+    fn test_should_compile_exclude_tautology_when_all_rules_off() {
+        use consumer_engine_core::SuppressionRules;
+        let q = orders(vec![Op::Exclude {
+            campaign_id: "c1".into(),
+        }]);
+        let c = compile_with_opts(
+            &q,
+            &CompileOptions {
+                alias: READ_ONLY_CATALOG_ALIAS,
+                suppression: &SuppressionRules {
+                    per_campaign_no_repeat: false,
+                    frequency_cap: None,
+                },
+                derive_limit: None,
+            },
+        )
+        .expect("compile");
+        assert!(
+            c.sql.contains("1=1"),
+            "all rules off must be a tautology: {}",
+            c.sql
+        );
+        assert!(c.params.is_empty());
+    }
+
+    #[test]
+    fn test_should_compile_derive_with_survivor_cte() {
+        use consumer_engine_core::SuppressionRules;
+        let q = orders(vec![
+            Op::Filter {
+                predicate: Predicate {
+                    column: "sku".into(),
+                    op: Cmp::Eq,
+                    value: serde_json::json!("A"),
+                },
+            },
+            Op::Derive {
+                name: "total_revenue".into(),
+                metric: JitMetric::Sum {
+                    event: Dataset {
+                        system: "erp".into(),
+                        entity: "orders".into(),
+                    },
+                    column: "amount".into(),
+                },
+            },
+        ]);
+        let c = compile_with_opts(
+            &q,
+            &CompileOptions {
+                alias: READ_ONLY_CATALOG_ALIAS,
+                suppression: &SuppressionRules::default(),
+                derive_limit: Some(42),
+            },
+        )
+        .expect("compile");
+        assert!(
+            c.sql.contains(
+                "WITH survivor AS (SELECT DISTINCT base.user_id AS user_id FROM \
+                 dro.raw_erp_orders base WHERE base.sku = ? LIMIT 42)"
+            ),
+            "expected survivor CTE with inner LIMIT: {}",
+            c.sql
+        );
+        assert!(
+            c.sql.contains(
+                "SELECT ? AS name, sum(CAST(e.amount AS DOUBLE)) AS value FROM survivor s JOIN \
+                 dro.raw_erp_orders e ON e.user_id = s.user_id"
+            ),
+            "expected metric join over survivors: {}",
+            c.sql
+        );
+        // sku bound + metric name bound (no interpolated values).
+        assert_eq!(
+            c.params,
+            vec![Value::Text("A".into()), Value::Text("total_revenue".into())]
+        );
+    }
+
+    #[test]
+    fn test_should_require_derive_limit_to_compile() {
+        use consumer_engine_core::SuppressionRules;
+        let q = orders(vec![Op::Derive {
+            name: "n".into(),
+            metric: JitMetric::Count {
+                event: Dataset {
+                    system: "erp".into(),
+                    entity: "orders".into(),
+                },
+            },
+        }]);
+        // No derive_limit (and no narrowing) must fail at compile.
+        let res = compile_with_opts(
+            &q,
+            &CompileOptions {
+                alias: READ_ONLY_CATALOG_ALIAS,
+                suppression: &SuppressionRules::default(),
+                derive_limit: None,
+            },
+        );
+        assert!(matches!(res, Err(QueryError::InvalidDsl(_))));
     }
 
     #[test]

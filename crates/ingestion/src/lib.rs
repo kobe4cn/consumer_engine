@@ -16,7 +16,9 @@
 
 use std::{collections::HashSet, path::PathBuf, sync::Arc, thread};
 
-use consumer_engine_core::{BoxError, CatalogRow, Error, FeatureRow, Result, SnapshotSpec};
+use consumer_engine_core::{
+    BoxError, CatalogRow, Error, FeatureRow, Result, SnapshotSpec, SuppressionRow,
+};
 use consumer_engine_storage::Writer;
 use duckdb::types::Value;
 
@@ -82,6 +84,13 @@ enum Cmd {
     WriteCatalog {
         /// The catalog rows to append.
         rows: Vec<CatalogRow>,
+        /// Reply channel carrying the inserted row count.
+        reply: flume::Sender<Result<usize>>,
+    },
+    /// Append suppression writebacks idempotently (Q3, E1).
+    WriteSuppression {
+        /// The suppression rows to append (deduped by `suppression_id`).
+        rows: Vec<SuppressionRow>,
         /// Reply channel carrying the inserted row count.
         reply: flume::Sender<Result<usize>>,
     },
@@ -236,6 +245,21 @@ impl IngestionHandle {
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?
     }
 
+    /// Append suppression writebacks idempotently (Q3, E1). Returns the number
+    /// of rows actually inserted (duplicates by `suppression_id` are skipped).
+    ///
+    /// # Errors
+    /// Propagates storage errors from the writer.
+    pub async fn write_suppression(&self, rows: Vec<SuppressionRow>) -> Result<usize> {
+        let (rtx, rrx) = flume::bounded(1);
+        self.tx
+            .send(Cmd::WriteSuppression { rows, reply: rtx })
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
+        rrx.recv_async()
+            .await
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?
+    }
+
     /// Run the producer registered under `id` at `as_of` and persist its output
     /// to `feature_store`. The producer reads on the caller's async task; only
     /// the write crosses into the single writer thread (spec 20 I1).
@@ -314,6 +338,10 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>) {
             }
             Cmd::WriteCatalog { rows, reply } => {
                 let res = writer.write_catalog_rows(&rows);
+                let _ = reply.send(res);
+            }
+            Cmd::WriteSuppression { rows, reply } => {
+                let res = writer.write_suppression_idempotent(&rows);
                 let _ = reply.send(res);
             }
             Cmd::Shutdown => break,

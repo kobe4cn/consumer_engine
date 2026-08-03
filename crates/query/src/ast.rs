@@ -93,12 +93,75 @@ pub enum Op {
         /// Comparison value (a JSON number, deserialised to `f64`).
         value: f64,
     },
-    /// JIT derive (J) — phase T7a.
-    Derive,
+    /// JIT derive (J): compute a metric at query time over the survivor set
+    /// left by the preceding B/F narrowing, under `j_survivor_cap` (specs/12
+    /// §4). Terminal — must be the last op.
+    #[serde(rename_all = "camelCase")]
+    Derive {
+        /// Metric name (validated identifier; the output column).
+        name: String,
+        /// The aggregate to compute over the survivors' event rows.
+        metric: JitMetric,
+    },
     /// Similarity / lookalike (S) — phase 2.
     Similar,
-    /// Comparative characterisation (P) — phase T7b.
-    Characterize,
+    /// Comparative characterisation (P): a terminal node that emits a structured
+    /// profile comparing the segment (survivors of the preceding ops) to the
+    /// whole population over an event table — recency, frequency, monetary and
+    /// category-mix aggregations with ratios (specs/12 §4, issue #9).
+    #[serde(rename_all = "camelCase")]
+    Characterize {
+        /// The metric source (raw event table) — defines the population.
+        event: Dataset,
+        /// Event timestamp column (recency).
+        ts_column: String,
+        /// Event monetary column (AOV).
+        monetary_column: String,
+        /// Event category column (category mix).
+        category_column: String,
+    },
+}
+
+/// A JIT metric: an aggregate over the event rows of the survivor set (J, D7).
+/// `Count` is the total event rows among survivors; the others aggregate a
+/// named numeric column of the event table. The event table joins survivors on
+/// its `user_id` column (the engine's key convention).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum JitMetric {
+    /// Total event rows among survivors.
+    Count {
+        /// The event relation.
+        event: Dataset,
+    },
+    /// Sum of `column` over survivor event rows.
+    Sum {
+        /// The event relation.
+        event: Dataset,
+        /// Numeric column to sum.
+        column: String,
+    },
+    /// Average of `column` over survivor event rows.
+    Avg {
+        /// The event relation.
+        event: Dataset,
+        /// Numeric column to average.
+        column: String,
+    },
+    /// Minimum of `column` over survivor event rows.
+    Min {
+        /// The event relation.
+        event: Dataset,
+        /// Numeric column to take the min of.
+        column: String,
+    },
+    /// Maximum of `column` over survivor event rows.
+    Max {
+        /// The event relation.
+        event: Dataset,
+        /// Numeric column to take the max of.
+        column: String,
+    },
 }
 
 /// Set operator.
@@ -224,12 +287,47 @@ fn collect_columns(q: &SegmentQuery, out: &mut Vec<ReferencedColumn>) {
                 }
             }
             Op::SetOp { other, .. } => collect_columns(other, out),
+            Op::Derive { metric, .. } => {
+                // The metric's event table is read by user_id (join key) plus an
+                // optional named column — both are raw catalogue references.
+                let (event, column): (&Dataset, Option<&str>) = match metric {
+                    JitMetric::Count { event } => (event, None),
+                    JitMetric::Sum { event, column }
+                    | JitMetric::Avg { event, column }
+                    | JitMetric::Min { event, column }
+                    | JitMetric::Max { event, column } => (event, Some(column)),
+                };
+                out.push(ReferencedColumn {
+                    system: event.system.clone(),
+                    entity: event.entity.clone(),
+                    column: "user_id".into(),
+                });
+                if let Some(col) = column {
+                    out.push(ReferencedColumn {
+                        system: event.system.clone(),
+                        entity: event.entity.clone(),
+                        column: col.into(),
+                    });
+                }
+            }
             // Derived/campaign references are not raw catalogued columns.
-            Op::Feature { .. }
-            | Op::Exclude { .. }
-            | Op::Derive
-            | Op::Similar
-            | Op::Characterize => {}
+            Op::Feature { .. } | Op::Exclude { .. } | Op::Similar => {}
+            Op::Characterize {
+                event,
+                ts_column,
+                monetary_column,
+                category_column,
+            } => {
+                // The profile reads the event table's user_id + the three
+                // named columns — all raw catalogue references.
+                for col in ["user_id", ts_column, monetary_column, category_column] {
+                    out.push(ReferencedColumn {
+                        system: event.system.clone(),
+                        entity: event.entity.clone(),
+                        column: col.into(),
+                    });
+                }
+            }
         }
     }
 }

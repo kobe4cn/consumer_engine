@@ -33,6 +33,7 @@ pub mod catalog;
 pub mod jobs;
 pub mod presign;
 pub mod producers;
+pub mod suppression;
 
 pub use jobs::{JobRegistry, JobStatus};
 
@@ -134,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         .route("/query", post(query))
         .route("/catalog", get(catalog::get_catalog))
         .route("/producers/run", post(producers::run_producer))
+        .route("/suppression", post(suppression::post_suppression))
         .route("/jobs", post(jobs::post_jobs))
         .route("/jobs/{id}", get(jobs::get_job))
         .route("/audience/{snapshot_id}", get(audience::get_audience))

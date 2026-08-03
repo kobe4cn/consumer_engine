@@ -9,7 +9,7 @@
 use consumer_engine_core::{split_feature_name, validate_ident};
 
 use crate::{
-    ast::{Cmp, Dataset, Op, Predicate, SegmentQuery},
+    ast::{Cmp, Dataset, JitMetric, Op, Predicate, SegmentQuery},
     error::{QueryError, Result},
 };
 
@@ -47,6 +47,7 @@ pub fn validate(q: &SegmentQuery) -> Result<()> {
     for op in &q.ops {
         validate_op(op)?;
     }
+    validate_positions(q)?;
     Ok(())
 }
 
@@ -82,14 +83,83 @@ fn validate_op(op: &Op) -> Result<()> {
             Ok(())
         }
         Op::SetOp { other, .. } => validate(other),
-        Op::Exclude { .. } => Err(invalid(
-            "Exclude is not supported in M3 (requires the suppression table, phase 5)",
-        )),
+        Op::Exclude { campaign_id } => validate_ident_field(campaign_id, "exclude.campaignId"),
         Op::Feature { name, op, .. } => validate_feature(name, op),
-        Op::Derive | Op::Similar | Op::Characterize => Err(invalid(
-            "Derive/Similar/Characterize are not supported in M3",
-        )),
+        Op::Derive { name, metric } => validate_derive(name, metric),
+        Op::Characterize {
+            event,
+            ts_column,
+            monetary_column,
+            category_column,
+        } => validate_characterize(event, ts_column, monetary_column, category_column),
+        Op::Similar => Err(invalid("Similar is not supported yet")),
     }
+}
+
+/// Validate a `Characterize` op: the metric source is a valid dataset and the
+/// three named columns are sound identifiers. Position invariants (terminal,
+/// may follow narrowing) are enforced by [`validate_positions`].
+fn validate_characterize(
+    event: &Dataset,
+    ts_column: &str,
+    monetary_column: &str,
+    category_column: &str,
+) -> Result<()> {
+    validate_dataset(event)?;
+    validate_ident_field(ts_column, "characterize.tsColumn")?;
+    validate_ident_field(monetary_column, "characterize.monetaryColumn")?;
+    validate_ident_field(category_column, "characterize.categoryColumn")?;
+    Ok(())
+}
+
+/// Validate a `Derive` op: the metric name and any metric column are sound
+/// identifiers, and the metric's event relation is a valid dataset. Position
+/// invariants (must follow B/F narrowing, must be terminal) are enforced by
+/// [`validate_positions`].
+fn validate_derive(name: &str, metric: &JitMetric) -> Result<()> {
+    validate_ident_field(name, "derive.name")?;
+    let (event, column): (&Dataset, Option<&str>) = match metric {
+        JitMetric::Count { event } => (event, None),
+        JitMetric::Sum { event, column }
+        | JitMetric::Avg { event, column }
+        | JitMetric::Min { event, column }
+        | JitMetric::Max { event, column } => (event, Some(column)),
+    };
+    validate_dataset(event)?;
+    if let Some(c) = column {
+        validate_ident_field(c, "derive.metric.column")?;
+    }
+    Ok(())
+}
+
+/// Enforce op-position invariants (specs/12 §4 I5): a terminal metric/profile
+/// op (`Derive`, and later `Characterize`) must follow at least one B/F
+/// narrowing op and must be the final op of the segment.
+fn validate_positions(q: &SegmentQuery) -> Result<()> {
+    let mut narrowing_seen = false;
+    for (i, op) in q.ops.iter().enumerate() {
+        match op {
+            Op::Filter { .. }
+            | Op::Recency { .. }
+            | Op::Lapsed { .. }
+            | Op::Feature { .. }
+            | Op::SetOp { .. }
+            | Op::Exclude { .. } => narrowing_seen = true,
+            Op::Derive { .. } | Op::Characterize { .. } => {
+                if !narrowing_seen {
+                    return Err(invalid(
+                        "Derive must follow B/F narrowing (filter/lapsed/recency/feature)",
+                    ));
+                }
+                if i + 1 != q.ops.len() {
+                    return Err(invalid("Derive must be the final op of the segment"));
+                }
+                return Ok(());
+            }
+            Op::Similar => return Err(invalid("Similar is not supported yet")),
+        }
+    }
+    Ok(())
 }
 
 /// Validate a `Feature` op: the namespaced name must split into two sound
@@ -201,8 +271,103 @@ mod tests {
 
     #[test]
     fn test_should_reject_unsupported_capability() {
-        // Derive/Similar/Characterize remain forward-contract stubs in M3.
-        let q = orders_q(vec![Op::Derive]);
+        // Similar remains a forward-contract stub.
+        let q = orders_q(vec![Op::Similar]);
+        assert!(matches!(validate(&q), Err(QueryError::InvalidDsl(_))));
+    }
+
+    #[test]
+    fn test_should_validate_derive_with_narrowing() {
+        let q = orders_q(vec![
+            Op::Filter {
+                predicate: Predicate {
+                    column: "sku".into(),
+                    op: Cmp::Eq,
+                    value: serde_json::json!("A"),
+                },
+            },
+            Op::Derive {
+                name: "total_revenue".into(),
+                metric: JitMetric::Sum {
+                    event: Dataset {
+                        system: "erp".into(),
+                        entity: "orders".into(),
+                    },
+                    column: "amount".into(),
+                },
+            },
+        ]);
+        assert!(
+            validate(&q).is_ok(),
+            "narrowing + terminal derive must pass"
+        );
+    }
+
+    #[test]
+    fn test_should_reject_derive_without_narrowing() {
+        let q = orders_q(vec![Op::Derive {
+            name: "total_revenue".into(),
+            metric: JitMetric::Count {
+                event: Dataset {
+                    system: "erp".into(),
+                    entity: "orders".into(),
+                },
+            },
+        }]);
+        assert!(matches!(validate(&q), Err(QueryError::InvalidDsl(_))));
+    }
+
+    #[test]
+    fn test_should_reject_derive_not_terminal() {
+        let q = orders_q(vec![
+            Op::Filter {
+                predicate: Predicate {
+                    column: "sku".into(),
+                    op: Cmp::Eq,
+                    value: serde_json::json!("A"),
+                },
+            },
+            Op::Derive {
+                name: "total_revenue".into(),
+                metric: JitMetric::Count {
+                    event: Dataset {
+                        system: "erp".into(),
+                        entity: "orders".into(),
+                    },
+                },
+            },
+            Op::Filter {
+                predicate: Predicate {
+                    column: "sku".into(),
+                    op: Cmp::Eq,
+                    value: serde_json::json!("B"),
+                },
+            },
+        ]);
+        assert!(matches!(validate(&q), Err(QueryError::InvalidDsl(_))));
+    }
+
+    #[test]
+    fn test_should_reject_derive_with_bad_metric_column() {
+        let q = orders_q(vec![
+            Op::Filter {
+                predicate: Predicate {
+                    column: "sku".into(),
+                    op: Cmp::Eq,
+                    value: serde_json::json!("A"),
+                },
+            },
+            Op::Derive {
+                name: "total_revenue".into(),
+                metric: JitMetric::Sum {
+                    event: Dataset {
+                        system: "erp".into(),
+                        entity: "orders".into(),
+                    },
+                    column: "bad col!".into(),
+                },
+            },
+        ]);
         assert!(matches!(validate(&q), Err(QueryError::InvalidDsl(_))));
     }
 
@@ -252,12 +417,16 @@ mod tests {
     }
 
     #[test]
-    fn test_should_reject_exclude_in_m1() {
-        let q = orders_q(vec![Op::Exclude {
+    fn test_should_validate_exclude_campaign_id() {
+        // A valid campaign id passes; a bad one is rejected.
+        let ok = orders_q(vec![Op::Exclude {
             campaign_id: "c1".into(),
         }]);
-        let res = validate(&q);
-        assert!(matches!(res, Err(QueryError::InvalidDsl(_))));
+        assert!(validate(&ok).is_ok());
+        let bad = orders_q(vec![Op::Exclude {
+            campaign_id: "bad id!".into(),
+        }]);
+        assert!(matches!(validate(&bad), Err(QueryError::InvalidDsl(_))));
     }
 
     #[test]

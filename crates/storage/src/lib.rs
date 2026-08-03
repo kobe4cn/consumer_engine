@@ -17,7 +17,7 @@ use std::path::Path;
 
 use consumer_engine_core::{
     BoxError, CatalogRow, Error, FeatureRow, READ_ONLY_CATALOG_ALIAS, Result, SnapshotSpec,
-    WRITE_CATALOG_ALIAS, validate_feature_name, validate_ident,
+    SuppressionRow, WRITE_CATALOG_ALIAS, validate_feature_name, validate_ident,
 };
 use duckdb::{Connection, types::Value};
 use fs2::FileExt;
@@ -125,6 +125,60 @@ impl Writer {
         self.conn
             .execute_batch(&sql)
             .map_err(|e| Error::Storage(BoxError::from(e)))
+    }
+
+    /// Create the `suppression` table if absent. No PRIMARY KEY — DuckLake
+    /// rejects constraints (specs/10 §2); idempotency is enforced by the write
+    /// path on the `suppression_id` logical key (specs/20 §5, E1).
+    pub fn ensure_suppression_table(&self) -> Result<()> {
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.suppression (suppression_id UUID, \
+             campaign_id VARCHAR, user_id VARCHAR, channel VARCHAR, action VARCHAR, occurred_ts \
+             TIMESTAMPTZ, received_ts TIMESTAMPTZ)"
+        );
+        self.conn
+            .execute_batch(&sql)
+            .map_err(|e| Error::Storage(BoxError::from(e)))
+    }
+
+    /// Append suppression rows **idempotently**: a row whose `suppression_id`
+    /// already exists is skipped (the delivery system supplies the id for
+    /// dedup — re-POSTing the same outcome writes nothing new, specs/21 §4 E1).
+    /// Returns the number of rows actually inserted.
+    ///
+    /// # Errors
+    /// [`Error::Storage`] on insert failure.
+    pub fn write_suppression_idempotent(&self, rows: &[SuppressionRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_suppression_table()?;
+        let insert = format!(
+            "INSERT INTO {WRITE_CATALOG_ALIAS}.suppression (suppression_id, campaign_id, user_id, \
+             channel, action, occurred_ts, received_ts) SELECT CAST(? AS UUID), ?, ?, ?, ?, \
+             CAST(? AS TIMESTAMPTZ), CAST(? AS TIMESTAMPTZ) WHERE NOT EXISTS (SELECT 1 FROM \
+             {WRITE_CATALOG_ALIAS}.suppression WHERE suppression_id = CAST(? AS UUID))"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&insert)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let mut written = 0usize;
+        for r in rows {
+            written += stmt
+                .execute(duckdb::params![
+                    r.suppression_id,
+                    r.campaign_id,
+                    r.user_id,
+                    r.channel.as_str(),
+                    r.action.as_str(),
+                    r.occurred_ts,
+                    r.received_ts,
+                    r.suppression_id,
+                ])
+                .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        }
+        Ok(written)
     }
 
     /// Append feature rows to `feature_store`. Append-only: a newer `as_of_ts`
@@ -682,6 +736,64 @@ mod tests {
             w.write_feature_rows(&[r]),
             Err(Error::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn test_should_write_suppression_idempotently() {
+        use consumer_engine_core::{SuppressionAction, SuppressionChannel};
+        let (_tmp, w) = tmp_writer();
+        let row = SuppressionRow {
+            suppression_id: "11111111-2222-3333-4444-555555555555".into(),
+            campaign_id: "c1".into(),
+            user_id: "u1".into(),
+            channel: SuppressionChannel::Email,
+            action: SuppressionAction::Delivered,
+            occurred_ts: "2025-01-01T00:00:00Z".into(),
+            received_ts: "2025-01-01T00:00:01Z".into(),
+        };
+        // First write inserts; re-writing the same suppression_id is a no-op.
+        let n1 = w
+            .write_suppression_idempotent(std::slice::from_ref(&row))
+            .expect("write");
+        let n2 = w
+            .write_suppression_idempotent(std::slice::from_ref(&row))
+            .expect("write");
+        assert_eq!(n1, 1, "first write must insert");
+        assert_eq!(
+            n2, 0,
+            "duplicate suppression_id must be skipped (idempotent)"
+        );
+        let count: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM dl.suppression", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "only one row despite the re-POST");
+    }
+
+    #[test]
+    fn test_should_persist_suppression_across_restart() {
+        // Write-through durability: an acked writeback survives a restart (the
+        // "restart replays queued writeback without loss" AC — the ack is only
+        // sent after the DuckLake commit).
+        use consumer_engine_core::{SuppressionAction, SuppressionChannel};
+        let (tmp, w) = tmp_writer();
+        w.write_suppression_idempotent(&[SuppressionRow {
+            suppression_id: "11111111-2222-3333-4444-555555555555".into(),
+            campaign_id: "c1".into(),
+            user_id: "u1".into(),
+            channel: SuppressionChannel::Email,
+            action: SuppressionAction::Delivered,
+            occurred_ts: "2025-01-01T00:00:00Z".into(),
+            received_ts: "2025-01-01T00:00:01Z".into(),
+        }])
+        .expect("write");
+        drop(w);
+        let r =
+            open_reader(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("read attach");
+        let count: i64 = r
+            .query_row("SELECT count(*) FROM dro.suppression", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "suppression must survive restart");
     }
 
     #[test]

@@ -153,12 +153,25 @@ async fn post_filter_job(client: &reqwest::Client, base: &str, campaign_id: &str
 
 /// Like [`spawn`] but with custom guardrail budgets.
 async fn spawn_guardrails(guardrails: consumer_engine_core::GuardrailConfig) -> String {
+    spawn_with(
+        guardrails,
+        consumer_engine_core::SuppressionRules::default(),
+    )
+    .await
+}
+
+/// Like [`spawn`] but with custom guardrail budgets + suppression rules.
+async fn spawn_with(
+    guardrails: consumer_engine_core::GuardrailConfig,
+    suppression: consumer_engine_core::SuppressionRules,
+) -> String {
     let tmp = tempfile::tempdir().expect("tmp");
     let cfg = EngineConfig {
         catalog_path: tmp.path().join("cat.db"),
         data_path: tmp.path().join("data"),
         compaction_interval_secs: 0, // disable periodic compaction in tests
         guardrails,
+        suppression,
         ..EngineConfig::default()
     };
     let (router, engine) = Engine::build(&cfg).expect("build engine");
@@ -912,4 +925,287 @@ async fn test_should_catalog_returns_bounded_candidates() {
             arr.len()
         );
     }
+}
+
+// --- M4: closed suppression loop (Phase 5) ---
+
+/// POST a suppression writeback; asserts 201 with the suppression id.
+async fn post_suppression(
+    client: &reqwest::Client,
+    base: &str,
+    body: &serde_json::Value,
+) -> String {
+    let resp = client
+        .post(format!("{base}/suppression"))
+        .json(body)
+        .send()
+        .await
+        .expect("post suppression");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "POST /suppression must be 201: {}",
+        resp.status()
+    );
+    let v: Value = resp.json().await.expect("json");
+    v["suppressionId"]
+        .as_str()
+        .expect("suppressionId")
+        .to_string()
+}
+
+#[tokio::test]
+async fn test_should_exclude_suppressed_users_from_rerun() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "sku"],
+        vec![vec!["u1", "A"], vec!["u2", "B"]],
+    )
+    .await;
+
+    // u1 gets a delivered writeback for campaign c1.
+    let id = post_suppression(
+        &client,
+        &base,
+        &serde_json::json!({
+            "suppressionId": "11111111-2222-3333-4444-555555555555",
+            "campaignId": "c1", "userId": "u1",
+            "channel": "email", "action": "delivered",
+            "occurredTs": "2025-01-01T00:00:00Z"
+        }),
+    )
+    .await;
+    assert_eq!(id, "11111111-2222-3333-4444-555555555555");
+
+    // Re-POST the same suppressionId is a no-op (idempotent): still 201, same id.
+    let id2 = post_suppression(
+        &client,
+        &base,
+        &serde_json::json!({
+            "suppressionId": "11111111-2222-3333-4444-555555555555",
+            "campaignId": "c1", "userId": "u1",
+            "channel": "email", "action": "delivered",
+            "occurredTs": "2025-01-01T00:00:00Z"
+        }),
+    )
+    .await;
+    assert_eq!(id2, id);
+
+    // Segment for c1 with Exclude: u1 (suppressed) absent, u2 present.
+    let dsl = serde_json::json!({
+        "source": {"system":"erp","entity":"orders"},
+        "key": "user_id",
+        "ops": [{"kind":"exclude","campaignId":"c1"}]
+    });
+    let q = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({ "dsl": dsl }))
+        .send()
+        .await
+        .expect("query");
+    assert!(q.status().is_success(), "query failed: {}", q.status());
+    let qv: Value = q.json().await.expect("json");
+    let users = first_column(&qv);
+    assert!(
+        !users.iter().any(|u| u == "u1"),
+        "suppressed user must be absent from the rerun: {users:?}"
+    );
+    assert!(users.iter().any(|u| u == "u2"), "u2 must remain: {users:?}");
+
+    // Materialise the same segment: the snapshot holds only u2 (AC: absent
+    // from C's next snapshot).
+    let resp = client
+        .post(format!("{base}/jobs"))
+        .json(&serde_json::json!({
+            "dsl": dsl,
+            "materialize": {"campaignId": "c1"}
+        }))
+        .send()
+        .await
+        .expect("post jobs");
+    assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+    let v: Value = resp.json().await.expect("json");
+    let job_id = v["jobId"].as_str().expect("jobId").to_string();
+    let status = poll_until_done(&client, &base, &job_id).await;
+    assert!(status["error"].is_null(), "job must succeed: {status}");
+    let snap = status["snapshotId"]
+        .as_str()
+        .expect("snapshotId")
+        .to_string();
+    let resp = client
+        .get(format!("{base}/audience/{snap}"))
+        .send()
+        .await
+        .expect("audience");
+    let meta: Value = resp.json().await.expect("meta");
+    assert_eq!(
+        meta["rowCount"], 1,
+        "snapshot must exclude the suppressed user: {meta}"
+    );
+}
+
+#[tokio::test]
+async fn test_should_enforce_frequency_cap() {
+    // Global frequency cap: >= 1 targeted/delivered contact in 30 days across
+    // campaigns excludes the user.
+    let base = spawn_with(
+        consumer_engine_core::GuardrailConfig::default(),
+        consumer_engine_core::SuppressionRules {
+            per_campaign_no_repeat: true,
+            frequency_cap: Some(consumer_engine_core::FrequencyCap {
+                max_contacts: 1,
+                window_days: 30,
+            }),
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "sku"],
+        vec![vec!["u1", "A"], vec!["u2", "B"]],
+    )
+    .await;
+
+    // u1 targeted for c1 AND c2 (2 contacts across campaigns in the window).
+    post_suppression(
+        &client,
+        &base,
+        &serde_json::json!({
+            "suppressionId": "11111111-2222-3333-4444-555555555556",
+            "campaignId": "c1", "userId": "u1",
+            "channel": "email", "action": "targeted",
+            "occurredTs": "2025-01-01T00:00:00Z"
+        }),
+    )
+    .await;
+    post_suppression(
+        &client,
+        &base,
+        &serde_json::json!({
+            "suppressionId": "11111111-2222-3333-4444-555555555557",
+            "campaignId": "c2", "userId": "u1",
+            "channel": "email", "action": "targeted",
+            "occurredTs": "2025-01-02T00:00:00Z"
+        }),
+    )
+    .await;
+
+    // Querying campaign c1's segment: u1 is over the global cap -> excluded,
+    // even though u1 has no c1-targeted writeback (only c1-cap exempts by
+    // per-campaign no-repeat would keep u1; the cap is what removes them).
+    let q = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({
+            "dsl": {
+                "source": {"system":"erp","entity":"orders"},
+                "key": "user_id",
+                "ops": [{"kind":"exclude","campaignId":"c1"}]
+            }
+        }))
+        .send()
+        .await
+        .expect("query");
+    assert!(q.status().is_success(), "query failed: {}", q.status());
+    let qv: Value = q.json().await.expect("json");
+    let users = first_column(&qv);
+    assert!(
+        !users.iter().any(|u| u == "u1"),
+        "user over the global frequency cap must be excluded: {users:?}"
+    );
+    assert!(users.iter().any(|u| u == "u2"), "u2 must remain: {users:?}");
+}
+
+#[tokio::test]
+async fn test_should_run_jit_derive_and_profile_over_rest() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    // Seed enough rows that EXPLAIN estimates the true survivor count (2 users);
+    // the Derive inner LIMIT then covers both. u1 amounts 10 x50, u2 amounts 5 x50.
+    let mut rows: Vec<Vec<&str>> = Vec::with_capacity(100);
+    for i in 0..100 {
+        let (user, amount) = if i % 2 == 0 {
+            ("u1", "10")
+        } else {
+            ("u2", "5")
+        };
+        rows.push(vec![user, "2025-01-01T00:00:00Z", amount, "A"]);
+    }
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "ts", "amount", "category"],
+        rows,
+    )
+    .await;
+
+    // JIT Derive over REST: sum(amount) over the survivors of a filter.
+    let dsl = serde_json::json!({
+        "source": {"system":"erp","entity":"orders"},
+        "key": "user_id",
+        "ops": [
+            {"kind":"filter","predicate":{"column":"category","op":"eq","value":"A"}},
+            {"kind":"derive","name":"revenue_of_a_buyers",
+             "metric":{"kind":"sum","event":{"system":"erp","entity":"orders"},"column":"amount"}}
+        ]
+    });
+    let resp = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({ "dsl": dsl }))
+        .send()
+        .await
+        .expect("query");
+    assert!(
+        resp.status().is_success(),
+        "derive query failed: {}",
+        resp.status()
+    );
+    let v: Value = resp.json().await.expect("json");
+    assert_eq!(v["rows"][0][0], "revenue_of_a_buyers");
+    // Survivors {u1, u2}: 50*10 + 50*5 = 750.
+    assert_eq!(v["rows"][0][1], 750.0);
+
+    // Characterize over REST: profile comparing A-buyers to the population.
+    let resp = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({
+            "dsl": {
+                "source": {"system":"erp","entity":"orders"},
+                "key": "user_id",
+                "ops": [
+                    {"kind":"filter","predicate":{"column":"category","op":"eq","value":"A"}},
+                    {"kind":"characterize",
+                     "event":{"system":"erp","entity":"orders"},
+                     "tsColumn":"ts","monetaryColumn":"amount","categoryColumn":"category"}
+                ]
+            }
+        }))
+        .send()
+        .await
+        .expect("query");
+    assert!(
+        resp.status().is_success(),
+        "characterize query failed: {}",
+        resp.status()
+    );
+    let v: Value = resp.json().await.expect("json");
+    let profile = &v["rows"][0][0];
+    assert!(profile["segment"]["users"].as_u64().unwrap_or(0) >= 1);
+    assert!(profile["ratios"]["averageOrderValue"].as_f64().is_some());
+    assert!(
+        profile["segment"]["categoryMix"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "profile must carry a category mix: {profile}"
+    );
 }
