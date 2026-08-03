@@ -14,7 +14,7 @@ use std::{
 
 use axum::Router;
 use consumer_engine_core::{EngineConfig, Result};
-use consumer_engine_execution::Reader;
+use consumer_engine_execution::{Reader, ReaderLimits};
 use consumer_engine_ingestion::IngestionHandle;
 use consumer_engine_ingress::{AppState, router};
 use consumer_engine_storage::{self as storage, Writer};
@@ -50,10 +50,19 @@ impl Engine {
         let writer = Writer::attach(&config.catalog_path, &config.data_path)?;
         let read_conn = storage::open_reader(&config.catalog_path, &config.data_path)?;
         let attach_sql = storage::read_only_attach_sql(&config.catalog_path, &config.data_path);
-        let reader = Reader::start(read_conn, attach_sql)?;
+        let limits = ReaderLimits {
+            memory_limit: config.guardrails.memory_limit.clone(),
+            threads: config.guardrails.threads,
+        };
+        let reader = Reader::start(read_conn, attach_sql, limits)?;
         let ingestion = IngestionHandle::start(writer)?;
 
         let last_ingest_epoch = Arc::new(AtomicI64::new(0));
+        let query_engine = consumer_engine_query::QueryEngine::new(
+            reader.clone(),
+            config.guardrails.clone(),
+            Arc::clone(&last_ingest_epoch),
+        );
         let compaction = tokio::spawn(supervise_compaction(
             ingestion.clone(),
             config.compaction_interval_secs,
@@ -61,7 +70,7 @@ impl Engine {
 
         let state = AppState {
             ingestion: ingestion.clone(),
-            reader: reader.clone(),
+            query_engine,
             last_ingest_epoch: Arc::clone(&last_ingest_epoch),
         };
         let router = router(state);

@@ -13,7 +13,7 @@ mod error;
 pub mod freshness;
 pub mod ident;
 
-pub use config::EngineConfig;
+pub use config::{EngineConfig, GuardrailConfig};
 pub use error::{Error, Result};
 pub use freshness::Freshness;
 pub use ident::validate_ident;

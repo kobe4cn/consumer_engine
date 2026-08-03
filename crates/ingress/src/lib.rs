@@ -1,11 +1,10 @@
 //! REST ingress — the single trust boundary (decision D13).
 //!
-//! Exposes the T1 stand-in surface: `POST /sources/onboard` (batch ingest into
-//! `raw_*`), `POST /query` (a trivial read-only SQL-over-REST, replaced by the
-//! DSL in T2), and `GET /healthz`. Every value crossing this boundary is
-//! validated — identifiers against `^[a-zA-Z0-9_-]{1,64}$`, and every external
-//! string capped in bytes (AGENTS.md § Input Validation) — and query results
-//! carry a graded `freshness` label (decision D5).
+//! `POST /query` runs the DSL happy path (`{dsl}`) through `QueryEngine`;
+//! raw SQL (`{sql}`) is the escape-hatch and is **rejected in M1** (approval
+//! token wiring lands later). `POST /sources/onboard` and `GET /healthz` are
+//! unchanged from T1. All boundary values are validated/capped (AGENTS.md §
+//! Input Validation); query results carry a graded `freshness` label (D5).
 
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
@@ -26,33 +25,29 @@ use axum::{
     routing::{get, post},
 };
 use consumer_engine_core::{Error, Freshness, validate_ident};
-use consumer_engine_execution::{QueryResult, Reader};
+use consumer_engine_execution::RowCells;
 use consumer_engine_ingestion::IngestionHandle;
+use consumer_engine_query::{QueryEngine, QueryError};
 use serde::{Deserialize, Serialize};
 
-/// Maximum rows accepted in a single onboard request (defense against memory
-/// exhaustion — a full body-size limit also applies via the router layer).
+/// Maximum rows accepted in a single onboard request.
 const MAX_ONBOARD_ROWS: usize = 200_000;
-
-/// Maximum number of columns in an onboard request (DoS bound — a huge column
-/// count builds a huge `CREATE TABLE`).
+/// Maximum number of columns in an onboard request.
 const MAX_COLUMNS: usize = 1024;
-
-/// Maximum size of a `POST /query` SQL string, in bytes. DoS bound on the T1
-/// stand-in query surface (the DSL in T2 replaces free SQL).
+/// Maximum size of a raw-SQL escape-hatch string, in bytes.
 const MAX_SQL_BYTES: usize = 8_192;
-
-/// Maximum size of a single onboarded cell value, in bytes. Per AGENTS.md § Input
-/// Validation, every external string needs an explicit byte cap.
+/// Maximum size of a single onboarded cell value, in bytes.
 const MAX_CELL_BYTES: usize = 4_096;
+/// Request body limit.
+const BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 /// Shared state injected into handlers.
 #[derive(Clone, Debug)]
 pub struct AppState {
     /// The single ingestion writer handle.
     pub ingestion: IngestionHandle,
-    /// The read-only reader handle.
-    pub reader: Reader,
+    /// The query engine (DSL → guarded SQL).
+    pub query_engine: QueryEngine,
     /// Epoch seconds of the last successful ingest (drives the freshness label).
     pub last_ingest_epoch: Arc<AtomicI64>,
 }
@@ -74,12 +69,24 @@ pub struct OnboardResponse {
     rows_inserted: usize,
 }
 
-/// `POST /query` request body.
-#[derive(Debug, Deserialize)]
+/// `POST /query` request body. Provide `dsl` (happy path) or `sql` (escape
+/// hatch — rejected in M1 without a valid approval token).
+#[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueryRequest {
-    /// Read-only SQL referencing the `dro` catalog alias.
-    sql: String,
+    /// The DSL segment query (raw JSON; parsed/validated by the query engine).
+    #[serde(default)]
+    dsl: Option<serde_json::Value>,
+    /// Raw SQL escape hatch (M1: rejected).
+    #[serde(default)]
+    sql: Option<String>,
+    /// Approval token for the escape hatch (M1: not honoured).
+    #[serde(default)]
+    #[allow(
+        dead_code,
+        reason = "forward-contract field for the escape-hatch approval gate (spec 21 §4)"
+    )]
+    approval_token: Option<String>,
 }
 
 /// `POST /query` response body.
@@ -87,17 +94,19 @@ pub struct QueryRequest {
 #[serde(rename_all = "camelCase")]
 pub struct QueryResponse {
     columns: Vec<String>,
-    rows: Vec<consumer_engine_execution::RowCells>,
+    rows: Vec<RowCells>,
+    count: u64,
     freshness: Freshness,
+    query_id: String,
 }
 
-/// Build the T1 router with `state` and a 10 MB request-body limit.
+/// Build the router with `state` and a bounded request body.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/sources/onboard", post(onboard))
         .route("/query", post(query))
-        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
 }
 
@@ -158,20 +167,38 @@ async fn query(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
-    if req.sql.len() > MAX_SQL_BYTES {
-        return Err(Error::InvalidInput(format!("sql exceeds {MAX_SQL_BYTES} bytes")).into());
-    }
-    let QueryResult { columns, rows, .. } = state.reader.query(&req.sql).await?;
-    let lag = now_epoch() - state.last_ingest_epoch.load(Ordering::Relaxed);
+    let res = match (req.dsl, req.sql) {
+        (Some(dsl), _) => state.query_engine.run(dsl).await?,
+        (None, Some(sql)) => {
+            // Cap the escape-hatch payload even though it is rejected in M1.
+            if sql.len() > MAX_SQL_BYTES {
+                return Err(
+                    Error::InvalidInput(format!("sql exceeds {MAX_SQL_BYTES} bytes")).into(),
+                );
+            }
+            // M1: the raw-SQL escape hatch is closed. The approval-token gate
+            // lands with the DSL's long tail (spec 21 §4).
+            return Err(ApiError::Query(QueryError::InvalidDsl(
+                "raw-SQL escape hatch is not enabled in M1; submit a 'dsl' instead".into(),
+            )));
+        }
+        (None, None) => {
+            return Err(Error::InvalidInput(
+                "provide a 'dsl' (or 'sql' with an approval token — not enabled in M1)".into(),
+            )
+            .into());
+        }
+    };
     Ok(Json(QueryResponse {
-        columns,
-        rows,
-        freshness: Freshness::batch(lag),
+        columns: res.columns,
+        rows: res.rows,
+        count: res.count,
+        freshness: res.freshness,
+        query_id: res.query_id,
     }))
 }
 
-/// Current epoch seconds. Falls back to 0 if the clock is before the epoch
-/// (cannot happen in practice).
+/// Current epoch seconds (0 if the clock is before the epoch).
 fn now_epoch() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -179,16 +206,42 @@ fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-/// HTTP error wrapper mapping [`Error`] to status codes.
+/// HTTP error wrapper for either a core [`Error`] or a [`QueryError`].
 #[derive(Debug)]
-pub struct ApiError(pub Error);
+pub enum ApiError {
+    /// A core / ingress error.
+    Core(Error),
+    /// A query-engine error.
+    Query(QueryError),
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (code, msg) = match &self.0 {
-            Error::InvalidInput(_) => (StatusCode::BAD_REQUEST, self.0.to_string()),
-            Error::WriterAlreadyHeld => (StatusCode::CONFLICT, self.0.to_string()),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()),
+        let (code, msg): (StatusCode, String) = match self {
+            ApiError::Core(Error::InvalidInput(m)) => (StatusCode::BAD_REQUEST, m),
+            ApiError::Core(Error::WriterAlreadyHeld) => {
+                (StatusCode::CONFLICT, "writer already held".into())
+            }
+            ApiError::Core(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            ApiError::Query(QueryError::InvalidDsl(m)) => (StatusCode::BAD_REQUEST, m),
+            ApiError::Query(QueryError::TooLarge) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "query too large for sync".into(),
+            ),
+            ApiError::Query(QueryError::Guardrail { rule, limit }) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("guardrail {rule} exceeded (limit {limit})"),
+            ),
+            ApiError::Query(QueryError::SurvivorUnbounded) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "JIT derive over unbounded survivor set".into(),
+            ),
+            ApiError::Query(QueryError::Execution { .. }) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "execution failure".into(),
+            ),
+            // QueryError is non_exhaustive; future variants map to 500.
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "query failure".into()),
         };
         (code, msg).into_response()
     }
@@ -196,6 +249,12 @@ impl IntoResponse for ApiError {
 
 impl From<Error> for ApiError {
     fn from(e: Error) -> Self {
-        Self(e)
+        Self::Core(e)
+    }
+}
+
+impl From<QueryError> for ApiError {
+    fn from(e: QueryError) -> Self {
+        Self::Query(e)
     }
 }

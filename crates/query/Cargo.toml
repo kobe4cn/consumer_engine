@@ -1,8 +1,8 @@
 [package]
-name = "consumer_engine-ingress"
-description = "axum REST ingress: the single trust boundary for agents and delivery systems"
+name = "consumer_engine-query"
+description = "DSL parser, SQL compiler, guardrails, and QueryEngine (capabilities B/F/J/S/P)"
 categories = ["development-tools"]
-keywords = ["rest", "api"]
+keywords = ["dsl", "query", "guardrail"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -14,10 +14,13 @@ homepage.workspace = true
 [dependencies]
 consumer_engine-core.workspace = true
 consumer_engine-execution.workspace = true
-consumer_engine-ingestion.workspace = true
-consumer_engine-query.workspace = true
-axum.workspace = true
+duckdb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

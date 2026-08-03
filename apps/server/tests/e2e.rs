@@ -1,8 +1,8 @@
-//! T1 end-to-end integration tests at the REST seam.
+//! T1/T2 end-to-end integration tests at the REST seam.
 //!
-//! User-facing behaviours (onboard, read-only query + freshness, read-only
-//! write rejection, boundary validation) go through HTTP. Engine invariants
-//! not observable through REST (single-writer refusal, restart durability,
+//! User-facing behaviours (onboard, DSL query + freshness, escape-hatch
+//! rejection, boundary validation) go through HTTP. Engine invariants not
+//! observable through REST (single-writer refusal, restart durability,
 //! compaction) are covered by `consumer_engine-storage` unit tests.
 
 #![forbid(unsafe_code)]
@@ -39,11 +39,11 @@ async fn spawn() -> String {
 }
 
 #[tokio::test]
-async fn test_should_onboard_then_query_with_freshness() {
+async fn test_should_run_dsl_filter_query_over_rest() {
     let base = spawn().await;
     let client = reqwest::Client::new();
 
-    let onb_resp = client
+    let onb = client
         .post(format!("{base}/sources/onboard"))
         .json(&serde_json::json!({
             "system": "erp", "entity": "users",
@@ -53,64 +53,67 @@ async fn test_should_onboard_then_query_with_freshness() {
         .send()
         .await
         .expect("onboard");
-    let body = onb_resp.text().await.unwrap_or_default();
-    let onb: Value =
-        serde_json::from_str(&body).unwrap_or_else(|_| panic!("onboard non-json: {body}"));
-    assert_eq!(onb["rowsInserted"], 2);
+    assert!(onb.status().is_success(), "onboard failed");
 
+    // DSL: filter id = 'u1' (value bound, not interpolated).
     let q = client
         .post(format!("{base}/query"))
-        .json(&serde_json::json!({ "sql": "SELECT count(*) AS c FROM dro.raw_erp_users" }))
-        .send()
-        .await
-        .expect("query")
-        .json::<Value>()
-        .await
-        .expect("query json");
-    assert_eq!(q["columns"][0], "c");
-    assert_eq!(q["rows"][0][0], 2);
-    assert_eq!(q["freshness"]["worstSource"], "batch");
-    assert!(q["freshness"]["lagSeconds"].as_i64().is_some());
-}
-
-#[tokio::test]
-async fn test_should_reject_write_on_readonly_path() {
-    let base = spawn().await;
-    let client = reqwest::Client::new();
-
-    client
-        .post(format!("{base}/sources/onboard"))
         .json(&serde_json::json!({
-            "system": "erp", "entity": "users",
-            "columns": ["id"], "rows": [["u1"]]
+            "dsl": {
+                "source": {"system":"erp","entity":"users"},
+                "key": "id",
+                "ops": [
+                    {"kind":"filter","predicate":{"column":"id","op":"eq","value":"u1"}}
+                ]
+            }
         }))
         .send()
         .await
-        .expect("onboard");
+        .expect("query");
+    assert!(q.status().is_success(), "dsl query failed: {}", q.status());
+    let q = q.json::<Value>().await.expect("query json");
+    assert_eq!(q["columns"][0], "id");
+    assert_eq!(q["rows"].as_array().map(Vec::len), Some(1));
+    assert_eq!(q["rows"][0][0], "u1");
+    assert_eq!(q["count"], 1);
+    assert_eq!(q["freshness"]["worstSource"], "batch");
+    assert!(q["queryId"].as_str().is_some_and(|s| s.starts_with("q_")));
+}
 
-    // An INSERT submitted to the read-only query path must fail.
+#[tokio::test]
+async fn test_should_reject_raw_sql_escape_hatch() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    // M1: the raw-SQL escape hatch is closed regardless of token.
     let resp = client
         .post(format!("{base}/query"))
-        .json(&serde_json::json!({ "sql": "INSERT INTO dro.raw_erp_users (id) VALUES ('evil')" }))
+        .json(&serde_json::json!({ "sql": "SELECT 1", "approvalToken": "t" }))
         .send()
         .await
         .expect("query");
     assert!(
         !resp.status().is_success(),
-        "read-only path must reject writes"
+        "raw-SQL escape hatch must be rejected in M1"
     );
+}
 
-    // And the table is unchanged.
-    let q = client
+#[tokio::test]
+async fn test_should_reject_invalid_dsl() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    // Bad source.system identifier.
+    let resp = client
         .post(format!("{base}/query"))
-        .json(&serde_json::json!({ "sql": "SELECT count(*) AS c FROM dro.raw_erp_users" }))
+        .json(&serde_json::json!({
+            "dsl": {
+                "source": {"system":"erp; DROP","entity":"users"},
+                "key": "id", "ops": []
+            }
+        }))
         .send()
         .await
-        .expect("query")
-        .json::<Value>()
-        .await
-        .expect("json");
-    assert_eq!(q["rows"][0][0], 1, "no row was inserted");
+        .expect("query");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

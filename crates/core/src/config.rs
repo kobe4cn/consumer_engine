@@ -28,6 +28,9 @@ pub struct EngineConfig {
     /// Bind address for the REST ingress.
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Query guardrail budgets (see `specs/71-performance-budgets.md`).
+    #[serde(default)]
+    pub guardrails: GuardrailConfig,
 }
 
 const fn default_compaction_interval() -> u64 {
@@ -42,6 +45,86 @@ fn default_bind() -> String {
     "127.0.0.1:8080".to_string()
 }
 
+/// Query guardrail budgets. Defaults from `specs/71-performance-budgets.md`;
+/// calibrate against a real corpus (the `max_bytes_scanned` cap especially).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GuardrailConfig {
+    /// Per-query DuckDB memory limit, e.g. `"8GB"`.
+    #[serde(default = "default_memory_limit")]
+    pub memory_limit: String,
+    /// DuckDB thread count (default: physical cores).
+    #[serde(default = "default_threads")]
+    pub threads: usize,
+    /// Hard per-statement timeout in seconds.
+    #[serde(default = "default_statement_timeout")]
+    pub statement_timeout_secs: u64,
+    /// Row count above which a sync query becomes async.
+    #[serde(default = "default_sync_row_cap")]
+    pub sync_row_cap: u64,
+    /// Estimated-cost cap (seconds) above which a sync query becomes async.
+    #[serde(default = "default_sync_cost_cap")]
+    pub sync_cost_cap_secs: u64,
+    /// Maximum rows ever returned inline.
+    #[serde(default = "default_max_output_rows")]
+    pub max_output_rows: u64,
+    /// Maximum bytes scanned per query (calibrate on target storage).
+    #[serde(default = "default_max_bytes_scanned")]
+    pub max_bytes_scanned: u64,
+    /// JIT (`Derive`) survivor-set cap above which a derive is rejected.
+    #[serde(default = "default_j_survivor_cap")]
+    pub j_survivor_cap: u64,
+}
+
+fn default_memory_limit() -> String {
+    "8GB".to_string()
+}
+
+fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+}
+
+const fn default_statement_timeout() -> u64 {
+    30
+}
+
+const fn default_sync_row_cap() -> u64 {
+    100_000
+}
+
+const fn default_sync_cost_cap() -> u64 {
+    1
+}
+
+const fn default_max_output_rows() -> u64 {
+    1_000_000
+}
+
+const fn default_max_bytes_scanned() -> u64 {
+    10 * 1024 * 1024 * 1024 // 10 GiB
+}
+
+const fn default_j_survivor_cap() -> u64 {
+    200_000
+}
+
+impl Default for GuardrailConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit: default_memory_limit(),
+            threads: default_threads(),
+            statement_timeout_secs: default_statement_timeout(),
+            sync_row_cap: default_sync_row_cap(),
+            sync_cost_cap_secs: default_sync_cost_cap(),
+            max_output_rows: default_max_output_rows(),
+            max_bytes_scanned: default_max_bytes_scanned(),
+            j_survivor_cap: default_j_survivor_cap(),
+        }
+    }
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -50,6 +133,7 @@ impl Default for EngineConfig {
             compaction_interval_secs: default_compaction_interval(),
             micro_batch_flush_rows: default_micro_batch_rows(),
             bind: default_bind(),
+            guardrails: GuardrailConfig::default(),
         }
     }
 }
@@ -100,6 +184,8 @@ data_path: /tmp/data
         assert_eq!(cfg.compaction_interval_secs, 3600);
         assert_eq!(cfg.micro_batch_flush_rows, 50_000);
         assert_eq!(cfg.bind, "127.0.0.1:8080");
+        assert_eq!(cfg.guardrails.statement_timeout_secs, 30);
+        assert_eq!(cfg.guardrails.sync_row_cap, 100_000);
     }
 
     #[test]

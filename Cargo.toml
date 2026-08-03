@@ -35,3 +35,4 @@ consumer_engine-storage = { path = "crates/storage" }
 consumer_engine-execution = { path = "crates/execution" }
 consumer_engine-ingestion = { path = "crates/ingestion" }
 consumer_engine-ingress = { path = "crates/ingress" }
+consumer_engine-query = { path = "crates/query" }
