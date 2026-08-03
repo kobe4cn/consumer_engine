@@ -157,14 +157,16 @@ pub struct SuppressionRules {
     pub frequency_cap: Option<FrequencyCap>,
 }
 
-/// The global frequency cap: `N` contacts in `D` days (specs/20 §5).
+/// The global frequency cap: `N` contacts in `D` days (specs/20 §5). Both
+/// fields are non-zero (`NonZeroU32` — a zero cap would exclude everyone and a
+/// zero window is meaningless; AGENTS.md § Type Design).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FrequencyCap {
     /// Maximum contacts (`N`).
-    pub max_contacts: u32,
+    pub max_contacts: std::num::NonZeroU32,
     /// The window, in days (`D`).
-    pub window_days: u32,
+    pub window_days: std::num::NonZeroU32,
 }
 
 const fn default_per_campaign_no_repeat() -> bool {

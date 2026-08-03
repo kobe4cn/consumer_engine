@@ -57,6 +57,10 @@ impl Engine {
         // producer run / profile never races a lazy DDL (D9 / spec 13).
         writer.ensure_feature_store_table()?;
         writer.ensure_semantic_catalog_table()?;
+        // The suppression table must exist before any Exclude query (the write
+        // path creates it lazily too, but a startup init keeps Exclude reads
+        // clean on a fresh engine).
+        writer.ensure_suppression_table()?;
         let read_conn = storage::open_reader(&config.catalog_path, &config.data_path)?;
         let attach_sql = storage::read_only_attach_sql(&config.catalog_path, &config.data_path);
         let limits = ReaderLimits {

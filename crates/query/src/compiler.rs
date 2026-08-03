@@ -597,13 +597,12 @@ fn compile_exclude(
         ));
     }
     if let Some(cap) = opts.suppression.frequency_cap {
-        let (n, d) = (cap.max_contacts, cap.window_days);
+        let (n, d) = (cap.max_contacts.get(), cap.window_days.get());
         params.push(Value::BigInt(i64::from(n)));
         clauses.push(format!(
             "NOT EXISTS (SELECT 1 FROM {alias}.suppression s WHERE s.user_id = base.{base_key} \
-             AND s.action IN ('targeted', 'delivered') AND s.occurred_ts >= CAST(CAST(now() AS \
-             TIMESTAMP) - INTERVAL '{d}' DAY AS TIMESTAMPTZ) GROUP BY s.user_id HAVING count(*) \
-             >= ?)",
+             AND s.action = 'targeted' AND s.occurred_ts >= CAST(CAST(now() AS TIMESTAMP) - \
+             INTERVAL '{d}' DAY AS TIMESTAMPTZ) GROUP BY s.user_id HAVING count(*) >= ?)",
             alias = opts.alias,
         ));
     }
@@ -869,8 +868,8 @@ mod tests {
                 suppression: &SuppressionRules {
                     per_campaign_no_repeat: true,
                     frequency_cap: Some(FrequencyCap {
-                        max_contacts: 3,
-                        window_days: 30,
+                        max_contacts: std::num::NonZeroU32::new(3).expect("nonzero"),
+                        window_days: std::num::NonZeroU32::new(30).expect("nonzero"),
                     }),
                 },
                 derive_limit: None,

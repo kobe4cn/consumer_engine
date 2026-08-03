@@ -133,8 +133,9 @@ fn validate_derive(name: &str, metric: &JitMetric) -> Result<()> {
 }
 
 /// Enforce op-position invariants (specs/12 §4 I5): a terminal metric/profile
-/// op (`Derive`, and later `Characterize`) must follow at least one B/F
-/// narrowing op and must be the final op of the segment.
+/// op (`Derive`, `Characterize`) must follow at least one B/F narrowing op and
+/// must be the final op; a `SetOp` must also be final (the compiler cannot
+/// combine ops after a set-op with the survivor set).
 fn validate_positions(q: &SegmentQuery) -> Result<()> {
     let mut narrowing_seen = false;
     for (i, op) in q.ops.iter().enumerate() {
@@ -144,9 +145,14 @@ fn validate_positions(q: &SegmentQuery) -> Result<()> {
             | Op::Lapsed { .. }
             | Op::Feature { .. }
             | Op::Exclude { .. } => narrowing_seen = true,
-            // SetOp is valid (B) but does not count as narrowing for a
-            // following Derive — the compiler rejects any op after a SetOp.
-            Op::SetOp { .. } => {}
+            // SetOp is valid (B) but must be final: the compiler rejects any op
+            // after a SetOp, so a later Derive/Filter would silently drop the
+            // set-op's `other` side.
+            Op::SetOp { .. } => {
+                if i + 1 != q.ops.len() {
+                    return Err(invalid("no op may follow a SetOp"));
+                }
+            }
             Op::Derive { .. } | Op::Characterize { .. } => {
                 if !narrowing_seen {
                     return Err(invalid(

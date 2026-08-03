@@ -1058,8 +1058,8 @@ async fn test_should_enforce_frequency_cap() {
         consumer_engine_core::SuppressionRules {
             per_campaign_no_repeat: true,
             frequency_cap: Some(consumer_engine_core::FrequencyCap {
-                max_contacts: 1,
-                window_days: 30,
+                max_contacts: std::num::NonZeroU32::new(1).expect("nonzero"),
+                window_days: std::num::NonZeroU32::new(30).expect("nonzero"),
             }),
         },
     )
