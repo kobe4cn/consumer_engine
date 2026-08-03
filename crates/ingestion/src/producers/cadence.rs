@@ -130,7 +130,15 @@ pub fn regularity(times: &[i64]) -> f64 {
     if times.len() < 2 {
         return 0.0;
     }
-    let intervals: Vec<f64> = times.windows(2).map(|w| (w[1] - w[0]) as f64).collect();
+    let intervals: Vec<f64> = times
+        .windows(2)
+        .filter_map(|w| match w {
+            // windows(2) always yields two elements; destructure rather than
+            // index to keep the no-indexing lint set clean.
+            [a, b] => Some((b - a) as f64),
+            _ => None,
+        })
+        .collect();
     let n = intervals.len() as f64;
     let mean = intervals.iter().sum::<f64>() / n;
     if mean == 0.0 {

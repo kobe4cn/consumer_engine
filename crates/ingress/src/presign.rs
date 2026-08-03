@@ -115,8 +115,13 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let hi = hex_nibble(bytes[i])?;
-        let lo = hex_nibble(bytes[i + 1])?;
+        // The even-length check guarantees `i + 1` is in bounds; get() keeps
+        // the no-indexing lint set clean (defensive None otherwise).
+        let (Some(&hi_b), Some(&lo_b)) = (bytes.get(i), bytes.get(i + 1)) else {
+            return None;
+        };
+        let hi = hex_nibble(hi_b)?;
+        let lo = hex_nibble(lo_b)?;
         out.push(hi << 4 | lo);
         i += 2;
     }

@@ -109,7 +109,9 @@ impl EmbeddingModel for StubEmbed {
                 .wrapping_add((i as u64).wrapping_mul(0x0000_0100_0000_01B3));
             // Map the folded u64 to a signed value in roughly [-1, 1).
             let mapped = (folded as f64 / (1u64 << 62) as f64) - 1.0;
-            v[dim_i] += mapped as f32;
+            if let Some(slot) = v.get_mut(dim_i) {
+                *slot += mapped as f32;
+            }
         }
         // Normalise to a unit vector so cosine reduces to a dot product.
         let norm: f64 = v

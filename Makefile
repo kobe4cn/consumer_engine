@@ -4,6 +4,22 @@ build:
 test:
 	@cargo nextest run --all-features
 
+# Strict boundary lint: no unwrap/indexing/panic/expect on the lib surfaces
+# that handle external input (AGENTS.md § Safety; specs/70). Run on the
+# boundary crates only (ingress is the trust boundary; its deps are compiled
+# with the same gates).
+lint-boundary:
+	@for c in consumer_engine-ingress consumer_engine-query consumer_engine-storage consumer_engine-semantic consumer_engine-ingestion; do \
+		echo "== $$c =="; \
+		cargo clippy -p $$c --lib -- -D warnings -W clippy::unwrap_used -W clippy::indexing_slicing -W clippy::panic -W clippy::expect_used || exit 1; \
+	done
+	@echo "boundary lint: clean"
+
+# Query-latency calibration harness (issue #10 AC1; docs/research/perf-calibration.md).
+# Scale via CE_SCALE_ROWS (default 50000).
+bench-queries:
+	@cargo run --release -p consumer_engine-query --example query_latency
+
 check-agent-sync:
 	@cmp -s CLAUDE.md AGENTS.md || { \
 		echo "AGENTS.md must stay in sync with CLAUDE.md"; \
@@ -30,4 +46,4 @@ release:
 update-submodule:
 	@git submodule update --init --recursive --remote
 
-.PHONY: build test check-agent-sync release update-submodule
+.PHONY: build test check-agent-sync release update-submodule lint-boundary bench-queries

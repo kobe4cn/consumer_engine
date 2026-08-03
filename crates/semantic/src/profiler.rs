@@ -148,10 +148,11 @@ fn sample_columns(rows: &[Vec<Value>], columns: &[String], value_bytes: usize) -
     let mut out: Vec<Vec<String>> = (0..columns.len()).map(|_| Vec::new()).collect();
     for row in rows {
         for (idx, cell) in row.iter().enumerate() {
-            if idx >= out.len() {
+            // `idx < out.len()` by construction (checked below); get_mut keeps
+            // the no-indexing lint set clean.
+            let Some(bucket) = out.get_mut(idx) else {
                 break;
-            }
-            let bucket = &mut out[idx];
+            };
             if bucket.len() >= MAX_SAMPLE_VALUES {
                 continue;
             }

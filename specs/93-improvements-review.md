@@ -318,3 +318,21 @@ Append-only.
   snapshot it was built from (re-onboard versioning, spec 13 §4) and emit a
   `warn!` when a referenced column's entry predates the source's latest ingest
   (reusing the `FreshnessRegistry` epoch).
+
+### T7c-TENANT — multi-tenant isolation deferred (by design, M5 scope)
+
+- **Citation**: issue #10 AC6 ("Tenant isolation enforced — cross-tenant access
+  is impossible by construction"); `specs/21-rest-api.md` §3 I2 (the compiler
+  injects `tenant_id` into every SQL).
+- **Finding**: the engine has **no tenant model** — authN/AuthZ is stubbed from
+  M1 (no auth middleware, no tokens beyond the presigned-export HMAC), so there
+  is no `tenant_id` to extract or inject. AC6 is not implementable without an
+  auth layer + `tenant_id` columns on every engine table + compiler injection,
+  which is a standalone feature, not a hardening item.
+- **What holds today**: the engine is single-tenant by construction (one
+  catalog, one writer); there is no cross-tenant surface to leak.
+- **Fix shape (later)**: auth middleware (axum-login/oauth2) extracting
+  `tenant_id` from the verified token → `tenant_id` column on `raw_*`/
+  `feature_store`/`suppression`/`audience_snapshot`/`semantic_catalog` → the
+  compiler filters every query by the caller's tenant; test that a tenant-B
+  token cannot read tenant-A data.

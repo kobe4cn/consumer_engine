@@ -14,6 +14,7 @@ The spec set cites these by path; the impl plan relies on their decisions.
 | [research/spike-duckdb-vss.md](./research/spike-duckdb-vss.md) | spike | PASS | HNSW requires fixed `FLOAT[N]` (not `FLOAT[]`); index engages only with constant query vector; build offline |
 | [research/spike-microbatch-compaction.md](./research/spike-microbatch-compaction.md) | spike | PASS-with-amendments | 1 Parquet file per commit; compaction is threshold-gated; flush interval raised to 30s/50k |
 | [research/survey-cdc-adapter.md](./research/survey-cdc-adapter.md) | survey | GO | Debezium+Kafka via `rdkafka`; batch fallback realistic; per-source freshness grading |
+| [research/perf-calibration.md](./research/perf-calibration.md) | calibration | measured | B/F/J/P sync P50/P99 harness; targets unmet — per-query DuckLake re-attach (P1-1) dominates; guardrail budgets stay as locked targets |
 
 ## Spec corrections driven by this research
 

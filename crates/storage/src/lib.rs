@@ -92,6 +92,15 @@ impl Writer {
         );
         conn.execute_batch(&sql)
             .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        // Compaction tuning (D6 / specs/71 §4): write every batch as a data file
+        // (no inlining into the catalog) so micro-batches accumulate small files
+        // that compaction can merge, and merge up to a 1 MB target. Without this
+        // DuckLake inlines small writes and `ducklake_list_files` stays empty.
+        conn.execute_batch(
+            "SET ducklake_default_data_inlining_row_limit = 0; SET ducklake_target_file_size = \
+             '1MB';",
+        )
+        .map_err(|e| Error::Storage(BoxError::from(e)))?;
         Ok(Self {
             conn,
             _lock: lock_file,
@@ -234,7 +243,9 @@ impl Writer {
             return Ok(0);
         }
         self.ensure_semantic_catalog_table()?;
-        let dim = rows[0].embedding.len();
+        // `rows` is non-empty (checked above); `first()` keeps the lint set
+        // (no indexing) clean while the dimension is taken from row 0.
+        let dim = rows.first().map(|r| r.embedding.len()).unwrap_or(0);
         for r in rows {
             if r.embedding.len() != dim {
                 return Err(Error::InvalidInput(format!(
@@ -472,7 +483,12 @@ impl Writer {
     /// - [`Error::Storage`] on failure.
     pub fn compact(&self, system: &str, entity: &str) -> Result<()> {
         let table = raw_table_name(system, entity)?;
-        let sql = format!("CALL ducklake_rewrite_data_files('{WRITE_CATALOG_ALIAS}', '{table}');");
+        // `ducklake_merge_adjacent_files` is the compaction that actually fires
+        // in this DuckLake build (`ducklake_rewrite_data_files` is threshold-
+        // gated and returns 0 processed); it merges adjacent small files toward
+        // the configured target size. Old snapshots are retained (time-travel).
+        let sql =
+            format!("CALL ducklake_merge_adjacent_files('{WRITE_CATALOG_ALIAS}', '{table}');");
         self.conn
             .execute_batch(&sql)
             .map_err(|e| Error::Storage(BoxError::from(e)))?;
@@ -637,6 +653,68 @@ mod tests {
             .expect("ingest");
         w.compact("erp", "orders")
             .expect("compact is best-effort ok");
+    }
+
+    #[test]
+    fn test_should_compact_reduce_file_count_and_preserve_rows_and_snapshots() {
+        // R2 from spike-microbatch-compaction.md: seed many small batches (each
+        // a data file once inlining is off), compact, assert the DuckLake file
+        // count drops, all rows remain readable, and the snapshot history
+        // (time-travel window) is retained.
+        let (_tmp, w) = tmp_writer();
+        for b in 0..20 {
+            let rows: Vec<Vec<Option<String>>> =
+                (0..50).map(|i| vec![Some(format!("b{b}_r{i}"))]).collect();
+            w.ingest_raw("erp", "evt", &["id".into()], &rows)
+                .expect("ingest");
+        }
+        let files = |w: &Writer| -> i64 {
+            w.conn
+                .query_row(
+                    "SELECT count(*) FROM ducklake_list_files('dl','raw_erp_evt')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1)
+        };
+        let before = files(&w);
+        let snapshots_before: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM ducklake_snapshots('dl')", [], |r| {
+                r.get(0)
+            })
+            .expect("snapshots");
+        assert!(
+            before >= 20,
+            "seeded batches must produce data files: {before}"
+        );
+
+        w.compact("erp", "evt").expect("compact");
+
+        let after = files(&w);
+        assert!(
+            after < before,
+            "compaction must reduce the file count: before={before} after={after}"
+        );
+        // All rows remain readable (no data loss from the merge).
+        let rows: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM dl.raw_erp_evt", [], |r| r.get(0))
+            .expect("rows");
+        assert_eq!(rows, 1000, "all 20*50 rows must survive compaction");
+        // The snapshot history (time-travel window) is retained: compaction
+        // must not expire the pre-merge snapshots.
+        let snapshots_after: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM ducklake_snapshots('dl')", [], |r| {
+                r.get(0)
+            })
+            .expect("snapshots");
+        assert!(
+            snapshots_after >= snapshots_before,
+            "compaction must not shrink the time-travel window: before={snapshots_before} \
+             after={snapshots_after}"
+        );
     }
 
     #[test]

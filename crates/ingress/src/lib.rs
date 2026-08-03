@@ -98,7 +98,7 @@ pub struct OnboardResponse {
 
 /// `POST /query` request body. Provide `dsl` (happy path) or `sql` (escape
 /// hatch — rejected in M1 without a valid approval token).
-#[derive(Debug, Deserialize, Default)]
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueryRequest {
     /// The DSL segment query (raw JSON; parsed/validated by the query engine).
@@ -114,6 +114,18 @@ pub struct QueryRequest {
         reason = "forward-contract field for the escape-hatch approval gate (spec 21 §4)"
     )]
     approval_token: Option<String>,
+}
+
+/// Redacting `Debug` (specs/70, AC: no auth token in logs): the approval token
+/// is never printed, only a `[REDACTED]` marker.
+impl std::fmt::Debug for QueryRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryRequest")
+            .field("dsl", &self.dsl)
+            .field("sql", &self.sql)
+            .field("approvalToken", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// `POST /query` response body.
@@ -350,5 +362,30 @@ impl From<Error> for ApiError {
 impl From<QueryError> for ApiError {
     fn from(e: QueryError) -> Self {
         Self::Query(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_redact_approval_token_in_debug() {
+        // specs/70: no auth token in log output. The Debug representation must
+        // never contain the token value, only a [REDACTED] marker.
+        let req = QueryRequest {
+            dsl: Some(serde_json::json!({ "source": {"system":"erp","entity":"users"} })),
+            sql: None,
+            approval_token: Some("super-secret-token-12345".into()),
+        };
+        let debug = format!("{req:?}");
+        assert!(
+            !debug.contains("super-secret-token-12345"),
+            "approval token must never appear in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains("[REDACTED]"),
+            "marker must be present: {debug}"
+        );
     }
 }

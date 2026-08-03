@@ -94,6 +94,13 @@ pub async fn get_export(
     if !presign::verify(st.signing_key.as_ref(), &bare, token) {
         return Err(ApiError::Unauthorized);
     }
+    // Access logging (specs/21 §4: presigned access is logged). No token, no
+    // query string — only the snapshot identity.
+    tracing::info!(
+        snapshot_id = %bare,
+        format = "parquet",
+        "presigned audience export accessed"
+    );
 
     // Server-controlled temp path (caller never chooses it): snapshot uuid +
     // fresh uuidv7 suffix avoids collisions between concurrent exports.
