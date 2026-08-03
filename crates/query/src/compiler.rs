@@ -183,6 +183,8 @@ fn compile_at(q: &SegmentQuery, depth: u8, opts: &CompileOptions<'_>) -> Result<
                             .into(),
                     )
                 })?;
+                // The metric's event table is a freshness source (D5).
+                sources.push(metric_event(metric).clone());
                 let survivor = survivor_cte(&q.source, &q.key, &conjuncts, alias, limit);
                 let sql = compile_derive_metric(&survivor, name, metric, &mut params, alias)?;
                 return Ok(CompiledQuery {
@@ -412,6 +414,17 @@ fn survivor_cte(
     format!("SELECT DISTINCT base.{key} AS user_id FROM {table} base{where_sql} LIMIT {limit}")
 }
 
+/// The event relation a `JitMetric` reads.
+fn metric_event(m: &JitMetric) -> &Dataset {
+    match m {
+        JitMetric::Count { event }
+        | JitMetric::Sum { event, .. }
+        | JitMetric::Avg { event, .. }
+        | JitMetric::Min { event, .. }
+        | JitMetric::Max { event, .. } => event,
+    }
+}
+
 /// Build the `Derive` metric SELECT over the survivor CTE: the event table
 /// joins survivors on `user_id` and aggregates per the metric. Emits one row
 /// `(name, value)`.
@@ -503,7 +516,9 @@ pub fn compile_characterize(
              (SELECT sum(amount) FROM ev) * 1.0 / NULLIF((SELECT count(*) FROM ev), 0) AS \
              base_aov, (SELECT count(*) FROM ev WHERE in_seg) * 1.0 / NULLIF((SELECT \
              count(DISTINCT user_id) FROM ev WHERE in_seg), 0) AS seg_freq, (SELECT count(*) FROM \
-             ev) * 1.0 / NULLIF((SELECT count(DISTINCT user_id) FROM ev), 0) AS base_freq",
+             ev) * 1.0 / NULLIF((SELECT count(DISTINCT user_id) FROM ev), 0) AS base_freq, \
+             (SELECT count(*) FROM ev WHERE in_seg) AS seg_orders, (SELECT count(*) FROM ev) AS \
+             base_orders",
         ),
         params: params.clone(),
         sources: sources.clone(),

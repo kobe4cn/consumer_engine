@@ -143,8 +143,10 @@ fn validate_positions(q: &SegmentQuery) -> Result<()> {
             | Op::Recency { .. }
             | Op::Lapsed { .. }
             | Op::Feature { .. }
-            | Op::SetOp { .. }
             | Op::Exclude { .. } => narrowing_seen = true,
+            // SetOp is valid (B) but does not count as narrowing for a
+            // following Derive — the compiler rejects any op after a SetOp.
+            Op::SetOp { .. } => {}
             Op::Derive { .. } | Op::Characterize { .. } => {
                 if !narrowing_seen {
                     return Err(invalid(

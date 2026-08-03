@@ -132,11 +132,11 @@ impl QueryEngine {
         compile_with_opts(q, &base)
     }
 
-    /// Plan the prior B/F narrowing of a `Derive` segment, EXPLAIN it, and
-    /// return the survivor-set `LIMIT` to inject into the CTE — rejecting when
-    /// the estimated survivor count exceeds `j_survivor_cap` (specs/12 §4 I5:
-    /// narrow first or precompute as F). When EXPLAIN yields no estimate, the
-    /// cap itself is used so the inner LIMIT still bounds the set.
+    /// Plan the prior B/F narrowing of a `Derive` segment and return the
+    /// survivor-set `LIMIT` to inject into the CTE — rejecting when the **actual**
+    /// survivor count exceeds `j_survivor_cap` (specs/12 §4 I5 / I2: guardrails
+    /// non-bypassable — an EXPLAIN estimate could both bypass the cap and
+    /// silently truncate, so the count is measured, not estimated).
     async fn derive_survivor_limit(&self, q: &SegmentQuery) -> Result<u64> {
         let narrowing = strip_derive(q);
         let c = compile_with_opts(
@@ -147,16 +147,18 @@ impl QueryEngine {
                 derive_limit: None,
             },
         )?;
-        let est = explain_cost(&self.reader, &c).await;
-        let est_rows = est.est_rows;
-        if est_rows > self.guardrails.j_survivor_cap {
+        let count_sql = format!("SELECT count(*) FROM ({}) sub", c.sql);
+        let qr = self.timed_read(&count_sql, c.params).await?;
+        let count = qr
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if count > self.guardrails.j_survivor_cap {
             return Err(QueryError::SurvivorUnbounded);
         }
-        Ok(if est_rows == 0 {
-            self.guardrails.j_survivor_cap
-        } else {
-            est_rows
-        })
+        Ok(count)
     }
 
     /// Run a terminal `Characterize` segment (P): compile the three profile
@@ -513,12 +515,14 @@ fn assemble_profile(
     let base_aov = cell(&m, 3);
     let seg_freq = cell(&m, 4);
     let base_freq = cell(&m, 5);
+    // Total order counts (all categories) for correct shares even when the
+    // category query is limited to the top-3.
+    let seg_orders = cell(&m, 6);
+    let base_orders = cell(&m, 7);
     let seg_recency = cell(&r, 0);
     let base_recency = cell(&r, 1);
 
     // Category mix: shares of the top categories (by segment count).
-    let mut seg_cat_total = 0.0_f64;
-    let mut base_cat_total = 0.0_f64;
     let mut seg_mix: Vec<serde_json::Value> = Vec::new();
     let mut base_mix: Vec<serde_json::Value> = Vec::new();
     for row in &categories.rows {
@@ -529,19 +533,17 @@ fn assemble_profile(
             .to_string();
         let seg_n = cell(row, 1);
         let base_n = cell(row, 2);
-        seg_cat_total += seg_n;
-        base_cat_total += base_n;
         seg_mix.push(json!({ "category": category, "orders": seg_n }));
         base_mix.push(json!({ "category": category, "orders": base_n }));
     }
     let share = |n: f64, total: f64| if total > 0.0 { n / total } else { 0.0 };
     for v in seg_mix.iter_mut() {
         let orders = v["orders"].as_f64().unwrap_or(0.0);
-        v["share"] = json!(share(orders, seg_cat_total));
+        v["share"] = json!(share(orders, seg_orders));
     }
     for v in base_mix.iter_mut() {
         let orders = v["orders"].as_f64().unwrap_or(0.0);
-        v["share"] = json!(share(orders, base_cat_total));
+        v["share"] = json!(share(orders, base_orders));
     }
 
     let ratio = |seg: f64, base: f64| if base != 0.0 { seg / base } else { 0.0 };

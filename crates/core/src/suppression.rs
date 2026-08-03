@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::{Error, Result};
+
 /// The delivery channel a suppression outcome was observed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -34,16 +36,20 @@ impl SuppressionChannel {
         }
     }
 
-    /// Parse the wire label back into a channel. Returns `None` for unknown
-    /// labels (reject, never coerce — boundary input).
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
+    /// Parse the wire label back into a channel.
+    ///
+    /// # Errors
+    /// [`Error::InvalidInput`] for an unknown label (reject, never coerce —
+    /// boundary input).
+    pub fn parse(s: &str) -> Result<Self> {
         match s {
-            "sms" => Some(Self::Sms),
-            "email" => Some(Self::Email),
-            "push" => Some(Self::Push),
-            "ads" => Some(Self::Ads),
-            _ => None,
+            "sms" => Ok(Self::Sms),
+            "email" => Ok(Self::Email),
+            "push" => Ok(Self::Push),
+            "ads" => Ok(Self::Ads),
+            _ => Err(Error::InvalidInput(format!(
+                "unknown channel {s:?}; expected sms|email|push|ads"
+            ))),
         }
     }
 }
@@ -79,17 +85,20 @@ impl SuppressionAction {
         }
     }
 
-    /// Parse the wire label back into an action. Returns `None` for unknown
-    /// labels.
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
+    /// Parse the wire label back into an action.
+    ///
+    /// # Errors
+    /// [`Error::InvalidInput`] for an unknown label.
+    pub fn parse(s: &str) -> Result<Self> {
         match s {
-            "targeted" => Some(Self::Targeted),
-            "delivered" => Some(Self::Delivered),
-            "converted" => Some(Self::Converted),
-            "opted_out" => Some(Self::OptedOut),
-            "bounced" => Some(Self::Bounced),
-            _ => None,
+            "targeted" => Ok(Self::Targeted),
+            "delivered" => Ok(Self::Delivered),
+            "converted" => Ok(Self::Converted),
+            "opted_out" => Ok(Self::OptedOut),
+            "bounced" => Ok(Self::Bounced),
+            _ => Err(Error::InvalidInput(format!(
+                "unknown action {s:?}; expected targeted|delivered|converted|opted_out|bounced"
+            ))),
         }
     }
 }

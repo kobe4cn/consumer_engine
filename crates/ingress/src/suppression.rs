@@ -56,18 +56,8 @@ pub async fn post_suppression(
 ) -> Result<(StatusCode, Json<SuppressionResponse>), ApiError> {
     validate_ident(&req.campaign_id)?;
     validate_ident(&req.user_id)?;
-    let channel = SuppressionChannel::parse(&req.channel).ok_or_else(|| {
-        ApiError::Core(Error::InvalidInput(format!(
-            "unknown channel {:?}; expected sms|email|push|ads",
-            req.channel
-        )))
-    })?;
-    let action = SuppressionAction::parse(&req.action).ok_or_else(|| {
-        ApiError::Core(Error::InvalidInput(format!(
-            "unknown action {:?}; expected targeted|delivered|converted|opted_out|bounced",
-            req.action
-        )))
-    })?;
+    let channel = SuppressionChannel::parse(&req.channel)?;
+    let action = SuppressionAction::parse(&req.action)?;
     if chrono::DateTime::parse_from_rfc3339(&req.occurred_ts).is_err() {
         return Err(ApiError::Core(Error::InvalidInput(
             "occurredTs must be ISO-8601 UTC".into(),
