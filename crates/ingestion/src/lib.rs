@@ -14,12 +14,7 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    path::PathBuf,
-    sync::Arc,
-    thread,
-};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, thread};
 
 use consumer_engine_core::{BoxError, CatalogRow, Error, FeatureRow, Result, SnapshotSpec};
 use consumer_engine_storage::Writer;
@@ -314,7 +309,7 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>) {
                 let _ = reply.send(res);
             }
             Cmd::WriteFeatures { rows, reply } => {
-                let res = write_features_and_refresh(&writer, &rows);
+                let res = writer.write_features_and_refresh(&rows);
                 let _ = reply.send(res);
             }
             Cmd::WriteCatalog { rows, reply } => {
@@ -324,27 +319,6 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>) {
             Cmd::Shutdown => break,
         }
     }
-}
-
-/// Append feature rows and refresh the wide pivot view for every distinct
-/// family touched. The view is rebuilt with the **union** of the current batch's
-/// short names and those already stored for the family, so a partial batch never
-/// drops previously-written columns (specs/10 §2). A newer `as_of_ts` supersedes
-/// via the view (never overwrites).
-fn write_features_and_refresh(writer: &Writer, rows: &[FeatureRow]) -> Result<usize> {
-    let n = writer.write_feature_rows(rows)?;
-    let mut families: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for r in rows {
-        let (family, short) = consumer_engine_core::split_feature_name(&r.feature_name)?;
-        families.entry(family).or_default().insert(short);
-    }
-    for (family, batch_shorts) in families {
-        // Union with the short names already in `feature_store` for this family.
-        let mut all: BTreeSet<String> = writer.feature_short_names(&family)?.into_iter().collect();
-        all.extend(batch_shorts);
-        writer.refresh_feature_wide_view(&family, &all.into_iter().collect::<Vec<_>>())?;
-    }
-    Ok(n)
 }
 
 #[cfg(test)]

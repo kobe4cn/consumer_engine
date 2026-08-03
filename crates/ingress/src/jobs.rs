@@ -9,7 +9,10 @@
 //! panics). No `futures` dependency is needed — `tokio::spawn`'s `JoinHandle`
 //! suffices.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json,
@@ -22,9 +25,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ApiError, AppState};
 
-/// In-memory job registry keyed by job id. Cheap to clone (`Arc`).
+/// How long a finished/expired job stays in the registry before it is dropped
+/// on the next poll. Bounds the registry so it cannot grow without limit
+/// (AGENTS.md § Resource Limits: bound every collection).
+const JOB_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// In-memory job registry keyed by job id. Cheap to clone (`Arc`). Entries
+/// expire lazily on [`JobRegistry::get`] after `JOB_TTL`.
 #[derive(Clone, Debug)]
-pub struct JobRegistry(Arc<DashMap<String, JobStatus>>);
+pub struct JobRegistry(Arc<DashMap<String, (JobStatus, Instant)>>);
 
 impl JobRegistry {
     /// Build an empty registry.
@@ -35,23 +44,37 @@ impl JobRegistry {
 
     /// Mark `id` as `Running`.
     pub fn insert_running(&self, id: &str) {
-        self.0.insert(id.to_string(), JobStatus::Running);
+        self.0
+            .insert(id.to_string(), (JobStatus::Running, Instant::now()));
     }
 
     /// Mark `id` as `Done(snapshot)`.
     pub fn set_done(&self, id: &str, snapshot: String) {
-        self.0.insert(id.to_string(), JobStatus::Done(snapshot));
+        self.0
+            .insert(id.to_string(), (JobStatus::Done(snapshot), Instant::now()));
     }
 
     /// Mark `id` as `Failed(err)`.
     pub fn set_failed(&self, id: &str, err: String) {
-        self.0.insert(id.to_string(), JobStatus::Failed(err));
+        self.0
+            .insert(id.to_string(), (JobStatus::Failed(err), Instant::now()));
     }
 
-    /// Read the status of `id`, if present.
+    /// Read the status of `id`, if present. Entries older than `JOB_TTL` are
+    /// dropped (and reported as absent), bounding the map's size.
     #[must_use]
     pub fn get(&self, id: &str) -> Option<JobStatus> {
-        self.0.get(id).map(|r| r.clone())
+        let now = Instant::now();
+        // Check-and-expire under the shard guard so a concurrent poll can't race
+        // a stale entry.
+        if let Some(entry) = self.0.get(id)
+            && now.duration_since(entry.1) > JOB_TTL
+        {
+            drop(entry);
+            self.0.remove(id);
+            return None;
+        }
+        self.0.get(id).map(|r| r.0.clone())
     }
 }
 
@@ -104,7 +127,7 @@ pub struct JobResponse {
 }
 
 /// `POST /jobs`: validate the DSL + campaign id, mint a job id, spawn the
-/// materialise work, and return `202 { jobId }`.
+/// materialise work under a concurrency cap, and return `202 { jobId }`.
 pub async fn post_jobs(
     State(st): State<AppState>,
     Json(req): Json<JobsRequest>,
@@ -116,12 +139,28 @@ pub async fn post_jobs(
     let id = format!("j_{}", uuid::Uuid::now_v7());
     st.jobs.insert_running(&id);
 
+    // Concurrency cap (AGENTS.md § Resource Limits: bound concurrent in-flight
+    // work with a Semaphore — an unbounded spawn per request is a fork bomb).
+    // Wait for a slot (queueing, not rejecting); the permit is held for the
+    // whole materialise and released on drop.
+    let permit = st
+        .materialise_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| {
+            ApiError::Core(consumer_engine_core::Error::Ingestion(Box::from(format!(
+                "materialise slot closed: {e}"
+            ))))
+        })?;
+
     // Supervisor owns the inner materialise task so a panic is captured.
     let qe = st.query_engine.clone();
     let jobs = st.jobs.clone();
     let job_id = id.clone();
     let campaign_id = req.materialize.campaign_id.clone();
     tokio::spawn(async move {
+        let _permit = permit;
         let qe_inner = qe.clone();
         let q_owned = q;
         let camp_inner = campaign_id.clone();

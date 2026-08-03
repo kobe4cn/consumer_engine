@@ -88,10 +88,11 @@ impl QueryEngine {
         self.run_sync(&q).await
     }
 
-    /// Run a read-only catalogue/feature-store query under the statement
-    /// timeout guardrail (AGENTS.md § Resource Limits: every storage read needs
-    /// a timeout — a stalled probe must not block the single reader thread).
-    async fn catalogue_read(&self, sql: &str, params: Vec<Value>) -> Result<QueryResult> {
+    /// Run a read-only reader query under the statement-timeout guardrail
+    /// (AGENTS.md § Resource Limits: every storage read needs a timeout — a
+    /// stalled probe must not block the single reader thread). Used by the
+    /// catalogue guardrail and the snapshot-metadata read.
+    async fn timed_read(&self, sql: &str, params: Vec<Value>) -> Result<QueryResult> {
         let timeout = Duration::from_secs(self.guardrails.statement_timeout_secs);
         match tokio::time::timeout(timeout, self.reader.query_with_params(sql, params)).await {
             Ok(inner) => inner.map_err(Into::into),
@@ -134,7 +135,7 @@ impl QueryEngine {
         }
         for ((system, entity), cols) in by_table {
             let qr = self
-                .catalogue_read(
+                .timed_read(
                     &format!(
                         "SELECT DISTINCT column_name FROM \
                          {READ_ONLY_CATALOG_ALIAS}.semantic_catalog WHERE system = ? AND \
@@ -163,7 +164,7 @@ impl QueryEngine {
         }
         for name in crate::ast::referenced_features(q) {
             let qr = self
-                .catalogue_read(
+                .timed_read(
                     &format!(
                         "SELECT 1 FROM {READ_ONLY_CATALOG_ALIAS}.feature_store WHERE feature_name \
                          = ? LIMIT 1"

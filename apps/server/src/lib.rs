@@ -104,6 +104,11 @@ impl Engine {
         ));
 
         let jobs = Arc::new(JobRegistry::new());
+        // Materialisation concurrency cap: one slot per guardrail thread (the
+        // sync query path already bounds in-flight work the same way).
+        let materialise_slots = Arc::new(tokio::sync::Semaphore::new(
+            config.guardrails.threads.max(1),
+        ));
         let state = AppState {
             ingestion: ingestion.clone(),
             query_engine,
@@ -111,6 +116,7 @@ impl Engine {
             profiler,
             intent_rag,
             jobs: Arc::clone(&jobs),
+            materialise_slots,
             signing_key: Arc::new(signing_key),
         };
         let router = router(state);

@@ -69,15 +69,26 @@ impl FeatureProducer for CadenceRegularityProducer {
     async fn run(&self, as_of: &str) -> Result<ProducerOutput> {
         consumer_engine_core::validate_ident(&self.orders.system)?;
         consumer_engine_core::validate_ident(&self.orders.entity)?;
+        // Fetch one more row than the cap so an over-cap source is detected
+        // (fail loudly) rather than silently truncated — silent truncation would
+        // corrupt the cadence scores of users past the cap.
         let sql = format!(
-            "SELECT user_id, ts FROM {READ_ONLY_CATALOG_ALIAS}.raw_{}_{} WHERE ts <= ? LIMIT \
-             {SCAN_ROW_CAP}",
-            self.orders.system, self.orders.entity,
+            "SELECT user_id, ts FROM {READ_ONLY_CATALOG_ALIAS}.raw_{}_{} WHERE ts <= ? LIMIT {}",
+            self.orders.system,
+            self.orders.entity,
+            SCAN_ROW_CAP + 1,
         );
         let qr = self
             .reader
             .query_with_params(&sql, vec![Value::Text(as_of.to_string())])
             .await?;
+        if qr.rows.len() > SCAN_ROW_CAP {
+            return Err(consumer_engine_core::Error::InvalidInput(format!(
+                "{}.{} has >{SCAN_ROW_CAP} matching rows at as_of {as_of}; raise the producer \
+                 scan cap or narrow as_of",
+                self.orders.system, self.orders.entity,
+            )));
+        }
 
         // Group valid timestamps (epoch seconds) by user.
         let mut by_user: HashMap<String, Vec<i64>> = HashMap::new();

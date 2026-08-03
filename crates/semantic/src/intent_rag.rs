@@ -13,6 +13,11 @@ use serde_json::Value;
 
 use crate::{limits::DEFAULT_K, llm::EmbeddingModel};
 
+/// Defensive cap on the number of catalogue rows read per retrieval (spec 13
+/// §3 I3: bounded retrieval; AGENTS.md § Resource Limits: bound every
+/// collection). Far larger than any M3 catalogue, so top-k is unaffected.
+const MAX_CATALOG_SCAN: usize = 10_000;
+
 /// The L1 retrieval engine. Cheap to share via `Arc`.
 pub struct IntentRag {
     reader: Reader,
@@ -55,9 +60,12 @@ impl IntentRag {
     /// `consumer_engine_core::Error::Execution` on a reader failure.
     pub async fn retrieve(&self, utterance: &str, k: usize) -> Result<Vec<CatalogHit>> {
         let k = if k == 0 { self.default_k } else { k };
+        // The read is bounded with a defensive row cap (AGENTS.md § Resource
+        // Limits: bound every collection). M3 catalogues are far smaller than
+        // this, so top-k over the full catalogue is unaffected.
         let query = format!(
             "SELECT system, table_name, column_name, semantic_type, description, embedding FROM \
-             {READ_ONLY_CATALOG_ALIAS}.semantic_catalog"
+             {READ_ONLY_CATALOG_ALIAS}.semantic_catalog LIMIT {MAX_CATALOG_SCAN}"
         );
         let qr = self.reader.query_with_params(&query, Vec::new()).await?;
 

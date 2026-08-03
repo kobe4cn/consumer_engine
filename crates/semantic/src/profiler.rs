@@ -104,11 +104,23 @@ impl Profiler {
                 per_column_samples.get(idx).cloned().unwrap_or_default()
             };
 
-            let description = self
+            let description = match self
                 .llm
                 .describe_column(system, table, column, "VARCHAR", &llm_samples)
                 .await
-                .unwrap_or_else(|_| format!("Column '{column}' of {system}.{table}"));
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        %system,
+                        %table,
+                        %column,
+                        "LLM description failed; using stub description"
+                    );
+                    format!("Column '{column}' of {system}.{table}")
+                }
+            };
             // I4: only the description is embedded, never PII values.
             let embedding = self.embed.embed(&description);
 

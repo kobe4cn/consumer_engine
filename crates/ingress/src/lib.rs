@@ -64,6 +64,8 @@ pub struct AppState {
     pub intent_rag: Arc<IntentRag>,
     /// Async-job registry for `POST /jobs` / `GET /jobs/:id`.
     pub jobs: Arc<JobRegistry>,
+    /// Concurrency cap for materialisation jobs (bound in-flight work).
+    pub materialise_slots: Arc<tokio::sync::Semaphore>,
     /// HMAC-SHA256 signing key for presigned export URLs (32 bytes of OS
     /// randomness; minted once at server startup).
     pub signing_key: Arc<[u8; 32]>,

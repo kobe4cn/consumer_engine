@@ -230,6 +230,58 @@ impl Writer {
         Ok(written)
     }
 
+    /// Append feature rows and refresh the wide pivot views for every distinct
+    /// family in **one catalog transaction** (specs/20 I4: a partial write is
+    /// never observable). Each view is rebuilt with the **union** of the batch's
+    /// short names and those already stored (`specs/10 §2`: the wide pivot
+    /// covers all stored features — a partial batch never drops columns). On any
+    /// failure the whole transaction rolls back: no rows written, no view
+    /// changed. This is the write path the ingestion actor uses for `Feature`
+    /// producer output.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidInput`] on a bad feature name/producer id or family.
+    /// - [`Error::Storage`] on insert/view/transaction failure.
+    pub fn write_features_and_refresh(&self, rows: &[FeatureRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        self.conn
+            .execute_batch("BEGIN TRANSACTION")
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let outcome = (|| -> Result<usize> {
+            let n = self.write_feature_rows(rows)?;
+            let mut families: std::collections::BTreeMap<
+                String,
+                std::collections::BTreeSet<String>,
+            > = std::collections::BTreeMap::new();
+            for r in rows {
+                let (family, short) = consumer_engine_core::split_feature_name(&r.feature_name)?;
+                families.entry(family).or_default().insert(short);
+            }
+            for (family, batch_shorts) in families {
+                let mut all: std::collections::BTreeSet<String> =
+                    self.feature_short_names(&family)?.into_iter().collect();
+                all.extend(batch_shorts);
+                self.refresh_feature_wide_view(&family, &all.into_iter().collect::<Vec<_>>())?;
+            }
+            Ok(n)
+        })();
+        match outcome {
+            Ok(n) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| Error::Storage(BoxError::from(e)))?;
+                Ok(n)
+            }
+            Err(e) => {
+                // Best-effort rollback; the original error is what surfaces.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     /// Read the distinct feature short names already stored for `family`
     /// (`feature_name` values `family.<short>`). Used by the ingestion writer to
     /// rebuild a wide view that unions the current batch with everything
@@ -596,6 +648,29 @@ mod tests {
             .query_row("SELECT count(*) FROM dl.feature_store", [], |r| r.get(0))
             .expect("count");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_should_leave_no_state_on_failed_write_features_and_refresh() {
+        // A failed transactional write must leave the store empty and no view
+        // (specs/20 I4: a partial batch is never observable).
+        let (_tmp, w) = tmp_writer();
+        let mut bad = feature_row("u1", 0.9, "2025-01-01T00:00:00Z");
+        bad.feature_name = "cadence; DROP".into();
+        let res =
+            w.write_features_and_refresh(&[feature_row("u1", 0.9, "2025-01-01T00:00:00Z"), bad]);
+        assert!(matches!(res, Err(Error::InvalidInput(_))));
+        // Fully atomic: the rollback even undoes the CREATE TABLE — no table,
+        // no rows, no view (specs/20 I4: a partial batch is never observable).
+        let table_err = w
+            .conn
+            .query_row("SELECT count(*) FROM dl.feature_store", [], |r| {
+                r.get::<_, i64>(0)
+            });
+        assert!(
+            table_err.is_err(),
+            "failed transaction must leave no feature_store table"
+        );
     }
 
     #[test]
