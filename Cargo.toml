@@ -8,8 +8,8 @@ authors = ["Your Name <YourName@yourdomain.com>"]
 edition = "2024"
 license = "MIT"
 documentation = "https://docs.rs/"
-repository = "https://github.com/TODO"
-homepage = "https://github.com/TODO"
+repository = "https://github.com/kobe4cn/consumer_engine"
+homepage = "https://github.com/kobe4cn/consumer_engine"
 readme = "README.md"
 
 [workspace.dependencies]
@@ -17,7 +17,21 @@ anyhow = "1.0.102"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.142"
 thiserror = "2.0.18"
-tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+# Engine-specific
+duckdb = { version = "1.10505.0", features = ["bundled"] }
+axum = { version = "0.8", features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+flume = "0.11"
+config = { version = "0.14", default-features = false, features = ["yaml"] }
+uuid = { version = "1", features = ["v7"] }
+validator = { version = "0.20", features = ["derive"] }
 
 # workspace crates
 consumer_engine-core = { path = "crates/core" }
+consumer_engine-storage = { path = "crates/storage" }
+consumer_engine-execution = { path = "crates/execution" }
+consumer_engine-ingestion = { path = "crates/ingestion" }
+consumer_engine-ingress = { path = "crates/ingress" }

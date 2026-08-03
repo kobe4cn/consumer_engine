@@ -1,8 +1,8 @@
 [package]
-name = "consumer_engine-core"
-description = "Shared types, error model, and configuration for consumer engine"
+name = "consumer_engine-execution"
+description = "Read-only DuckDB execution: thread-isolated reader actor"
 categories = ["development-tools"]
-keywords = ["audience", "marketing", "duckdb"]
+keywords = ["duckdb", "execution"]
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -12,8 +12,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-thiserror.workspace = true
+consumer_engine-core.workspace = true
+duckdb.workspace = true
+flume.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-config.workspace = true
 tracing.workspace = true

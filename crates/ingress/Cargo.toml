@@ -1,0 +1,24 @@
+[package]
+name = "consumer_engine-ingress"
+description = "axum REST ingress: the single trust boundary for agents and delivery systems"
+categories = ["development-tools"]
+keywords = ["rest", "api"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+consumer_engine-core.workspace = true
+consumer_engine-execution.workspace = true
+consumer_engine-ingestion.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+once_cell = "1"
+regex = "1"

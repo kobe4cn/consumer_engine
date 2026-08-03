@@ -1,0 +1,19 @@
+[package]
+name = "consumer_engine-ingestion"
+description = "Single-writer ingestion actor: batch ingest, micro-batch, compaction"
+categories = ["development-tools"]
+keywords = ["ingestion", "actor"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+consumer_engine-core.workspace = true
+consumer_engine-storage.workspace = true
+duckdb.workspace = true
+flume.workspace = true
+tracing.workspace = true
