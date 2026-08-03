@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned per AGENTS.md ("Rust 2024 edition, latest stable, pin version").
+# Active stable on this host: rustc 1.97.0 (2026-07-07).
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "default"
