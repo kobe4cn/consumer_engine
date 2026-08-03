@@ -80,11 +80,11 @@ impl Reader {
     /// # Errors
     /// Propagates [`Error::Execution`] on prepare/query failure (including
     /// read-only violations for non-SELECT statements).
-    pub async fn query(&self, sql: impl Into<String>) -> Result<QueryResult> {
+    pub async fn query(&self, sql: &str) -> Result<QueryResult> {
         let (rtx, rrx) = flume::bounded(1);
         self.tx
             .send(Cmd::Query {
-                sql: sql.into(),
+                sql: sql.to_string(),
                 reply: rtx,
             })
             .map_err(|e| Error::Execution(BoxError::from(e)))?;

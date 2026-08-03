@@ -34,6 +34,10 @@ use serde::{Deserialize, Serialize};
 /// exhaustion — a full body-size limit also applies via the router layer).
 const MAX_ONBOARD_ROWS: usize = 200_000;
 
+/// Maximum number of columns in an onboard request (DoS bound — a huge column
+/// count builds a huge `CREATE TABLE`).
+const MAX_COLUMNS: usize = 1024;
+
 /// Maximum size of a `POST /query` SQL string, in bytes. DoS bound on the T1
 /// stand-in query surface (the DSL in T2 replaces free SQL).
 const MAX_SQL_BYTES: usize = 8_192;
@@ -112,6 +116,9 @@ async fn onboard(
     if req.columns.is_empty() {
         return Err(Error::InvalidInput("columns must not be empty".into()).into());
     }
+    if req.columns.len() > MAX_COLUMNS {
+        return Err(Error::InvalidInput(format!("columns exceed cap of {MAX_COLUMNS}")).into());
+    }
     for c in &req.columns {
         validate_ident(c)?;
     }
@@ -138,7 +145,7 @@ async fn onboard(
     }
     let n = state
         .ingestion
-        .ingest_raw(req.system, req.entity, req.columns, req.rows)
+        .ingest_raw(&req.system, &req.entity, req.columns, req.rows)
         .await?;
     state
         .last_ingest_epoch
@@ -154,7 +161,7 @@ async fn query(
     if req.sql.len() > MAX_SQL_BYTES {
         return Err(Error::InvalidInput(format!("sql exceeds {MAX_SQL_BYTES} bytes")).into());
     }
-    let QueryResult { columns, rows, .. } = state.reader.query(req.sql).await?;
+    let QueryResult { columns, rows, .. } = state.reader.query(&req.sql).await?;
     let lag = now_epoch() - state.last_ingest_epoch.load(Ordering::Relaxed);
     Ok(Json(QueryResponse {
         columns,

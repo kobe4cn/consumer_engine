@@ -76,16 +76,16 @@ impl IngestionHandle {
     /// Propagates validation/storage errors from the writer.
     pub async fn ingest_raw(
         &self,
-        system: impl Into<String>,
-        entity: impl Into<String>,
+        system: &str,
+        entity: &str,
         columns: Vec<String>,
         rows: Vec<Vec<Option<String>>>,
     ) -> Result<usize> {
         let (rtx, rrx) = flume::bounded(1);
         self.tx
             .send(Cmd::IngestRaw {
-                system: system.into(),
-                entity: entity.into(),
+                system: system.to_string(),
+                entity: entity.to_string(),
                 columns,
                 rows,
                 reply: rtx,

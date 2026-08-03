@@ -104,3 +104,32 @@ Append-only.
   persists), not via a full `Engine::build → drop → Engine::build` cycle.
 - **Fix shape**: add an e2e restart test once the engine owns restorable state
   (it currently owns none beyond DuckLake); low priority.
+
+## From the independent two-axis review (parallel sub-agents)
+
+### Fixed in this pass (commit `phase 1 review (independent): …`)
+
+- **`columns` count unbounded** → added `MAX_COLUMNS = 1024` cap in ingress
+  `onboard` (both axes converged; DoS on `CREATE TABLE` width). Pinned by
+  `test_should_reject_too_many_columns`.
+- **`from_yaml_str` mis-categorised error** → was `Error::Ingestion`, now
+  `Error::InvalidInput` (both axes converged; YAML parse ≠ ingestion failure).
+- **`impl Trait` in public APIs** → `Reader::query` and `IngestionHandle::ingest_raw`
+  now take `&str` (AGENTS.md § Code Style; explicit types in public APIs).
+- **`compaction_loop` un-handled panic** → now runs under a `JoinSet` supervisor
+  that logs + respawns on panic (AGENTS.md § Async).
+
+### Deferred (smells / T2 scope)
+
+- **P3-11 `map_err` duplication** — the `Error::Storage/Execution(BoxError::from(e))`
+  shape repeats ~16×; extract `fn storage_err<E: Into<BoxError>>(e) -> Error`.
+- **P3-12 `escape_for_sql_literal` doc inaccurate** — doc says backticks/quotes/
+  backslashes, body only escapes `'`→`''`; align doc to body.
+- **P3-13 `Freshness::worst_source` as `String`** — closed domain (`batch`/`cdc`);
+  make it an enum (round-trips to the same camelCase JSON).
+- **T2-scope (not T1 bugs)** — `/query` IO timeout (`spec 21 I5`), AuthN/AuthZ
+  + `/readyz` (`spec 21 I1`), raw-SQL escape-hatch approval token + audit
+  (`spec 21 §4`), startup read-only probe (`spec 11 I2`). These land with the
+  DSL + guardrails phase (`91-impl-plan` Phase 2 / T2).
+- **criterion 6 micro-batch** — already P3-4; the independent review confirms
+  `micro_batch_flush_rows` is dead config until the CDC adapter.

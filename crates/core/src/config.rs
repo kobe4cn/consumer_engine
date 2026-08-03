@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BoxError, Result};
+use crate::Result;
 
 /// Top-level engine configuration. Loaded from YAML at startup.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,8 +79,7 @@ impl EngineConfig {
         let cfg = config::Config::builder()
             .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
             .build()
-            .map_err(BoxError::from)
-            .map_err(crate::Error::Ingestion)?;
+            .map_err(|e| crate::Error::InvalidInput(format!("build config: {e}")))?;
         cfg.try_deserialize()
             .map_err(|e| crate::Error::InvalidInput(format!("parse config: {e}")))
     }

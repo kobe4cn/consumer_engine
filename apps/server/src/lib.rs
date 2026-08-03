@@ -54,7 +54,7 @@ impl Engine {
         let ingestion = IngestionHandle::start(writer)?;
 
         let last_ingest_epoch = Arc::new(AtomicI64::new(0));
-        let compaction = tokio::spawn(compaction_loop(
+        let compaction = tokio::spawn(supervise_compaction(
             ingestion.clone(),
             config.compaction_interval_secs,
         ));
@@ -80,6 +80,21 @@ impl Drop for Engine {
         self.ingestion.shutdown();
         self.reader.shutdown();
         self.compaction.abort();
+    }
+}
+
+/// Supervise the compaction loop: if it ever panics, log and respawn. Per
+/// AGENTS.md § Async ("always handle task panics"). The loop is infinite, so
+/// the supervisor only observes a result on panic; `Engine::drop` aborts the
+/// supervisor, whose drop aborts the inner task.
+async fn supervise_compaction(ingestion: IngestionHandle, interval_secs: u64) {
+    let mut set = tokio::task::JoinSet::new();
+    set.spawn(compaction_loop(ingestion.clone(), interval_secs));
+    while let Some(res) = set.join_next().await {
+        if let Err(e) = res {
+            tracing::error!(error = %e, "compaction task panicked; respawning");
+            set.spawn(compaction_loop(ingestion.clone(), interval_secs));
+        }
     }
 }
 

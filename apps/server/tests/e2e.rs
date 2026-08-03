@@ -144,6 +144,24 @@ async fn test_should_reject_invalid_onboard_input() {
 }
 
 #[tokio::test]
+async fn test_should_reject_too_many_columns() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    // 1025 columns > MAX_COLUMNS (1024) — bounds the CREATE TABLE width.
+    let cols: Vec<String> = (0..1025).map(|i| format!("c{i}")).collect();
+    let r = client
+        .post(format!("{base}/sources/onboard"))
+        .json(&serde_json::json!({
+            "system": "erp", "entity": "wide",
+            "columns": cols, "rows": []
+        }))
+        .send()
+        .await
+        .expect("req");
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_should_reject_oversized_sql() {
     let base = spawn().await;
     let client = reqwest::Client::new();
