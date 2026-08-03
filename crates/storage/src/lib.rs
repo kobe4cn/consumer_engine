@@ -15,12 +15,12 @@
 
 use std::path::Path;
 
-use consumer_engine_core::{BoxError, Error, Result, validate_ident};
-use duckdb::Connection;
+use consumer_engine_core::{
+    BoxError, Error, READ_ONLY_CATALOG_ALIAS, Result, SnapshotSpec, WRITE_CATALOG_ALIAS,
+    validate_ident,
+};
+use duckdb::{Connection, types::Value};
 use fs2::FileExt;
-
-/// The DuckLake catalog is always attached under this alias.
-const CATALOG_ALIAS: &str = "dl";
 
 /// Build the qualified raw table name `raw_<system>_<entity>` (validated).
 fn raw_table_name(system: &str, entity: &str) -> Result<String> {
@@ -86,7 +86,7 @@ impl Writer {
         let conn = Connection::open_in_memory().map_err(|e| Error::Storage(BoxError::from(e)))?;
         load_ducklake(&conn)?;
         let sql = format!(
-            "ATTACH 'ducklake:{}' AS {CATALOG_ALIAS} (DATA_PATH '{}');",
+            "ATTACH 'ducklake:{}' AS {WRITE_CATALOG_ALIAS} (DATA_PATH '{}');",
             escape_for_sql_literal(&catalog_path.to_string_lossy()),
             escape_for_sql_literal(&data_path.to_string_lossy()),
         );
@@ -126,7 +126,8 @@ impl Writer {
             .map(|c| format!("{c} VARCHAR"))
             .collect::<Vec<_>>()
             .join(", ");
-        let create = format!("CREATE TABLE IF NOT EXISTS {CATALOG_ALIAS}.{table} ({cols_typed})");
+        let create =
+            format!("CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.{table} ({cols_typed})");
         self.conn
             .execute_batch(&create)
             .map_err(|e| Error::Storage(BoxError::from(e)))?;
@@ -135,8 +136,9 @@ impl Writer {
             return Ok(0);
         }
         let placeholders = format!("({})", vec!["?"; columns.len()].join(", "));
-        let insert =
-            format!("INSERT INTO {CATALOG_ALIAS}.{table} ({cols_names}) VALUES {placeholders}");
+        let insert = format!(
+            "INSERT INTO {WRITE_CATALOG_ALIAS}.{table} ({cols_names}) VALUES {placeholders}"
+        );
         let mut stmt = self
             .conn
             .prepare(&insert)
@@ -158,9 +160,79 @@ impl Writer {
     /// - [`Error::Storage`] on failure.
     pub fn compact(&self, system: &str, entity: &str) -> Result<()> {
         let table = raw_table_name(system, entity)?;
-        let sql = format!("CALL ducklake_rewrite_data_files('{CATALOG_ALIAS}', '{table}');");
+        let sql = format!("CALL ducklake_rewrite_data_files('{WRITE_CATALOG_ALIAS}', '{table}');");
         self.conn
             .execute_batch(&sql)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        Ok(())
+    }
+
+    /// Create the `audience_snapshot` table if absent. No PRIMARY KEY/UNIQUE —
+    /// DuckLake rejects them (`specs/10`, `specs/20 §4`).
+    fn ensure_audience_snapshot_table(&self) -> Result<()> {
+        let sql = format!(
+            "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.audience_snapshot (snapshot_id \
+             UUID, campaign_id VARCHAR, as_of_ts TIMESTAMPTZ, user_id VARCHAR, features JSON, \
+             hit_reason JSON)"
+        );
+        self.conn
+            .execute_batch(&sql)
+            .map_err(|e| Error::Storage(BoxError::from(e)))
+    }
+
+    /// Atomically materialise a DSL segment's distinct keys into
+    /// `audience_snapshot` via a single `INSERT … SELECT` (one catalog
+    /// transaction ⇒ a partial snapshot is never observable, `specs/20 I4`).
+    ///
+    /// `subquery_sql` must reference the **write** alias (`dl.raw_*`); its `?`
+    /// placeholders are bound by `subquery_params`. `key_column` is validated.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidInput`] on a bad key column.
+    /// - [`Error::Storage`] on table/insert failure.
+    pub fn materialize_snapshot(
+        &self,
+        subquery_sql: &str,
+        subquery_params: &[Value],
+        key_column: &str,
+        spec: &SnapshotSpec,
+    ) -> Result<u64> {
+        validate_ident(key_column)?;
+        self.ensure_audience_snapshot_table()?;
+        let sql = format!(
+            "INSERT INTO {WRITE_CATALOG_ALIAS}.audience_snapshot (snapshot_id, campaign_id, \
+             as_of_ts, user_id, features, hit_reason) SELECT CAST(? AS UUID), ?, CAST(? AS \
+             TIMESTAMPTZ), sub.{key_column}, CAST(? AS JSON), CAST(? AS JSON) FROM \
+             ({subquery_sql}) sub"
+        );
+        let mut params: Vec<Value> = vec![
+            Value::Text(spec.snapshot_id.clone()),
+            Value::Text(spec.campaign_id.clone()),
+            Value::Text(spec.as_of_ts.clone()),
+            Value::Text(spec.features.clone()),
+            Value::Text(spec.hit_reason.clone()),
+        ];
+        params.extend_from_slice(subquery_params);
+        let n = self
+            .conn
+            .execute(&sql, duckdb::params_from_iter(params.iter()))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        Ok(n as u64)
+    }
+
+    /// Export a snapshot to a Parquet file at `dest` (server-controlled path).
+    ///
+    /// # Errors
+    /// - [`Error::Storage`] on failure.
+    pub fn export_snapshot_parquet(&self, snapshot_id: &str, dest: &Path) -> Result<()> {
+        let dest = escape_for_sql_literal(&dest.to_string_lossy());
+        let sql = format!(
+            "COPY (SELECT snapshot_id, campaign_id, as_of_ts, user_id, features, hit_reason FROM \
+             {WRITE_CATALOG_ALIAS}.audience_snapshot WHERE snapshot_id = CAST(? AS UUID)) TO \
+             '{dest}' (FORMAT 'PARQUET')"
+        );
+        self.conn
+            .execute(&sql, duckdb::params![snapshot_id])
             .map_err(|e| Error::Storage(BoxError::from(e)))?;
         Ok(())
     }
@@ -172,7 +244,7 @@ impl Writer {
 #[must_use]
 pub fn read_only_attach_sql(catalog_path: &Path, data_path: &Path) -> String {
     format!(
-        "ATTACH 'ducklake:{}' AS dro (DATA_PATH '{}', READ_ONLY);",
+        "ATTACH 'ducklake:{}' AS {READ_ONLY_CATALOG_ALIAS} (DATA_PATH '{}', READ_ONLY);",
         escape_for_sql_literal(&catalog_path.to_string_lossy()),
         escape_for_sql_literal(&data_path.to_string_lossy()),
     )

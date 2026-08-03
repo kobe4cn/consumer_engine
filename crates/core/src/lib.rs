@@ -8,15 +8,19 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
+pub mod catalog;
 pub mod config;
 mod error;
 pub mod freshness;
 pub mod ident;
+pub mod snapshot;
 
+pub use catalog::{READ_ONLY_CATALOG_ALIAS, WRITE_CATALOG_ALIAS};
 pub use config::{EngineConfig, GuardrailConfig};
 pub use error::{Error, Result};
 pub use freshness::Freshness;
 pub use ident::validate_ident;
+pub use snapshot::SnapshotSpec;
 
 /// Boxed, source-preserving error carrying crate, used to embed an upstream
 /// failure (e.g. a `duckdb` error) inside [`Error`] without `core` depending on
