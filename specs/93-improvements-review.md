@@ -337,3 +337,29 @@ Append-only.
   `feature_store`/`suppression`/`audience_snapshot`/`semantic_catalog` → the
   compiler filters every query by the caller's tenant; test that a tenant-B
   token cannot read tenant-A data.
+
+## From the GC tickets (#13/#15/#16, 2025-08)
+
+### GC-HITREASON-REFINE — per-row matched hit_reason deferred (by design, #13 scope)
+
+- **Citation**: `crates/query/src/engine.rs` (`materialize`: `hit_reason` = the
+  validated `q.ops` array, bound per snapshot).
+- **Finding**: `hit_reason` is the **per-predicate selection chain** (the op
+  list), correct for every segment the DSL can express today — ops are
+  AND-composed (every op matched by construction) and `SetOp` is terminal (its
+  descriptor names the branch structure). The specs/92 refinement "compiler
+  carries the per-row matched conjunct" (per-op matched booleans, `SetOp`
+  UNION branch provenance) is **not** implemented.
+- **Fix shape (later)**: a materialise compile mode that emits one `bool_or`
+  column per op (reusing `compile_predicate`/`compile_recency`/… as boolean
+  expressions) and tags `SetOp` branches with a branch id; then `hit_reason` =
+  json of matched op descriptors per user.
+
+### GC-DEDUP-BOUNDARY — dedup sits at the writer, not an adapter (by design, #16 scope)
+
+- **Citation**: `crates/storage/src/lib.rs` (`upsert_raw` dedups by key before
+  the MERGE); specs/20 §4 "the adapter MUST dedup a source batch by key".
+- **Finding**: no `SourceAdapter` exists yet (CDC lands in #24), so the dedup
+  lives at the writer boundary — defense-in-depth, and the only seam today.
+- **Fix shape (#24)**: the CDC adapter dedups earlier (or relies on
+  `upsert_raw`'s contract); re-verify at the adapter seam.

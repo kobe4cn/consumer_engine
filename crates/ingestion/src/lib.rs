@@ -4,12 +4,14 @@
 //! thread — `duckdb::Connection` is not `Sync`. The async side sends commands
 //! over a `flume` channel and awaits typed replies.
 //!
-//! For T1, an `IngestRaw` command flushes the supplied batch immediately via the
-//! writer's multi-row parameterised insert (the batch is the micro-batch at the
-//! SQL level). CDC-driven cross-call accumulation on the configured flush
-//! threshold lands with the CDC adapter (survey-cdc-adapter.md). A
-//! [`IngestionHandle::compact_all`] entry point plus the server's interval task
-//! wire compaction (decision D6).
+//! Raw source batches (`Cmd::IngestRaw`) accumulate in a per-`(system, entity)`
+//! micro-batcher (decision D6, specs/71 §4): a batch is flushed when its row
+//! count reaches `MicroBatchConfig::flush_rows` or its age reaches
+//! `flush_age_secs` (checked on every command arrival), and always on
+//! shutdown. Flushing is a multi-row `VALUES` insert — one DuckLake commit per
+//! flush (issue #12: per-row commits balloon the catalog). Feature / catalog /
+//! suppression / materialise commands write through immediately (they are
+//! transactional with their own refresh/derivation).
 
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
@@ -72,6 +74,36 @@ enum Cmd {
         /// Reply channel.
         reply: flume::Sender<Result<()>>,
     },
+    /// Upsert a dimension batch by `key` (specs/20 §4): adapter-boundary dedup
+    /// by key (last wins) + `WHEN MATCHED THEN UPDATE / WHEN NOT MATCHED THEN
+    /// INSERT` MERGE.
+    UpsertRaw {
+        /// Source system identifier.
+        system: String,
+        /// Source entity (table) identifier.
+        entity: String,
+        /// Column names.
+        columns: Vec<String>,
+        /// The merge key column.
+        key: String,
+        /// Rows of optional string cells.
+        rows: Vec<Vec<Option<String>>>,
+        /// Reply channel carrying the rows affected.
+        reply: flume::Sender<Result<usize>>,
+    },
+    /// Logically delete rows by `key` (specs/20 §4).
+    DeleteRaw {
+        /// Source system identifier.
+        system: String,
+        /// Source entity (table) identifier.
+        entity: String,
+        /// The key column.
+        key: String,
+        /// Key values to delete.
+        keys: Vec<String>,
+        /// Reply channel carrying the rows affected.
+        reply: flume::Sender<Result<usize>>,
+    },
     /// Append feature rows to `feature_store` and refresh the wide pivot views
     /// for every distinct family touched (D9).
     WriteFeatures {
@@ -94,8 +126,12 @@ enum Cmd {
         /// Reply channel carrying the inserted row count.
         reply: flume::Sender<Result<usize>>,
     },
-    /// Stop the writer thread.
-    Shutdown,
+    /// Stop the writer thread (graceful drain; the ack fires after the flush).
+    Shutdown {
+        /// Acknowledges the drain — the writer sends after flushing buffered
+        /// batches and before exiting its loop.
+        ack: flume::Sender<()>,
+    },
 }
 
 /// Handle to the single ingestion writer. Cheap to clone.
@@ -105,6 +141,54 @@ pub struct IngestionHandle {
     registry: Arc<ProducerRegistry>,
 }
 
+/// Micro-batch flush policy for raw source batches (decision D6, specs/71 §4).
+/// `flush_rows` of `0` disables buffering entirely — every `IngestRaw` flushes
+/// immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MicroBatchConfig {
+    /// Flush a `(system, entity)` batch once this many rows are queued.
+    pub flush_rows: u64,
+    /// Flush a batch once it has been buffered this long (checked on command
+    /// arrival and on shutdown). `0` disables age-based flush.
+    pub flush_age_secs: u64,
+}
+
+impl MicroBatchConfig {
+    /// Spec defaults (specs/71 §4): 50k rows or 30 s, whichever comes first.
+    #[must_use]
+    pub const fn default_config() -> Self {
+        Self {
+            flush_rows: 50_000,
+            flush_age_secs: 30,
+        }
+    }
+
+    /// Unit-test convenience: flush on every ingest (equivalent to the pre-
+    /// micro-batch behaviour). Production wiring uses
+    /// [`Self::default_config`] or the engine config values.
+    #[must_use]
+    pub const fn immediate() -> Self {
+        Self {
+            flush_rows: 1,
+            flush_age_secs: 0,
+        }
+    }
+}
+
+impl Default for MicroBatchConfig {
+    fn default() -> Self {
+        Self::default_config()
+    }
+}
+
+/// A not-yet-flushed raw batch for one `(system, entity)`, with its shape and
+/// buffering start time (decision D6).
+struct PendingBatch {
+    columns: Vec<String>,
+    rows: Vec<Vec<Option<String>>>,
+    since: std::time::Instant,
+}
+
 impl std::fmt::Debug for IngestionHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IngestionHandle").finish_non_exhaustive()
@@ -112,19 +196,36 @@ impl std::fmt::Debug for IngestionHandle {
 }
 
 impl IngestionHandle {
-    /// Start the writer thread owning `writer` and bound to `registry`. Exactly
-    /// one handle should be built per catalog (the writer's file lock enforces
-    /// singleness). The registry holds the Feature Store producers (D9).
+    /// Start the writer thread owning `writer` and bound to `registry`, with
+    /// the micro-batch policy from `config`. Exactly one handle should be built
+    /// per catalog (the writer's file lock enforces singleness). The registry
+    /// holds the Feature Store producers (D9).
     ///
     /// # Errors
     /// - [`Error::Ingestion`] if the thread cannot be spawned.
-    pub fn start(writer: Writer, registry: Arc<ProducerRegistry>) -> Result<Self> {
+    pub fn start_with(
+        writer: Writer,
+        registry: Arc<ProducerRegistry>,
+        config: MicroBatchConfig,
+    ) -> Result<Self> {
         let (tx, rx) = flume::bounded::<Cmd>(64);
         thread::Builder::new()
             .name("ce-ingestion".into())
-            .spawn(move || writer_loop(writer, rx))
+            .spawn(move || writer_loop(writer, rx, config))
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
         Ok(Self { tx, registry })
+    }
+
+    /// Start the writer thread with immediate-flush behaviour. **Test
+    /// convenience only** — production wiring passes an explicit
+    /// [`MicroBatchConfig`] via [`Self::start_with`]; this default silently
+    /// disables micro-batching, which is why it is hidden from the docs.
+    ///
+    /// # Errors
+    /// - [`Error::Ingestion`] if the thread cannot be spawned.
+    #[doc(hidden)]
+    pub fn start(writer: Writer, registry: Arc<ProducerRegistry>) -> Result<Self> {
+        Self::start_with(writer, registry, MicroBatchConfig::immediate())
     }
 
     /// Ingest a batch into `raw_<system>_<entity>`. Returns the row count.
@@ -260,6 +361,62 @@ impl IngestionHandle {
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?
     }
 
+    /// Upsert a dimension batch by `key` through the single writer (specs/20
+    /// §4: dedup by key, update-or-insert). Returns the rows affected.
+    ///
+    /// # Errors
+    /// Propagates validation/storage errors from the writer.
+    pub async fn upsert_raw(
+        &self,
+        system: &str,
+        entity: &str,
+        columns: Vec<String>,
+        key: String,
+        rows: Vec<Vec<Option<String>>>,
+    ) -> Result<usize> {
+        let (rtx, rrx) = flume::bounded(1);
+        self.tx
+            .send(Cmd::UpsertRaw {
+                system: system.to_string(),
+                entity: entity.to_string(),
+                columns,
+                key,
+                rows,
+                reply: rtx,
+            })
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
+        rrx.recv_async()
+            .await
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?
+    }
+
+    /// Logically delete rows by `key` through the single writer (specs/20 §4).
+    /// Returns the rows deleted.
+    ///
+    /// # Errors
+    /// Propagates validation/storage errors from the writer.
+    pub async fn delete_raw(
+        &self,
+        system: &str,
+        entity: &str,
+        key: String,
+        keys: Vec<String>,
+    ) -> Result<usize> {
+        let (rtx, rrx) = flume::bounded(1);
+        self.tx
+            .send(Cmd::DeleteRaw {
+                system: system.to_string(),
+                entity: entity.to_string(),
+                key,
+                keys,
+                reply: rtx,
+            })
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
+        rrx.recv_async()
+            .await
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?
+    }
+
     /// Run the producer registered under `id` at `as_of` and persist its output
     /// to `feature_store`. The producer reads on the caller's async task; only
     /// the write crosses into the single writer thread (spec 20 I1).
@@ -276,16 +433,56 @@ impl IngestionHandle {
         self.write_features(output.rows).await
     }
 
-    /// Signal the writer thread to stop. Best-effort.
+    /// Ask the writer thread to stop after a graceful drain (specs/11 I3).
+    /// **Non-blocking**: safe to call from `Drop` on an async runtime thread
+    /// (the writer drains its buffered micro-batches before exiting, in the
+    /// background). Tests that must observe durability before continuing use
+    /// [`Self::shutdown_and_wait`].
     pub fn shutdown(&self) {
-        let _ = self.tx.send(Cmd::Shutdown);
+        let (ack_tx, _ack_rx) = flume::bounded::<()>(0);
+        let _ = self.tx.send(Cmd::Shutdown { ack: ack_tx });
+    }
+
+    /// Like [`Self::shutdown`] but blocks until the writer has drained every
+    /// buffered micro-batch and exited (an acked ingest is durable when this
+    /// returns). Use in tests/CLI shutdown, not on an async runtime thread.
+    pub fn shutdown_and_wait(&self) {
+        let (ack_tx, ack_rx) = flume::bounded::<()>(0);
+        if self.tx.send(Cmd::Shutdown { ack: ack_tx }).is_ok() {
+            // Rendezvous: the writer acks after the drain flush and before
+            // exiting its loop.
+            let _ = ack_rx.recv();
+        }
     }
 }
 
-/// The writer thread body: own the writer, track known tables, serve commands.
-fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>) {
+/// The writer thread body: own the writer, track known tables, micro-batch raw
+/// source batches (D6), serve commands until shutdown.
+///
+/// The loop waits up to [`AGE_TICK`] for a command and flushes expired batches
+/// on every timeout — a slow trickle of small batches is committed by wall
+/// clock, not only when a command happens to arrive (specs/71 §4 freshness
+/// SLA: flush age 30 s ⇒ end-to-end freshness well inside the ≤ 5 min bound).
+fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>, micro: MicroBatchConfig) {
     let mut known: HashSet<(String, String)> = HashSet::new();
-    for cmd in rx.iter() {
+    let mut pending: std::collections::BTreeMap<(String, String), PendingBatch> =
+        std::collections::BTreeMap::new();
+    loop {
+        let cmd = match rx.recv_timeout(AGE_TICK) {
+            Ok(cmd) => cmd,
+            Err(flume::RecvTimeoutError::Timeout) => {
+                flush_expired(&writer, &mut pending, &mut known, micro.flush_age_secs);
+                continue;
+            }
+            // All senders dropped: no graceful shutdown was requested — flush
+            // what is buffered so nothing acked is lost, then exit.
+            Err(flume::RecvTimeoutError::Disconnected) => {
+                flush_pending(&writer, &mut pending, &mut known);
+                break;
+            }
+        };
+        // Age-based flush before every command (incl. shutdown).
+        flush_expired(&writer, &mut pending, &mut known, micro.flush_age_secs);
         match cmd {
             Cmd::IngestRaw {
                 system,
@@ -294,13 +491,47 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>) {
                 rows,
                 reply,
             } => {
-                let res = writer.ingest_raw(&system, &entity, &columns, &rows);
-                if res.is_ok() {
-                    known.insert((system, entity));
-                }
+                let res = if micro.flush_rows == 0 {
+                    // Buffering disabled: flush immediately (pre-micro-batch path).
+                    let r = writer.ingest_raw(&system, &entity, &columns, &rows);
+                    if r.is_ok() {
+                        known.insert((system, entity));
+                    }
+                    r
+                } else {
+                    let key = (system.clone(), entity.clone());
+                    // A schema change (different columns) forces the old batch out
+                    // first — buffered rows must not mix shapes.
+                    if let Some(existing) = pending.get(&key)
+                        && existing.columns != columns
+                        && let Some(old) = pending.remove(&key)
+                        && let Err(e) = flush_batch(&writer, &key, &old, &mut known)
+                    {
+                        tracing::warn!(error = %e, "schema-change flush failed");
+                    }
+                    let batch = pending.entry(key.clone()).or_insert_with(|| PendingBatch {
+                        columns: columns.clone(),
+                        rows: Vec::new(),
+                        since: std::time::Instant::now(),
+                    });
+                    batch.rows.extend(rows);
+                    if batch.rows.len() as u64 >= micro.flush_rows {
+                        match pending.remove(&key) {
+                            Some(batch) => flush_batch(&writer, &key, &batch, &mut known),
+                            None => Ok(0),
+                        }
+                    } else {
+                        // Buffered; nothing committed yet — the caller sees 0
+                        // inserted until the threshold/age triggers the flush.
+                        Ok(0)
+                    }
+                };
                 let _ = reply.send(res);
             }
             Cmd::CompactAll { reply } => {
+                // Buffered rows are part of the table's latest state; compact
+                // only after they land.
+                flush_pending(&writer, &mut pending, &mut known);
                 let mut last: Result<()> = Ok(());
                 for (s, e) in &known {
                     if let Err(err) = writer.compact(s, e) {
@@ -308,6 +539,33 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>) {
                     }
                 }
                 let _ = reply.send(last);
+            }
+            Cmd::UpsertRaw {
+                system,
+                entity,
+                columns,
+                key,
+                rows,
+                reply,
+            } => {
+                let res = writer.upsert_raw(&system, &entity, &columns, &key, &rows);
+                if res.is_ok() {
+                    known.insert((system, entity));
+                }
+                let _ = reply.send(res);
+            }
+            Cmd::DeleteRaw {
+                system,
+                entity,
+                key,
+                keys,
+                reply,
+            } => {
+                let res = writer.delete_raw(&system, &entity, &key, &keys);
+                if res.is_ok() {
+                    known.insert((system, entity));
+                }
+                let _ = reply.send(res);
             }
             Cmd::Materialize {
                 subquery_sql,
@@ -344,9 +602,90 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>) {
                 let res = writer.write_suppression_idempotent(&rows);
                 let _ = reply.send(res);
             }
-            Cmd::Shutdown => break,
+            Cmd::Shutdown { ack } => {
+                // Graceful drain (specs/11 I3): force-flush every buffered batch
+                // so no acked ingest is lost on shutdown, then ack and exit.
+                flush_pending(&writer, &mut pending, &mut known);
+                let _ = ack.send(());
+                break;
+            }
         }
     }
+}
+
+/// Wall-clock cadence at which the writer loop wakes to age-flush batches
+/// (specs/71 §4: flush age 30 s ⇒ ≤ 5 min end-to-end freshness).
+const AGE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Flush one pending batch through the writer; registers the table as known on
+/// success (so compaction covers it).
+fn flush_batch(
+    writer: &Writer,
+    key: &(String, String),
+    batch: &PendingBatch,
+    known: &mut HashSet<(String, String)>,
+) -> Result<usize> {
+    let n = writer.ingest_raw(&key.0, &key.1, &batch.columns, &batch.rows)?;
+    known.insert(key.clone());
+    Ok(n)
+}
+
+/// Shared drain loop: flush every pending batch for which `should_flush`
+/// holds. A failed flush is logged — the writer thread must keep serving — and
+/// the rows are dropped (a retry would need a CDC-style offset, which is #24's
+/// scope).
+fn flush_some(
+    writer: &Writer,
+    pending: &mut std::collections::BTreeMap<(String, String), PendingBatch>,
+    known: &mut HashSet<(String, String)>,
+    should_flush: impl Fn(&(String, String), &PendingBatch) -> bool,
+) {
+    let keys: Vec<(String, String)> = pending
+        .iter()
+        .filter(|(k, b)| should_flush(k, b))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in keys {
+        if let Some(b) = pending.remove(&k)
+            && let Err(e) = flush_batch(writer, &k, &b, known)
+        {
+            tracing::warn!(
+                error = %e,
+                system = %k.0,
+                entity = %k.1,
+                "micro-batch flush failed"
+            );
+        }
+    }
+}
+
+/// Flush every pending batch (compaction pre-step and shutdown drain,
+/// specs/11 I3).
+fn flush_pending(
+    writer: &Writer,
+    pending: &mut std::collections::BTreeMap<(String, String), PendingBatch>,
+    known: &mut HashSet<(String, String)>,
+) {
+    flush_some(writer, pending, known, |_, _| true);
+}
+
+/// Flush any pending batch whose buffering age exceeds `age_secs` (`0`
+/// disables). Called on every loop wake (command arrival or [`AGE_TICK`] timeout)
+/// so freshness is wall-clock, not command-gated.
+fn flush_expired(
+    writer: &Writer,
+    pending: &mut std::collections::BTreeMap<(String, String), PendingBatch>,
+    known: &mut HashSet<(String, String)>,
+    age_secs: u64,
+) {
+    if age_secs == 0 {
+        return;
+    }
+    let age = std::time::Duration::from_secs(age_secs);
+    let now = std::time::Instant::now();
+    flush_some(writer, pending, known, |_, b| {
+        now.duration_since(b.since) >= age
+    });
 }
 
 #[cfg(test)]
@@ -356,6 +695,153 @@ mod tests {
     use duckdb::types::Value;
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_should_accumulate_rows_until_flush_threshold() {
+        // Micro-batch (D6): rows accumulate per (system, entity) and are
+        // committed only when the configured row threshold is reached — the
+        // pre-threshold ingests report 0 inserted.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        let handle = IngestionHandle::start_with(
+            writer,
+            Arc::new(ProducerRegistry::new()),
+            MicroBatchConfig {
+                flush_rows: 3,
+                flush_age_secs: 0,
+            },
+        )
+        .expect("start");
+        let cols = vec!["user_id".into(), "sku".into()];
+        let n1 = handle
+            .ingest_raw(
+                "erp",
+                "orders",
+                cols.clone(),
+                vec![vec![Some("u1".into()), Some("A".into())]],
+            )
+            .await
+            .expect("ingest 1");
+        let n2 = handle
+            .ingest_raw(
+                "erp",
+                "orders",
+                cols.clone(),
+                vec![vec![Some("u2".into()), Some("B".into())]],
+            )
+            .await
+            .expect("ingest 2");
+        assert_eq!(n1, 0, "below threshold: nothing committed yet");
+        assert_eq!(n2, 0, "below threshold: nothing committed yet");
+        // The third row crosses the threshold of 3 → the whole batch flushes.
+        let n3 = handle
+            .ingest_raw(
+                "erp",
+                "orders",
+                cols.clone(),
+                vec![vec![Some("u3".into()), Some("C".into())]],
+            )
+            .await
+            .expect("ingest 3");
+        assert_eq!(n3, 3, "threshold reached: all buffered rows commit at once");
+        let r = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let count: i64 = r
+            .query_row("SELECT count(*) FROM dro.raw_erp_orders", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, 3, "all three rows must be durable after the flush");
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_flush_on_age_by_wall_clock() {
+        // Age-based flush (specs/71 §4) must be wall-clock, not command-gated:
+        // a batch below the row threshold is committed once buffered for
+        // `flush_age_secs`, even with no further commands arriving.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        let handle = IngestionHandle::start_with(
+            writer,
+            Arc::new(ProducerRegistry::new()),
+            MicroBatchConfig {
+                flush_rows: 10_000,
+                flush_age_secs: 1,
+            },
+        )
+        .expect("start");
+        handle
+            .ingest_raw(
+                "erp",
+                "orders",
+                vec!["user_id".into(), "sku".into()],
+                vec![vec![Some("u1".into()), Some("A".into())]],
+            )
+            .await
+            .expect("ingest");
+        // No command is sent: the writer loop's wall-clock tick must flush.
+        tokio::time::sleep(std::time::Duration::from_millis(1_400)).await;
+        let r = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let count: i64 = r
+            .query_row("SELECT count(*) FROM dro.raw_erp_orders", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(
+            count, 1,
+            "wall-clock age-flush must commit the buffered row"
+        );
+        handle.shutdown_and_wait();
+    }
+
+    #[tokio::test]
+    async fn test_should_force_flush_on_shutdown() {
+        // Graceful drain (specs/11 I3): shutdown force-flushes every buffered
+        // batch — an acked ingest is never lost.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        let handle = IngestionHandle::start_with(
+            writer,
+            Arc::new(ProducerRegistry::new()),
+            MicroBatchConfig {
+                flush_rows: 10_000,
+                flush_age_secs: 0,
+            },
+        )
+        .expect("start");
+        handle
+            .ingest_raw(
+                "erp",
+                "orders",
+                vec!["user_id".into(), "sku".into()],
+                vec![vec![Some("u1".into()), Some("A".into())]],
+            )
+            .await
+            .expect("ingest");
+        handle.shutdown_and_wait();
+        let r = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let count: i64 = r
+            .query_row("SELECT count(*) FROM dro.raw_erp_orders", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, 1, "shutdown must drain the buffered batch");
+    }
 
     #[tokio::test]
     async fn test_should_materialize_via_handle() {
@@ -382,12 +868,13 @@ mod tests {
             snapshot_id: uuid::Uuid::now_v7().to_string(),
             campaign_id: "c1".into(),
             as_of_ts: chrono::Utc::now().to_rfc3339(),
-            features: "{}".into(),
-            hit_reason: "{}".into(),
         };
+        // The subquery emits `<key>, features, hit_reason` per row (issue #13:
+        // frozen features + predicate chain are per-row columns, not scalars).
         let rows = handle
             .materialize_snapshot(
-                "SELECT DISTINCT base.user_id FROM dl.raw_erp_orders base WHERE base.sku = ?",
+                "SELECT DISTINCT base.user_id, CAST('{}' AS JSON) AS features, CAST('{}' AS JSON) \
+                 AS hit_reason FROM dl.raw_erp_orders base WHERE base.sku = ?",
                 vec![Value::Text("A".into())],
                 "user_id",
                 spec.clone(),
@@ -428,6 +915,75 @@ mod tests {
         );
         assert_eq!(row.2, rows as i64, "features must be non-null on every row");
 
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_upsert_and_delete_via_handle() {
+        // The adapter seam: dim upsert (dedup + update-or-insert) and logical
+        // delete both route through the single writer (specs/20 §4).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        let handle = IngestionHandle::start(writer, Arc::new(ProducerRegistry::new()))
+            .expect("start handle");
+        let cols = vec!["id".into(), "tier".into()];
+        handle
+            .upsert_raw(
+                "erp",
+                "users",
+                cols.clone(),
+                "id".into(),
+                vec![
+                    vec![Some("u1".into()), Some("gold".into())],
+                    vec![Some("u2".into()), Some("silver".into())],
+                ],
+            )
+            .await
+            .expect("upsert");
+        // u1 updated (last wins dedup), u3 inserted.
+        handle
+            .upsert_raw(
+                "erp",
+                "users",
+                cols.clone(),
+                "id".into(),
+                vec![
+                    vec![Some("u1".into()), Some("platinum".into())],
+                    vec![Some("u3".into()), Some("diamond".into())],
+                ],
+            )
+            .await
+            .expect("upsert 2");
+        let deleted = handle
+            .delete_raw("erp", "users", "id".into(), vec!["u2".into()])
+            .await
+            .expect("delete");
+        assert_eq!(deleted, 1, "u2 logically deleted");
+        let r = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let rows: Vec<(String, String)> = {
+            let mut stmt = r
+                .prepare("SELECT id, tier FROM dro.raw_erp_users ORDER BY id")
+                .expect("prepare");
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("u1".into(), "platinum".into()),
+                ("u3".into(), "diamond".into()),
+            ],
+            "updated + inserted, deleted key gone, no duplicates"
+        );
         handle.shutdown();
     }
 

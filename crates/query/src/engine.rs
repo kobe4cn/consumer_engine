@@ -410,10 +410,13 @@ impl QueryEngine {
     /// materialising — but the T2 `EXPLAIN` is run best-effort so a malformed
     /// segment fails fast with a clear error (`specs/20 I4`).
     ///
-    /// `as_of_ts` is materialisation time in M2 (true I3 point-in-time bounding
-    /// lands in T4); `features` is the non-null placeholder `{}` (Feature Store
-    /// is T4); `hit_reason` is the serialised validated DSL — a faithful
-    /// per-row selection reason for B-only segments.
+    /// The snapshot is written as one atomic `INSERT … SELECT` where each row
+    /// carries its **frozen feature values** (left-joined from every
+    /// `feature_wide_*` family and projected as JSON — decision D11, issue
+    /// #13) and its **predicate chain** (`hit_reason` = the validated op list
+    /// that composed the segment; in an AND-composed segment every op matched,
+    /// so the chain is the selecting predicates). `as_of_ts` is materialisation
+    /// time in M2 (true I3 point-in-time bounding lands in #21).
     ///
     /// # Errors
     /// - [`QueryError::InvalidDsl`] if the segment fails to compile or the DSL cannot be serialised
@@ -448,9 +451,16 @@ impl QueryEngine {
         // Scalars.
         let snapshot_id = uuid::Uuid::now_v7().to_string();
         let as_of_ts = chrono::Utc::now().to_rfc3339();
-        let features = "{}".to_string();
-        let hit_reason = serde_json::to_string(q)
+        // hit_reason: the per-predicate selection chain (D11, issue #13). The
+        // validated op list is serialised to JSON text and **bound as a
+        // parameter** — never interpolated into SQL (values inside ops come
+        // from the agent).
+        let hit_reason = serde_json::to_string(&q.ops)
             .map_err(|e| QueryError::InvalidDsl(format!("serialize hit_reason: {e}")))?;
+
+        // Feature families known to the store (fresh read; the writer's
+        // `feature_wide_*` views are at least as fresh).
+        let families = self.feature_families().await?;
 
         // Write path: recompile under the writable alias so the writer's
         // `INSERT … SELECT` resolves `dl.raw_*`.
@@ -462,17 +472,89 @@ impl QueryEngine {
                 derive_limit: None,
             },
         )?;
+
+        // Wrap the compiled segment so the subquery emits `<key>, features,
+        // hit_reason` per row (the writer selects exactly those columns).
+        // Frozen features: LEFT JOIN every feature family's wide view on the
+        // key and project `json_object('family.short', fs_i.short, …)` —
+        // `json_object` omits NULLs, so a user's features JSON holds exactly
+        // the values they had at selection time (an empty object when the
+        // store has nothing for them).
+        let key = &q.key;
+        let mut wrap_params = Vec::with_capacity(write.params.len() + 1);
+        // The wrap SELECT's `CAST(? AS JSON) AS hit_reason` placeholder precedes
+        // every `?` inside the compiled subquery, so it binds first.
+        wrap_params.push(Value::Text(hit_reason));
+        wrap_params.extend(write.params);
+        let mut joins = String::new();
+        let mut json_pairs: Vec<String> = Vec::new();
+        for (idx, (family, shorts)) in families.iter().enumerate() {
+            let fa = format!("fs_{idx}");
+            joins.push_str(&format!(
+                " LEFT JOIN {WRITE_CATALOG_ALIAS}.feature_wide_{family} {fa} ON {fa}.user_id = \
+                 s.{key}"
+            ));
+            for short in shorts {
+                json_pairs.push(format!("'{family}.{short}', {fa}.{short}"));
+            }
+        }
+        let features_expr = if json_pairs.is_empty() {
+            "json_object()".to_string()
+        } else {
+            format!("json_object({})", json_pairs.join(", "))
+        };
+        let wrap_sql = format!(
+            "SELECT s.{key} AS {key}, {features_expr} AS features, CAST(? AS JSON) AS hit_reason \
+             FROM ({}) s{joins}",
+            write.sql
+        );
         let spec = SnapshotSpec {
             snapshot_id: snapshot_id.clone(),
             campaign_id: campaign_id.to_string(),
             as_of_ts,
-            features,
-            hit_reason,
         };
         self.ingestion
-            .materialize_snapshot(&write.sql, write.params, &q.key, spec)
+            .materialize_snapshot(&wrap_sql, wrap_params, &q.key, spec)
             .await?;
         Ok(format!("snap_{snapshot_id}"))
+    }
+
+    /// The distinct `(family, short)` feature names written to the store,
+    /// grouped by family and sorted (the frozen-features projection joins one
+    /// wide view per family).
+    ///
+    /// Best-effort: a missing `feature_store` table (a fresh engine with no
+    /// features) degrades to an empty map — the snapshot is still valid, its
+    /// rows just carry `features={}` (D11 / issue #13: frozen features are an
+    /// enrichment, not a prerequisite; the server ensures the table at startup
+    /// anyway).
+    async fn feature_families(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        let qr = match self
+            .timed_read(
+                "SELECT DISTINCT feature_name FROM dro.feature_store",
+                Vec::new(),
+            )
+            .await
+        {
+            Ok(qr) => qr,
+            Err(e) => {
+                tracing::warn!(error = %e, "feature_store unreadable; freezing no features");
+                return Ok(BTreeMap::new());
+            }
+        };
+        let mut families: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in &qr.rows {
+            if let Some(name) = row.first().and_then(serde_json::Value::as_str)
+                && let Ok((family, short)) = consumer_engine_core::split_feature_name(name)
+            {
+                families.entry(family).or_default().push(short);
+            }
+        }
+        for shorts in families.values_mut() {
+            shorts.sort();
+            shorts.dedup();
+        }
+        Ok(families)
     }
 
     /// Read a snapshot's metadata via the read-only reader. Returns `None` if no

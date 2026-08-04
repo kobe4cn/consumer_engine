@@ -124,6 +124,40 @@ fn assert_nonempty(col: &dyn arrow::array::Array) {
     // LargeUtf8/LargeBinary and other layouts: null-count check above suffices.
 }
 
+/// Decode a snapshot Parquet body into per-row `(user_id, features, hit_reason)`
+/// JSON text (column order: snapshot_id, campaign_id, as_of_ts, user_id,
+/// features, hit_reason). The JSON columns arrive as Utf8 or Binary — handle
+/// both. Callers assert on the parsed JSON (issue #13: frozen feature values +
+/// per-predicate hit_reason).
+fn decode_parquet_payloads(bytes: bytes::Bytes) -> Vec<(String, String, String)> {
+    use arrow::array::AsArray;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).expect("open parquet reader");
+    let reader = builder.build().expect("build record-batch reader");
+    let cell = |col: &dyn arrow::array::Array, i: usize| -> String {
+        if let Some(arr) = col.as_string_opt::<i32>() {
+            arr.value(i).to_string()
+        } else if let Some(arr) = col.as_binary_opt::<i32>() {
+            String::from_utf8_lossy(arr.value(i)).to_string()
+        } else {
+            panic!("unexpected parquet column type for value decode");
+        }
+    };
+    let mut out = Vec::new();
+    for batch in reader {
+        let batch = batch.expect("read batch");
+        for row in 0..batch.num_rows() {
+            out.push((
+                cell(batch.column(3), row),
+                cell(batch.column(4), row),
+                cell(batch.column(5), row),
+            ));
+        }
+    }
+    out
+}
+
 /// Post a `sku = eq A` filter segment for materialisation, returning the job id.
 async fn post_filter_job(client: &reqwest::Client, base: &str, campaign_id: &str) -> String {
     let resp = client
@@ -203,6 +237,10 @@ async fn spawn_full(
         catalog_path: tmp.path().join("cat.db"),
         data_path: tmp.path().join("data"),
         compaction_interval_secs: 0, // disable periodic compaction in tests
+        // The REST e2e ingests then immediately queries — flush every ingest
+        // call so rows are visible the moment onboard returns (the micro-batch
+        // accumulation behaviour itself is unit-tested in consumer_engine-ingestion).
+        micro_batch_flush_rows: 1,
         guardrails,
         suppression,
         auth_token,
@@ -883,12 +921,40 @@ async fn test_should_resolve_periodic_buyers_end_to_end() {
         .expect("export");
     assert_eq!(resp.status(), reqwest::StatusCode::OK, "export must be 200");
     let bytes = resp.bytes().await.expect("export bytes");
-    let (rows, hr_nulls, _feat_nulls) = decode_parquet_snapshot(bytes);
+    let (rows, hr_nulls, _feat_nulls) = decode_parquet_snapshot(bytes.clone());
     assert_eq!(
         rows, 1,
         "parquet row count must match the materialised segment"
     );
     assert_eq!(hr_nulls, 0, "hit_reason must be non-null on every row");
+
+    // Frozen features + per-predicate hit_reason (D11, issue #13): the single
+    // row's features JSON must carry the REAL cadence score the producer wrote
+    // (1.0 for a perfectly regular weekly buyer), and hit_reason must be the
+    // predicate chain (an ops array), not the whole DSL envelope.
+    let payloads = decode_parquet_payloads(bytes);
+    assert_eq!(payloads.len(), 1, "one materialised user");
+    let (user, features, hit_reason) = &payloads[0];
+    assert_eq!(user, "reg", "the regular buyer is the materialised user");
+    let fv: Value = serde_json::from_str(features).expect("features json");
+    assert!(
+        fv.is_object(),
+        "features must be a JSON object, not a placeholder: {fv}"
+    );
+    assert!(
+        (fv["cadence.regularity"].as_f64().unwrap_or(-1.0) - 1.0).abs() < 1e-9,
+        "frozen feature must be the real cadence.regularity value: {fv}"
+    );
+    let hr: Value = serde_json::from_str(hit_reason).expect("hit_reason json");
+    assert!(
+        hr.is_array(),
+        "hit_reason must be the per-predicate chain (array), not the whole DSL: {hr}"
+    );
+    assert!(
+        hr.as_array()
+            .is_some_and(|ops| ops.iter().any(|op| op["kind"] == "feature")),
+        "hit_reason must name the selecting Feature predicate: {hr}"
+    );
 }
 
 #[tokio::test]

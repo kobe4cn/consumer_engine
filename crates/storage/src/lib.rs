@@ -500,6 +500,146 @@ impl Writer {
         )
     }
 
+    /// Upsert a dimension batch by `key` (specs/20 §4): rows are **deduplicated
+    /// by key within the batch** (last row wins — DuckLake does not dedup), then
+    /// merged with a single `WHEN MATCHED THEN UPDATE / WHEN NOT MATCHED THEN
+    /// INSERT` statement per chunk, one catalog transaction per chunk (one
+    /// DuckLake snapshot per chunk, keeping the read-attach cost low — issue
+    /// #12). Events should use [`Self::ingest_raw`] (append); only dims upsert.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidInput`] on a bad identifier or a `key` absent from `columns`.
+    /// - [`Error::Storage`] on DDL/MERGE failure.
+    pub fn upsert_raw(
+        &self,
+        system: &str,
+        entity: &str,
+        columns: &[String],
+        key: &str,
+        rows: &[Vec<Option<String>>],
+    ) -> Result<usize> {
+        if columns.is_empty() {
+            return Err(Error::InvalidInput("columns must not be empty".into()));
+        }
+        for c in columns {
+            validate_ident(c)?;
+        }
+        validate_ident(key)?;
+        let key_idx = columns
+            .iter()
+            .position(|c| c == key)
+            .ok_or_else(|| Error::InvalidInput(format!("merge key {key:?} must be a column")))?;
+        let table = raw_table_name(system, entity)?;
+        let cols_typed = columns
+            .iter()
+            .map(|c| format!("{c} VARCHAR"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let create =
+            format!("CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.{table} ({cols_typed})");
+        self.conn
+            .execute_batch(&create)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        // Adapter-boundary dedup: last row per key wins (specs/20 §4 — DuckLake
+        // accumulates duplicates; the writer must not).
+        let mut deduped: Vec<&Vec<Option<String>>> = Vec::new();
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for row in rows {
+            let k = row.get(key_idx).and_then(|v| v.as_deref()).unwrap_or("");
+            match seen.get(k) {
+                Some(&i) => deduped[i] = row,
+                None => {
+                    seen.insert(k.to_string(), deduped.len());
+                    deduped.push(row);
+                }
+            }
+        }
+        // One MERGE per chunk with a multi-row `VALUES` USING source — a single
+        // statement per chunk, so one DuckLake commit per chunk (per-statement
+        // autocommit would create one snapshot per MERGE; per-row MERGE would
+        // create one snapshot per row — the issue #12 defect class).
+        const MERGE_CHUNK_ROWS: usize = 500;
+        let cols_names = columns.join(", ");
+        let set_clause = columns
+            .iter()
+            .map(|c| format!("{c} = s.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert_vals = columns
+            .iter()
+            .map(|c| format!("s.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut affected = 0usize;
+        for chunk in deduped.chunks(MERGE_CHUNK_ROWS) {
+            let row_sql = format!("({})", vec!["?"; columns.len()].join(", "));
+            let multi = vec![row_sql.as_str(); chunk.len()].join(", ");
+            let merge = format!(
+                "MERGE INTO {WRITE_CATALOG_ALIAS}.{table} AS t USING (VALUES {multi}) AS \
+                 s({cols_names}) ON t.{key} = s.{key} WHEN MATCHED THEN UPDATE SET {set_clause} \
+                 WHEN NOT MATCHED THEN INSERT ({cols_names}) VALUES ({insert_vals})"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&merge)
+                .map_err(|e| Error::Storage(BoxError::from(e)))?;
+            let params: Vec<Option<&str>> = chunk
+                .iter()
+                .flat_map(|row| row.iter().map(|v| v.as_deref()))
+                .collect();
+            affected += stmt
+                .execute(duckdb::params_from_iter(params))
+                .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        }
+        Ok(affected)
+    }
+
+    /// Logically delete rows by `key` (specs/20 §4): a `MERGE ... WHEN MATCHED
+    /// THEN DELETE` writes a delete-file in the catalog — the rows disappear
+    /// from reads while the Parquet data files are untouched. One catalog
+    /// transaction per chunk (one snapshot per chunk).
+    ///
+    /// # Errors
+    /// - [`Error::InvalidInput`] on a bad identifier.
+    /// - [`Error::Storage`] on DDL/MERGE failure.
+    pub fn delete_raw(
+        &self,
+        system: &str,
+        entity: &str,
+        key: &str,
+        keys: &[String],
+    ) -> Result<usize> {
+        validate_ident(key)?;
+        let table = raw_table_name(system, entity)?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        // One MERGE per chunk with a multi-row `VALUES` USING source — one
+        // statement per chunk, one DuckLake commit per chunk (see `upsert_raw`
+        // for the snapshot-count rationale).
+        const MERGE_CHUNK_KEYS: usize = 500;
+        let mut affected = 0usize;
+        for chunk in keys.chunks(MERGE_CHUNK_KEYS) {
+            let multi = vec!["(?)"; chunk.len()].join(", ");
+            let merge = format!(
+                "MERGE INTO {WRITE_CATALOG_ALIAS}.{table} AS t USING (VALUES {multi}) AS s({key}) \
+                 ON t.{key} = s.{key} WHEN MATCHED THEN DELETE"
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&merge)
+                .map_err(|e| Error::Storage(BoxError::from(e)))?;
+            let params: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            affected += stmt
+                .execute(duckdb::params_from_iter(params))
+                .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        }
+        Ok(affected)
+    }
+
     /// Run DuckLake compaction on a table. Uses `ducklake_merge_adjacent_files`
     /// — the procedure that actually merges in this DuckLake build
     /// (`ducklake_rewrite_data_files` is threshold-gated and returns 0
@@ -541,8 +681,10 @@ impl Writer {
     /// `audience_snapshot` via a single `INSERT … SELECT` (one catalog
     /// transaction ⇒ a partial snapshot is never observable, `specs/20 I4`).
     ///
-    /// `subquery_sql` must reference the **write** alias (`dl.raw_*`); its `?`
-    /// placeholders are bound by `subquery_params`. `key_column` is validated.
+    /// `subquery_sql` must reference the **write** alias (`dl.raw_*`) and emit
+    /// three columns: `<key_column>`, `features` (JSON), `hit_reason` (JSON) —
+    /// the frozen per-row feature values and the predicate chain (D11, issue
+    /// #13). Its `?` placeholders are bound by `subquery_params`.
     ///
     /// # Errors
     /// - [`Error::InvalidInput`] on a bad key column.
@@ -559,15 +701,13 @@ impl Writer {
         let sql = format!(
             "INSERT INTO {WRITE_CATALOG_ALIAS}.audience_snapshot (snapshot_id, campaign_id, \
              as_of_ts, user_id, features, hit_reason) SELECT CAST(? AS UUID), ?, CAST(? AS \
-             TIMESTAMPTZ), sub.{key_column}, CAST(? AS JSON), CAST(? AS JSON) FROM \
-             ({subquery_sql}) sub"
+             TIMESTAMPTZ), sub.{key_column}, sub.features, sub.hit_reason FROM ({subquery_sql}) \
+             sub"
         );
         let mut params: Vec<Value> = vec![
             Value::Text(spec.snapshot_id.clone()),
             Value::Text(spec.campaign_id.clone()),
             Value::Text(spec.as_of_ts.clone()),
-            Value::Text(spec.features.clone()),
-            Value::Text(spec.hit_reason.clone()),
         ];
         params.extend_from_slice(subquery_params);
         let n = self
@@ -770,6 +910,126 @@ mod tests {
         let (_tmp, w) = tmp_writer();
         let res = w.ingest_raw("erp", "users; DROP", &["id".into()], &[]);
         assert!(matches!(res, Err(Error::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_should_upsert_dedup_and_update_by_key() {
+        // Dim upsert (specs/20 §4): same-key rows within a batch are deduplicated
+        // (last wins) and the merged result never grows duplicate rows.
+        let (_tmp, w) = tmp_writer();
+        w.ingest_raw(
+            "erp",
+            "users",
+            &["id".into(), "tier".into()],
+            &[
+                vec![Some("u1".into()), Some("gold".into())],
+                vec![Some("u2".into()), Some("silver".into())],
+            ],
+        )
+        .expect("seed");
+        // One batch, u1 twice: u1 must end at the LAST value (tier=platinum);
+        // u2 unchanged; no duplicate rows anywhere.
+        let n = w
+            .upsert_raw(
+                "erp",
+                "users",
+                &["id".into(), "tier".into()],
+                "id",
+                &[
+                    vec![Some("u1".into()), Some("bronze".into())],
+                    vec![Some("u3".into()), Some("diamond".into())],
+                    vec![Some("u1".into()), Some("platinum".into())],
+                ],
+            )
+            .expect("upsert");
+        assert_eq!(n, 2, "one update (u1, deduped) + one insert (u3)");
+        let mut stmt = w
+            .conn
+            .prepare("SELECT id, tier FROM dl.raw_erp_users ORDER BY id")
+            .expect("prepare");
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("u1".into(), "platinum".into()),
+                ("u2".into(), "silver".into()),
+                ("u3".into(), "diamond".into()),
+            ],
+            "last-wins dedup + update, no duplicate keys"
+        );
+    }
+
+    #[test]
+    fn test_should_reject_upsert_without_key_column() {
+        let (_tmp, w) = tmp_writer();
+        let res = w.upsert_raw(
+            "erp",
+            "users",
+            &["id".into(), "tier".into()],
+            "nope",
+            &[vec![Some("u1".into()), Some("gold".into())]],
+        );
+        assert!(
+            matches!(res, Err(Error::InvalidInput(_))),
+            "merge key must be one of the columns"
+        );
+    }
+
+    #[test]
+    fn test_should_logical_delete_by_key() {
+        // Logical delete (specs/20 §4): MERGE ... THEN DELETE writes a catalog
+        // delete-file — the row vanishes from reads while the Parquet data
+        // files stay untouched (that is what makes it logical, not physical).
+        let (_tmp, w) = tmp_writer();
+        w.ingest_raw(
+            "erp",
+            "users",
+            &["id".into(), "tier".into()],
+            &[
+                vec![Some("u1".into()), Some("gold".into())],
+                vec![Some("u2".into()), Some("silver".into())],
+            ],
+        )
+        .expect("seed");
+        let files_before: i64 = w
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM ducklake_list_files('{WRITE_CATALOG_ALIAS}', \
+                     'raw_erp_users')"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .expect("files");
+        let n = w
+            .delete_raw("erp", "users", "id", &["u1".into()])
+            .expect("delete");
+        assert_eq!(n, 1, "one row logically deleted");
+        let count: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM dl.raw_erp_users", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1, "deleted row must be gone from reads");
+        let files_after: i64 = w
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM ducklake_list_files('{WRITE_CATALOG_ALIAS}', \
+                     'raw_erp_users')"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .expect("files");
+        assert_eq!(
+            files_before, files_after,
+            "logical delete must not touch the Parquet data files"
+        );
     }
 
     #[test]

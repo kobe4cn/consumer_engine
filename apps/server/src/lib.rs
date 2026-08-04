@@ -12,7 +12,9 @@ use std::{sync::Arc, time::Duration};
 use axum::Router;
 use consumer_engine_core::{BoxError, Dataset, EngineConfig, Error, FreshnessRegistry, Result};
 use consumer_engine_execution::{Reader, ReaderLimits};
-use consumer_engine_ingestion::{CadenceRegularityProducer, IngestionHandle, ProducerRegistry};
+use consumer_engine_ingestion::{
+    CadenceRegularityProducer, IngestionHandle, MicroBatchConfig, ProducerRegistry,
+};
 use consumer_engine_ingress::{AppState, JobRegistry, router};
 use consumer_engine_semantic::{IntentRag, Profiler, StubEmbed, StubLlm};
 use consumer_engine_storage::{self as storage, Writer};
@@ -116,7 +118,14 @@ impl Engine {
             },
         )))?;
 
-        let ingestion = IngestionHandle::start(writer, Arc::clone(&registry))?;
+        let ingestion = IngestionHandle::start_with(
+            writer,
+            Arc::clone(&registry),
+            MicroBatchConfig {
+                flush_rows: config.micro_batch_flush_rows,
+                flush_age_secs: config.micro_batch_flush_age_secs,
+            },
+        )?;
         // M2 signing key: 32 bytes of OS randomness (AGENTS.md § Crypto forbids
         // thread_rng for secrets; getrandom is the OsRng-equivalent source).
         let mut signing_key = [0u8; 32];

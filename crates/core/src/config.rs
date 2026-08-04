@@ -22,9 +22,16 @@ pub struct EngineConfig {
     /// How often the compaction task runs, in seconds.
     #[serde(default = "default_compaction_interval")]
     pub compaction_interval_secs: u64,
-    /// Micro-batch flush threshold: flush once this many rows are queued.
+    /// Micro-batch flush threshold: flush once this many rows are queued
+    /// per `(system, entity)` (specs/71 §4). `0` disables buffering — every
+    /// ingest flushes immediately.
     #[serde(default = "default_micro_batch_rows")]
-    pub micro_batch_flush_rows: usize,
+    pub micro_batch_flush_rows: u64,
+    /// Micro-batch flush age: flush a queued batch once it has been buffered
+    /// for this many seconds, even if the row threshold is not reached
+    /// (specs/71 §4). `0` disables age-based flush.
+    #[serde(default = "default_micro_batch_flush_age")]
+    pub micro_batch_flush_age_secs: u64,
     /// Bind address for the REST ingress.
     #[serde(default = "default_bind")]
     pub bind: String,
@@ -59,8 +66,12 @@ const fn default_compaction_interval() -> u64 {
     3600
 }
 
-const fn default_micro_batch_rows() -> usize {
+const fn default_micro_batch_rows() -> u64 {
     50_000
+}
+
+const fn default_micro_batch_flush_age() -> u64 {
+    30
 }
 
 fn default_bind() -> String {
@@ -226,6 +237,7 @@ impl Default for EngineConfig {
             data_path: PathBuf::from("./data"),
             compaction_interval_secs: default_compaction_interval(),
             micro_batch_flush_rows: default_micro_batch_rows(),
+            micro_batch_flush_age_secs: default_micro_batch_flush_age(),
             bind: default_bind(),
             guardrails: GuardrailConfig::default(),
             suppression: SuppressionRules::default(),
@@ -282,6 +294,7 @@ data_path: /tmp/data
         assert_eq!(cfg.catalog_path, PathBuf::from("/tmp/cat.db"));
         assert_eq!(cfg.compaction_interval_secs, 3600);
         assert_eq!(cfg.micro_batch_flush_rows, 50_000);
+        assert_eq!(cfg.micro_batch_flush_age_secs, 30);
         assert_eq!(cfg.bind, "127.0.0.1:8080");
         assert_eq!(cfg.guardrails.statement_timeout_secs, 30);
         assert_eq!(cfg.guardrails.sync_row_cap, 100_000);
