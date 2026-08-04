@@ -603,6 +603,7 @@ dependencies = [
  "arrow",
  "axum",
  "bytes",
+ "chrono",
  "consumer_engine-core",
  "consumer_engine-execution",
  "consumer_engine-ingestion",

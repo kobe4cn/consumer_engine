@@ -109,18 +109,25 @@ pub struct Plan {
 /// Cardinality` across plan nodes into `est_rows`. **Bytes-scanned and memory
 /// are not exposed by EXPLAIN** (DuckDB limitation), so those stay `0` and are
 /// bounded at runtime by the `memory_limit` PRAGMA + statement timeout. Any
-/// EXPLAIN/parse failure degrades to [`Estimate::unknown`] so the runtime
-/// guards still apply. EXPLAIN only plans (never executes), so it is not
-/// itself wrapped in a timeout.
+/// EXPLAIN/parse/timeout failure degrades to [`Estimate::unknown`] so the
+/// runtime guards still apply. The EXPLAIN is wrapped in `timeout_secs` — in
+/// DuckDB `EXPLAIN` does execute the query, so an unbounded estimate would be
+/// an untimed execution on the shared reader (AGENTS.md § Resource Limits).
 #[must_use]
-pub async fn explain_cost(reader: &Reader, compiled: &CompiledQuery) -> Estimate {
+pub async fn explain_cost(
+    reader: &Reader,
+    compiled: &CompiledQuery,
+    timeout_secs: u64,
+) -> Estimate {
     let sql = format!("EXPLAIN (FORMAT JSON) {}", compiled.sql);
-    let qr = match reader
-        .query_with_params(&sql, compiled.params.clone())
-        .await
+    let qr = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        reader.query_with_params(&sql, compiled.params.clone()),
+    )
+    .await
     {
-        Ok(qr) => qr,
-        Err(_) => return Estimate::unknown(),
+        Ok(Ok(qr)) => qr,
+        _ => return Estimate::unknown(),
     };
     match max_cardinality(&qr) {
         Some(rows) => Estimate {

@@ -279,7 +279,12 @@ impl QueryEngine {
     /// Propagates compile/guardrail errors.
     async fn prepare(&self, q: &SegmentQuery) -> Result<(Plan, CompiledQuery)> {
         let compiled = self.compile_and_check(q).await?;
-        let est = explain_cost(&self.reader, &compiled).await;
+        let est = explain_cost(
+            &self.reader,
+            &compiled,
+            self.guardrails.statement_timeout_secs,
+        )
+        .await;
         enforce(&est, &self.guardrails)?;
         let mode = if est.est_rows > self.guardrails.sync_row_cap {
             Mode::Async
@@ -392,7 +397,12 @@ impl QueryEngine {
         // budgets (large is the point of materialising). Errors from EXPLAIN
         // (a real compile error) are surfaced via `compile` below.
         let compiled = self.compile_and_check(q).await?;
-        let est = explain_cost(&self.reader, &compiled).await;
+        let est = explain_cost(
+            &self.reader,
+            &compiled,
+            self.guardrails.statement_timeout_secs,
+        )
+        .await;
         tracing::info!(est_rows = est.est_rows, "materialise estimate");
 
         // Scalars.
@@ -437,8 +447,7 @@ impl QueryEngine {
                            dro.audience_snapshot WHERE snapshot_id = CAST(? AS UUID) GROUP BY \
                            campaign_id, as_of_ts";
         let qr = self
-            .reader
-            .query_with_params(SQL, vec![Value::Text(snap_uuid.to_string())])
+            .timed_read(SQL, vec![Value::Text(snap_uuid.to_string())])
             .await?;
         let row = match qr.rows.into_iter().next() {
             Some(r) => r,

@@ -253,21 +253,19 @@ Append-only.
   `FLOAT[]` (variable-length) for M3's brute-force cosine; a phase-2 fixed-`FLOAT[dim]`
   + HNSW migration remains flagged.
 
-### T4-RECENCY-NOW — Recency/Lapsed compile `now() - INTERVAL` is rejected (DEFERRED)
+### T4-RECENCY-NOW — Recency/Lapsed `now() - INTERVAL` binder error (FIXED)
 
 - **Citation**: `crates/query/src/compiler.rs` (`compile_recency`,
-  `compile_lapsed`) → `now() - INTERVAL '<n>' DAY`.
+  `compile_lapsed`).
 - **Finding**: `now()` returns `TIMESTAMP WITH TIME ZONE`, and this DuckDB build
-  has **no** `-(TIMESTAMPTZ, INTERVAL)` overload (binder error). The M1/M2 B-temporal
+  has **no** `-(TIMESTAMPTZ, INTERVAL)` overload (binder error). The B-temporal
   ops were unit-tested only for SQL-string shape, never executed against real
-  DuckDB, so the defect was latent. Discovered during M3 when a freshness test
-  first ran a `Recency` query.
-- **Why deferred from M3**: out of Phase 4 scope (B capability, Phase 2); no M3
-  exit criterion depends on `Recency`/`Lapsed` (the freshness + periodic-buyers
-  tests use `SetOp`/`Feature`).
-- **Fix shape (Phase 2 follow-up)**: render `CAST(now() AS TIMESTAMP) - INTERVAL '<n>' DAY`
-  and cast the raw `e.ts` (`VARCHAR`) to `TIMESTAMPTZ` for the comparison, then
-  add an end-to-end `Recency`/`Lapsed` test.
+  DuckDB, so the defect was latent (discovered during M3).
+- **Fix applied (whole-project review)**: the compiler now renders
+  `CAST(e.ts AS TIMESTAMP) >= CAST(now() AS TIMESTAMP) - INTERVAL '<n>' DAY` for
+  both sides (raw `ts` is VARCHAR; both sides cast). End-to-end coverage added:
+  `test_should_run_recency_and_lapsed_over_rest` executes `Recency` (recent
+  buyer matches) and `Lapsed` (old buyer matches) over REST.
 
 ### T4-PRODUCER-CONFIG — producers hardcoded in `Engine::build` (DEFERRED)
 

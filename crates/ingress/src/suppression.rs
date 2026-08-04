@@ -23,8 +23,10 @@ const MAX_FIELD_BYTES: usize = 256;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SuppressionRequest {
     /// Client-supplied dedupe key (UUID), REQUIRED — idempotent retry is only
-    /// possible when the client controls the key (E1, specs/21 §4).
-    suppression_id: String,
+    /// possible when the client controls the key (E1, specs/21 §4). Optional in
+    /// serde so a missing key is a clear handler-level 400, not a 422.
+    #[serde(default)]
+    suppression_id: Option<String>,
     /// The campaign the outcome belongs to.
     campaign_id: String,
     /// Pseudonymous subject id (D12).
@@ -72,12 +74,16 @@ pub async fn post_suppression(
 
     // Client-supplied dedupe key is required (E1): a minted id would break
     // retry idempotency — a lost response + retry would write two rows.
-    if uuid::Uuid::parse_str(&req.suppression_id).is_err() {
+    let suppression_id = req.suppression_id.ok_or_else(|| {
+        ApiError::Core(Error::InvalidInput(
+            "suppressionId is required (client-supplied dedupe key for idempotent retry)".into(),
+        ))
+    })?;
+    if uuid::Uuid::parse_str(&suppression_id).is_err() {
         return Err(ApiError::Core(Error::InvalidInput(
             "suppressionId must be a UUID (required for idempotent retry)".into(),
         )));
     }
-    let suppression_id = req.suppression_id;
 
     let row = SuppressionRow {
         suppression_id: suppression_id.clone(),

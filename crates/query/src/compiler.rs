@@ -341,8 +341,12 @@ fn compile_recency(
     if let Some(p) = predicate {
         where_parts.push(compile_predicate("e", p, params)?);
     }
+    // Raw `ts` columns are VARCHAR (ingest_raw); cast both sides so the
+    // comparison is chronological. `CAST(now() AS TIMESTAMP)` is required —
+    // DuckDB has no `-(TIMESTAMPTZ, INTERVAL)` overload (T4-RECENCY-NOW).
     where_parts.push(format!(
-        "e.{ts_column} >= now() - INTERVAL '{within_days}' DAY"
+        "CAST(e.{ts_column} AS TIMESTAMP) >= CAST(now() AS TIMESTAMP) - INTERVAL '{within_days}' \
+         DAY"
     ));
     Ok(format!(
         "EXISTS (SELECT 1 FROM {table} e WHERE {})",
@@ -368,14 +372,16 @@ fn compile_lapsed(
         before_parts.push(compile_predicate("e", p, params)?);
     }
     before_parts.push(format!(
-        "e.{ts_column} < now() - INTERVAL '{within_days}' DAY"
+        "CAST(e.{ts_column} AS TIMESTAMP) < CAST(now() AS TIMESTAMP) - INTERVAL '{within_days}' \
+         DAY"
     ));
     let mut recent_parts = vec![format!("e.{user_key} = base.{base_key}")];
     if let Some(p) = predicate {
         recent_parts.push(compile_predicate("e", p, params)?);
     }
     recent_parts.push(format!(
-        "e.{ts_column} >= now() - INTERVAL '{within_days}' DAY"
+        "CAST(e.{ts_column} AS TIMESTAMP) >= CAST(now() AS TIMESTAMP) - INTERVAL '{within_days}' \
+         DAY"
     ));
     Ok(format!(
         "EXISTS (SELECT 1 FROM {table} e WHERE {before}) AND NOT EXISTS (SELECT 1 FROM {table} e \

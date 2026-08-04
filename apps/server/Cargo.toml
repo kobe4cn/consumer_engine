@@ -33,3 +33,4 @@ bytes = "1"
 arrow = "58"
 parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
 uuid = { workspace = true }
+chrono.workspace = true

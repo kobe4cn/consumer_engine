@@ -1209,3 +1209,385 @@ async fn test_should_run_jit_derive_and_profile_over_rest() {
         "profile must carry a category mix: {profile}"
     );
 }
+
+#[tokio::test]
+async fn test_should_run_recency_and_lapsed_over_rest() {
+    // The B-temporal capability end-to-end (PRD headline "bought in 30d,
+    // lapsed"): a recent buyer matches Recency; an old buyer matches Lapsed.
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    let now = chrono::Utc::now();
+    let recent = (now - chrono::Duration::days(1)).to_rfc3339();
+    let old = (now - chrono::Duration::days(40)).to_rfc3339();
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "ts"],
+        vec![vec!["u1", &recent], vec!["u2", &old]],
+    )
+    .await;
+
+    // Recency: bought within the last 30 days -> u1 only.
+    let q = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({
+            "dsl": {
+                "source": {"system":"erp","entity":"orders"},
+                "key": "user_id",
+                "ops": [{"kind":"recency","event":{"system":"erp","entity":"orders"},
+                         "userKey":"user_id","tsColumn":"ts","withinDays":30}]
+            }
+        }))
+        .send()
+        .await
+        .expect("recency query");
+    assert!(
+        q.status().is_success(),
+        "recency query failed: {}",
+        q.status()
+    );
+    let v: Value = q.json().await.expect("json");
+    let users = first_column(&v);
+    assert!(
+        users.iter().any(|u| u == "u1"),
+        "recent buyer must match: {users:?}"
+    );
+    assert!(
+        !users.iter().any(|u| u == "u2"),
+        "old buyer must NOT match recency: {users:?}"
+    );
+
+    // Lapsed: bought before the window but not within it -> u2 only.
+    let q = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({
+            "dsl": {
+                "source": {"system":"erp","entity":"orders"},
+                "key": "user_id",
+                "ops": [{"kind":"lapsed","event":{"system":"erp","entity":"orders"},
+                         "userKey":"user_id","tsColumn":"ts","withinDays":30}]
+            }
+        }))
+        .send()
+        .await
+        .expect("lapsed query");
+    assert!(
+        q.status().is_success(),
+        "lapsed query failed: {}",
+        q.status()
+    );
+    let v: Value = q.json().await.expect("json");
+    let users = first_column(&v);
+    assert!(
+        users.iter().any(|u| u == "u2"),
+        "lapsed buyer must match: {users:?}"
+    );
+    assert!(
+        !users.iter().any(|u| u == "u1"),
+        "recent buyer must NOT match lapsed: {users:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_should_map_query_errors_to_http_codes() {
+    // specs/21 §4: errors map 1:1 to typed QueryError via IntoResponse.
+    // Guardrail (over max_output_rows) -> 422; bad DSL -> 400.
+    let base = spawn_guardrails(consumer_engine_core::GuardrailConfig {
+        max_output_rows: 1,
+        ..consumer_engine_core::GuardrailConfig::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let rows: Vec<serde_json::Value> = (0..50)
+        .map(|i| serde_json::json!([format!("u{i}")]))
+        .collect();
+    client
+        .post(format!("{base}/sources/onboard"))
+        .json(&serde_json::json!({
+            "system": "erp", "entity": "users",
+            "columns": ["user_id"], "rows": rows
+        }))
+        .send()
+        .await
+        .expect("onboard");
+
+    // Guardrail 422: EXPLAIN estimates > 1 row -> max_output_rows guardrail.
+    let resp = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({
+            "dsl": {
+                "source": {"system":"erp","entity":"users"},
+                "key": "user_id", "ops": []
+            }
+        }))
+        .send()
+        .await
+        .expect("query");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "over-budget must be 422"
+    );
+
+    // Bad DSL -> 400.
+    let resp = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({
+            "dsl": {
+                "source": {"system":"erp; DROP","entity":"users"},
+                "key": "user_id", "ops": []
+            }
+        }))
+        .send()
+        .await
+        .expect("query");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Missing dsl -> 400.
+    let resp = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("query");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_should_map_survivor_unbounded_to_422() {
+    // A Derive whose measured survivor set exceeds j_survivor_cap -> 422
+    // (SurvivorUnbounded), not 500.
+    let base = spawn_guardrails(consumer_engine_core::GuardrailConfig {
+        j_survivor_cap: 1,
+        ..consumer_engine_core::GuardrailConfig::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let rows: Vec<serde_json::Value> = (0..100)
+        .map(|i| serde_json::json!([format!("u{}", i % 50)]))
+        .collect();
+    client
+        .post(format!("{base}/sources/onboard"))
+        .json(&serde_json::json!({
+            "system": "erp", "entity": "users",
+            "columns": ["user_id"], "rows": rows
+        }))
+        .send()
+        .await
+        .expect("onboard");
+    let resp = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({
+            "dsl": {
+                "source": {"system":"erp","entity":"users"},
+                "key": "user_id",
+                "ops": [
+                    {"kind":"filter","predicate":{"column":"user_id","op":"ne","value":"none"}},
+                    {"kind":"derive","name":"n","metric":{"kind":"count","event":{"system":"erp","entity":"users"}}}
+                ]
+            }
+        }))
+        .send()
+        .await
+        .expect("query");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "survivor over cap must be 422, got {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn test_should_reject_invalid_suppression_inputs() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    for (label, body) in [
+        (
+            "bad channel",
+            serde_json::json!({"suppressionId":"11111111-2222-3333-4444-555555555555","campaignId":"c1","userId":"u1","channel":"fax","action":"delivered","occurredTs":"2025-01-01T00:00:00Z"}),
+        ),
+        (
+            "bad action",
+            serde_json::json!({"suppressionId":"11111111-2222-3333-4444-555555555555","campaignId":"c1","userId":"u1","channel":"email","action":"spam","occurredTs":"2025-01-01T00:00:00Z"}),
+        ),
+        (
+            "bad ts",
+            serde_json::json!({"suppressionId":"11111111-2222-3333-4444-555555555555","campaignId":"c1","userId":"u1","channel":"email","action":"delivered","occurredTs":"not-a-date"}),
+        ),
+        (
+            "bad uuid",
+            serde_json::json!({"suppressionId":"nope","campaignId":"c1","userId":"u1","channel":"email","action":"delivered","occurredTs":"2025-01-01T00:00:00Z"}),
+        ),
+        (
+            "missing id",
+            serde_json::json!({"campaignId":"c1","userId":"u1","channel":"email","action":"delivered","occurredTs":"2025-01-01T00:00:00Z"}),
+        ),
+        (
+            "bad campaign",
+            serde_json::json!({"suppressionId":"11111111-2222-3333-4444-555555555555","campaignId":"bad id!","userId":"u1","channel":"email","action":"delivered","occurredTs":"2025-01-01T00:00:00Z"}),
+        ),
+    ] {
+        let resp = client
+            .post(format!("{base}/suppression"))
+            .json(&body)
+            .send()
+            .await
+            .expect("post");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{label} must be 400"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_should_reject_unknown_producer_and_404s() {
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+
+    // Unknown producer id -> 400.
+    let resp = client
+        .post(format!("{base}/producers/run"))
+        .json(&serde_json::json!({"producerId":"does_not_exist"}))
+        .send()
+        .await
+        .expect("run");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Unknown job -> 404.
+    let resp = client
+        .get(format!("{base}/jobs/j_does_not_exist"))
+        .send()
+        .await
+        .expect("poll");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // Bad audience id -> 400 (invalid snapshot id).
+    let resp = client
+        .get(format!("{base}/audience/not_a_snap"))
+        .send()
+        .await
+        .expect("audience");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Missing audience (valid snap_ prefix, unknown uuid) -> 404.
+    let resp = client
+        .get(format!("{base}/audience/snap_{}", uuid::Uuid::now_v7()))
+        .send()
+        .await
+        .expect("audience");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_should_exclude_nothing_when_all_rules_off() {
+    // With per-campaign no-repeat + frequency cap both disabled, an Exclude is
+    // a tautology — everyone stays (compiler unit covers the SQL; this proves
+    // the end-to-end path).
+    let base = spawn_with(
+        consumer_engine_core::GuardrailConfig::default(),
+        consumer_engine_core::SuppressionRules {
+            per_campaign_no_repeat: false,
+            frequency_cap: None,
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "sku"],
+        vec![vec!["u1", "A"], vec!["u2", "B"]],
+    )
+    .await;
+    // A suppression writeback exists, but with rules off nobody is excluded.
+    let _ = post_suppression(
+        &client,
+        &base,
+        &serde_json::json!({
+            "suppressionId": "11111111-2222-3333-4444-555555555558",
+            "campaignId": "c1", "userId": "u1",
+            "channel": "email", "action": "delivered",
+            "occurredTs": "2025-01-01T00:00:00Z"
+        }),
+    )
+    .await;
+    let q = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({
+            "dsl": {
+                "source": {"system":"erp","entity":"orders"},
+                "key": "user_id",
+                "ops": [{"kind":"exclude","campaignId":"c1"}]
+            }
+        }))
+        .send()
+        .await
+        .expect("query");
+    assert!(q.status().is_success(), "query failed: {}", q.status());
+    let v: Value = q.json().await.expect("json");
+    let users = first_column(&v);
+    assert_eq!(users.len(), 2, "no rules means no exclusion: {users:?}");
+}
+
+#[tokio::test]
+async fn test_should_report_job_status_field() {
+    // specs/10 §4: GET /jobs/:id -> { status: running|done|failed, ... }.
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "sku"],
+        vec![vec!["u1", "A"]],
+    )
+    .await;
+    let job_id = post_filter_job(&client, &base, "c1").await;
+    let status = poll_until_done(&client, &base, &job_id).await;
+    assert_eq!(status["status"], "done");
+    assert_eq!(status["done"], true);
+    assert!(status["snapshotId"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn test_should_complete_concurrent_jobs_under_slot_cap() {
+    // materialise_slots bounds in-flight work; a burst beyond the cap must
+    // queue (not drop) and every job completes.
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "sku"],
+        vec![vec!["u1", "A"], vec!["u2", "A"], vec!["u3", "A"]],
+    )
+    .await;
+
+    let mut jobs = Vec::new();
+    for i in 0..5 {
+        let client = client.clone();
+        let base = base.clone();
+        jobs.push(tokio::spawn(async move {
+            post_filter_job(&client, &base, &format!("c{i}")).await
+        }));
+    }
+    let mut ids = Vec::new();
+    for j in jobs {
+        ids.push(j.await.expect("join"));
+    }
+    for id in ids {
+        let status = poll_until_done(&client, &base, &id).await;
+        assert_eq!(status["status"], "done", "job {id} must complete: {status}");
+        assert!(status["snapshotId"].as_str().is_some());
+    }
+}

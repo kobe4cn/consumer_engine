@@ -33,48 +33,61 @@ const JOB_TTL: Duration = Duration::from_secs(60 * 60);
 /// In-memory job registry keyed by job id. Cheap to clone (`Arc`). Entries
 /// expire lazily on [`JobRegistry::get`] after `JOB_TTL`.
 #[derive(Clone, Debug)]
-pub struct JobRegistry(Arc<DashMap<String, (JobStatus, Instant)>>);
+pub struct JobRegistry {
+    map: Arc<DashMap<String, (JobStatus, Instant)>>,
+    ttl: Duration,
+}
 
 impl JobRegistry {
-    /// Build an empty registry.
+    /// Build an empty registry with the default 1-hour TTL.
     #[must_use]
     pub fn new() -> Self {
-        Self(Arc::new(DashMap::new()))
+        Self::with_ttl(JOB_TTL)
+    }
+
+    /// Build an empty registry with a custom entry TTL (tests use a tiny TTL to
+    /// exercise expiry without waiting an hour).
+    #[must_use]
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            map: Arc::new(DashMap::new()),
+            ttl,
+        }
     }
 
     /// Mark `id` as `Running`.
     pub fn insert_running(&self, id: &str) {
-        self.0
+        self.map
             .insert(id.to_string(), (JobStatus::Running, Instant::now()));
     }
 
     /// Mark `id` as `Done(snapshot)`.
     pub fn set_done(&self, id: &str, snapshot: String) {
-        self.0
+        self.map
             .insert(id.to_string(), (JobStatus::Done(snapshot), Instant::now()));
     }
 
     /// Mark `id` as `Failed(err)`.
     pub fn set_failed(&self, id: &str, err: String) {
-        self.0
+        self.map
             .insert(id.to_string(), (JobStatus::Failed(err), Instant::now()));
     }
 
-    /// Read the status of `id`, if present. Entries older than `JOB_TTL` are
-    /// dropped (and reported as absent), bounding the map's size.
+    /// Read the status of `id`, if present. Entries older than the registry
+    /// TTL are dropped (and reported as absent), bounding the map's size.
     #[must_use]
     pub fn get(&self, id: &str) -> Option<JobStatus> {
         let now = Instant::now();
         // Check-and-expire under the shard guard so a concurrent poll can't race
         // a stale entry.
-        if let Some(entry) = self.0.get(id)
-            && now.duration_since(entry.1) > JOB_TTL
+        if let Some(entry) = self.map.get(id)
+            && now.duration_since(entry.1) > self.ttl
         {
             drop(entry);
-            self.0.remove(id);
+            self.map.remove(id);
             return None;
         }
-        self.0.get(id).map(|r| r.0.clone())
+        self.map.get(id).map(|r| r.0.clone())
     }
 }
 
@@ -117,10 +130,13 @@ pub struct JobsResponse {
     job_id: String,
 }
 
-/// `GET /jobs/:id` response body.
+/// `GET /jobs/:id` response body (specs/10 §4 wire shape).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobResponse {
+    /// `"running"` / `"done"` / `"failed"` (specs/10 §4).
+    status: String,
+    /// Back-compat boolean mirror of `status == "done"`.
     done: bool,
     snapshot_id: Option<String>,
     error: Option<String>,
@@ -185,20 +201,39 @@ pub async fn get_job(
     };
     let resp = match status {
         JobStatus::Running => JobResponse {
+            status: "running".into(),
             done: false,
             snapshot_id: None,
             error: None,
         },
         JobStatus::Done(snapshot) => JobResponse {
+            status: "done".into(),
             done: true,
             snapshot_id: Some(snapshot),
             error: None,
         },
         JobStatus::Failed(err) => JobResponse {
+            status: "failed".into(),
             done: true,
             snapshot_id: None,
             error: Some(err),
         },
     };
     Ok(Json(resp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_expire_entries_after_ttl() {
+        // Entries older than the TTL must be dropped on the next poll, bounding
+        // the registry (AGENTS.md § Resource Limits: bound every collection).
+        let reg = JobRegistry::with_ttl(Duration::from_millis(10));
+        reg.insert_running("j_1");
+        assert!(reg.get("j_1").is_some());
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(reg.get("j_1").is_none(), "expired entry must be dropped");
+    }
 }

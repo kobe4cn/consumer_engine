@@ -435,10 +435,16 @@ impl Writer {
             ));
         }
         let select = cols.join(", ");
+        // `starts_with(feature_name, '{family}.')` instead of `LIKE '{family}.%'` —
+        // `_` in a family is a LIKE single-char wildcard that would match other
+        // families' rows. `starts_with` compares literally, and `family` is a
+        // validated identifier (no quotes) so the literal is injection-safe.
+        // (A bound parameter cannot be used here: DuckDB rejects prepared
+        // parameters inside a CREATE VIEW statement.)
         let sql = format!(
             "CREATE OR REPLACE VIEW {WRITE_CATALOG_ALIAS}.feature_wide_{family} AS SELECT \
-             {select} FROM {WRITE_CATALOG_ALIAS}.feature_store WHERE feature_name LIKE \
-             '{family}.%' GROUP BY user_id"
+             {select} FROM {WRITE_CATALOG_ALIAS}.feature_store WHERE starts_with(feature_name, \
+             '{family}.') GROUP BY user_id"
         );
         self.conn
             .execute_batch(&sql)

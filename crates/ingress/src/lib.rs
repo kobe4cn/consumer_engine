@@ -143,6 +143,7 @@ pub struct QueryResponse {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/sources/onboard", post(onboard))
         .route("/query", post(query))
         .route("/catalog", get(catalog::get_catalog))
@@ -158,6 +159,13 @@ pub fn router(state: AppState) -> Router {
 
 /// `GET /healthz`.
 async fn healthz() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+/// `GET /readyz` — readiness: the engine is ready when the writer + reader
+/// handles are wired (both are constructed at build time). Same body as
+/// healthz; kept as a distinct route per specs/21 §2.
+async fn readyz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
