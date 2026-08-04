@@ -58,7 +58,7 @@ read-only probe rejection, restart durability).
 > met (measured 2.5 s @ 50k rows vs target ≤ 50 M users). See
 > [docs/research/spec-gap-analysis.md](../docs/research/spec-gap-analysis.md).
 > Closure requires the perf fix (P1-1 read-connection pool) **and** human
-> confirmation (roadmap §4).
+> confirmation (roadmap §4); 补缺路径见 [92-gap-closure-plan.md](./92-gap-closure-plan.md).
 
 **Specs touched**: 12, 21. **Exit**: an agent composes "bought SKU A in 30d,
 lapsed" via `/query` (sync) and gets guarded, parameterised results; P50 < 1 s
