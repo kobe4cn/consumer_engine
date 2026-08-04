@@ -30,10 +30,6 @@ async fn spawn_two_tenants() -> String {
     use consumer_engine_core::TenantCredentials;
     let tmp = tempfile::tempdir().expect("tmp");
     let cfg = EngineConfig {
-        catalog_path: tmp.path().join("cat.db"),
-        data_path: tmp.path().join("data"),
-        compaction_interval_secs: 0,
-        micro_batch_flush_rows: 1,
         tenants: vec![
             TenantCredentials {
                 id: "tenant_a".into(),
@@ -44,7 +40,7 @@ async fn spawn_two_tenants() -> String {
                 token: "TOKEN_B".into(),
             },
         ],
-        ..EngineConfig::default()
+        ..test_engine_config(&tmp)
     };
     let (router, engine) = Engine::build(&cfg).expect("build engine");
     std::mem::forget(engine);
@@ -270,18 +266,11 @@ async fn spawn_full(
 ) -> String {
     let tmp = tempfile::tempdir().expect("tmp");
     let cfg = EngineConfig {
-        catalog_path: tmp.path().join("cat.db"),
-        data_path: tmp.path().join("data"),
-        compaction_interval_secs: 0, // disable periodic compaction in tests
-        // The REST e2e ingests then immediately queries — flush every ingest
-        // call so rows are visible the moment onboard returns (the micro-batch
-        // accumulation behaviour itself is unit-tested in consumer_engine-ingestion).
-        micro_batch_flush_rows: 1,
         guardrails,
         suppression,
         auth_token,
         sql_approval_token,
-        ..EngineConfig::default()
+        ..test_engine_config(&tmp)
     };
     let (router, engine) = Engine::build(&cfg).expect("build engine");
     std::mem::forget(engine);
@@ -2121,4 +2110,140 @@ async fn test_should_isolate_tenants_by_construction() {
         reqwest::StatusCode::OK,
         "tenant A reads its own"
     );
+}
+
+/// The shared test-engine base config: fresh catalog + data paths, compaction
+/// disabled, and per-ingest flush (immediate visibility) — the surfaces the
+/// restart/durability tests need. Callers override the rest.
+fn test_engine_config(tmp: &tempfile::TempDir) -> EngineConfig {
+    EngineConfig {
+        catalog_path: tmp.path().join("cat.db"),
+        data_path: tmp.path().join("data"),
+        compaction_interval_secs: 0,
+        micro_batch_flush_rows: 1,
+        ..EngineConfig::default()
+    }
+}
+
+/// Build the engine on `cfg`, serve it, and return `(engine, base, server task)`
+/// — the engine is NOT forgotten (unlike `spawn_*`), so dropping it drains the
+/// writer and releases the catalog lock, enabling a fresh engine on the same
+/// paths (P3-10 restart durability). Attach retries briefly: the previous
+/// instance's writer thread may still be releasing its lock.
+async fn spawn_owned(cfg: &EngineConfig) -> (Engine, String, tokio::task::JoinHandle<()>) {
+    let mut attempts = 0;
+    loop {
+        match Engine::build(cfg) {
+            Ok((router, engine)) => {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("local addr");
+                let server = tokio::spawn(async move {
+                    let _ = axum::serve(listener, router).await;
+                });
+                return (engine, format!("http://{addr}"), server);
+            }
+            Err(consumer_engine_core::Error::WriterAlreadyHeld) if attempts < 50 => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                attempts += 1;
+            }
+            Err(e) => panic!("build engine: {e:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_should_survive_engine_restart() {
+    // P3-10: Engine::build → drop → build on the SAME catalog. Committed raw
+    // rows, a materialised snapshot, and a suppression writeback must all
+    // survive the full engine lifecycle (the writer drains on drop and
+    // re-attaches cleanly).
+    let tmp = tempfile::tempdir().expect("tmp");
+    let cfg = test_engine_config(&tmp);
+    let client = reqwest::Client::new();
+
+    // ---- first life ----
+    let (engine, base, server) = spawn_owned(&cfg).await;
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "sku"],
+        vec![vec!["u1", "A"], vec!["u2", "A"]],
+    )
+    .await;
+    let job_id = post_filter_job(&client, &base, "c1").await;
+    let status = poll_until_done(&client, &base, &job_id).await;
+    let snap = status["snapshotId"]
+        .as_str()
+        .expect("snapshotId")
+        .to_string();
+    let resp = client
+        .post(format!("{base}/suppression"))
+        .json(&serde_json::json!({
+            "suppressionId": "11111111-2222-3333-4444-555555555555",
+            "campaignId": "c1", "userId": "u1", "channel": "email",
+            "action": "delivered", "occurredTs": "2025-01-01T00:00:00Z"
+        }))
+        .send()
+        .await
+        .expect("suppression");
+    assert!(resp.status().is_success(), "suppression: {}", resp.status());
+    // Tear the whole engine down (drain + release the catalog lock).
+    drop(engine);
+    server.abort();
+
+    // ---- second life, same paths ----
+    let (engine2, base2, server2) = spawn_owned(&cfg).await;
+
+    // Raw rows survive.
+    let resp = client
+        .post(format!("{base2}/query"))
+        .json(&serde_json::json!({
+            "dsl": {"source":{"system":"erp","entity":"orders"},"key":"user_id",
+                    "ops":[{"kind":"filter","predicate":{"column":"sku","op":"eq","value":"A"}}]}
+        }))
+        .send()
+        .await
+        .expect("query after restart");
+    let v: Value = resp.json().await.expect("json");
+    assert_eq!(v["count"], 2, "raw rows must survive restart: {v}");
+
+    // The materialised snapshot survives (metadata + row set).
+    let resp = client
+        .get(format!("{base2}/audience/{snap}"))
+        .send()
+        .await
+        .expect("snapshot after restart");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "snapshot survives");
+    let meta: Value = resp.json().await.expect("meta");
+    assert_eq!(meta["rowCount"], 2, "snapshot row set survives: {meta}");
+
+    // Suppression survives: Exclude removes u1 from the re-run.
+    let resp = client
+        .post(format!("{base2}/query"))
+        .json(&serde_json::json!({
+            "dsl": {"source":{"system":"erp","entity":"orders"},"key":"user_id",
+                    "ops":[{"kind":"exclude","campaignId":"c1"}]}
+        }))
+        .send()
+        .await
+        .expect("exclude after restart");
+    let v: Value = resp.json().await.expect("json");
+    let users = v["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r.as_array().and_then(|c| c.first()).and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        users,
+        vec!["u2"],
+        "suppression must survive restart (u1 excluded): {users:?}"
+    );
+
+    drop(engine2);
+    server2.abort();
 }

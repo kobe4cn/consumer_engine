@@ -157,3 +157,19 @@ human sign-off in #26:
 | Parameterised results (no interpolated values) | `test_should_parameterise_all_user_values` (compiler unit) |
 | `freshness` label on every result | e2e `test_should_report_worst_source_freshness` (graded per-source since #22/#24) |
 | Full Rust gate green | `cargo build` + `cargo test --workspace --all-features` (146) + `cargo +nightly fmt` + `cargo clippy -- -D warnings` + `make lint-boundary` |
+
+## M5 exit-criteria evidence (roadmap §4 closure table, issue #26)
+
+M5's exit criteria (specs/90 §2) mapped to concrete evidence, ready for the
+human sign-off in #26:
+
+| Exit criterion | Evidence |
+| -------------- | -------- |
+| JIT `Derive` over survivors works and is bounded | `test_should_run_jit_derive_over_survivors`, `test_should_reject_derive_over_j_survivor_cap` (measured, non-bypassable cap) |
+| `Characterize` emits comparative profiles | `test_should_emit_comparative_profile` (segment-vs-baseline AOV/frequency/recency/category mix) |
+| Perf budgets met (P50 < 1s / P99 < 5s) | **`make bench-queries` gate** (issue #25): B/F/J/P P50 14–65 ms @ 50k rows |
+| Security checklist green | `make lint-boundary`; `test_should_redact_approval_token_in_debug` + `test_should_not_leak_token_in_formatted_log_output` (redacting Debug/log); `test_should_hash_token_deterministically` + constant-time middleware; `test_should_redact_download_url_in_debug` + `test_should_require_bearer_auth_when_configured` (authN/presign); **tenant isolation by construction (AC6)** — `test_should_isolate_tenants_by_construction` (issue #22) |
+| G2 — every selected user auditable | `test_should_resolve_periodic_buyers_end_to_end` decodes the snapshot Parquet and asserts the **frozen feature value** + per-predicate `hit_reason` chain (issue #13) |
+| G3 — filtering latency | the `make bench-queries` gate row above |
+| 71 §4 ingestion budgets | compaction reduces file count + time-travel retained (`test_should_compact_reduce_file_count_and_preserve_rows_and_snapshots`); micro-batch accumulation/drain (#15 tests); snapshot expiry tracked separately as #17 (upstream DuckLake binder blocker) |
+| Full Rust gate green | `cargo build` + `cargo test --workspace --all-features` (146) + fmt + clippy + `make lint-boundary` + `make bench-queries` |
