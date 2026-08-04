@@ -2,7 +2,9 @@
 
 一个**面向 AI 代理的受众筛选引擎**（Rust 编写）：营销运营用自然语言描述目标受众，代理据此组合结构化 DSL，引擎将其编译为 DuckLake 之上的**受守卫的** DuckDB SQL，并物化为带审计 + 抑制的**版本化受众快照**。
 
-**里程碑 M0–M5 已全部关闭**（见 [specs/90-roadmap.md](specs/90-roadmap.md)）；PRD 及全部子 issue 均已关闭。v1 能力集：
+**里程碑 M0/M2/M3/M4 已关闭；M1/M5 处于 OPEN —— 退出标准未达成**（见
+[specs/90-roadmap.md](specs/90-roadmap.md)：性能目标差 2–3 个数量级、租户隔离 AC 延后，
+关闭流程已改为**人确认制**）；PRD 及子 issue #3/#10 已重新打开。v1 能力集：
 
 - **B** — 原始事件上的布尔/时间-关系谓词。
 - **F** — 预计算逐用户 **Feature Store** 上的谓词。
@@ -76,4 +78,5 @@ apps/server        用 EngineConfig 装配一切的二进制
 
 - **性能目标在规模下未达成**：实测 B/F/J/P P50 2.5–15 s（50k 行），主因是每次查询的 DuckLake 重新 attach（P1-1）。守卫预算保持为锁定目标；修复路径（读连接池、文件后端 DuckLake）跟踪于
   [docs/research/perf-calibration.md](docs/research/perf-calibration.md)。
+- 完整差距清单见 [docs/research/spec-gap-analysis.md](docs/research/spec-gap-analysis.md)（spec 承诺 vs 实现逐条对照）。
 - 延后项记录在 [specs/93-improvements-review.md](specs/93-improvements-review.md)：快照级 point-in-time（T4-I3）、目录新鲜度告警（T5-I5）、多租户 schema（T7c-TENANT —— authN 本身已实现）、CDC adapter（P3-4）、DuckDB 服务端语句超时（本 build 不可用）。

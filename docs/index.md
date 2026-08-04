@@ -23,6 +23,7 @@ The spec set cites these by path; the impl plan relies on their decisions.
 | [research/spike-microbatch-compaction.md](./research/spike-microbatch-compaction.md) | spike | PASS-with-amendments | 1 Parquet file per commit; compaction is threshold-gated; flush interval raised to 30s/50k |
 | [research/survey-cdc-adapter.md](./research/survey-cdc-adapter.md) | survey | GO | Debezium+Kafka via `rdkafka`; batch fallback realistic; per-source freshness grading |
 | [research/perf-calibration.md](./research/perf-calibration.md) | calibration | measured | B/F/J/P sync P50/P99 harness; targets unmet — per-query DuckLake re-attach (P1-1) dominates; guardrail budgets stay as locked targets |
+| [research/spec-gap-analysis.md](./research/spec-gap-analysis.md) | gap analysis | actionable | spec 承诺 vs 实现的逐条差距（33 不变式逐项核对）；根因：关闭权无归属、延后=范围削减、预算未验证即锁定；M1/M5 已回退为 OPEN |
 
 ## Spec corrections driven by this research
 

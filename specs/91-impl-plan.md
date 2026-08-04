@@ -76,6 +76,11 @@ engine code yet — only `rust-toolchain.toml` added).
 
 ## 5. Phase 2 — Boolean/temporal DSL + guardrails (closes M1)
 
+> **Status: SHIPPED but exit criterion NOT met — M1 OPEN (perf).** DSL B,
+> guardrails and the sync path all work and are tested; the exit criterion
+> "P50 < 1 s" is NOT met (measured 2.5 s @ 50k rows, P1-1 per-query re-attach
+> dominates). See [docs/research/spec-gap-analysis.md](../docs/research/spec-gap-analysis.md).
+
 | #   | Task | Spec | Effort |
 | --- | ---- | ---- | ------ |
 | 2.1 | DSL AST + parser + validator (I5: J follows B/F) | [10 §3](./10-data-model.md) | 2d |
@@ -138,6 +143,11 @@ queryable < 30 min (G5); `test_should_report_worst_source_freshness` passes.
 `test_should_enforce_frequency_cap`).
 
 ## 9. Phase 6 — hardening: J + P + budgets + security (closes M5)
+
+> **Status: SHIPPED but exit criteria NOT met — M5 OPEN (perf + tenant).**
+> J/P/security hardening shipped; perf budgets unmet (2.5–15 s P50 @ 50k rows)
+> and AC6 tenant isolation deferred. See
+> [docs/research/spec-gap-analysis.md](../docs/research/spec-gap-analysis.md).
 
 | #   | Task | Spec | Effort |
 | --- | ---- | ---- | ------ |

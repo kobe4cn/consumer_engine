@@ -4,6 +4,11 @@
 
 - **Always shippable.** Every milestone leaves touched surfaces green on the
   Rust gate set (AGENTS.md § Toolchain).
+- **Closure requires human confirmation.** A milestone closes only when (a)
+  every exit criterion is met with evidence, (b) the closure note lists that
+  evidence and any deferrals, and (c) a **human signs off**. "Closed with
+  caveat" is not a valid state — a caveat means the milestone stays OPEN
+  (roadmap §4).
 - **Contract before consumer.** The data model + single-writer land before any
   DSL consumer; the Feature Store seam lands before any feature predicate.
 - **Honest calibration.** One-developer estimates; pad for review/on-call. The
@@ -47,15 +52,23 @@ returns rows with a `freshness` label. No DSL yet. Shipped in T1 (`e50e918`);
 covered by `tests/e2e.rs` + storage unit tests (single-writer refusal,
 read-only probe rejection, restart durability).
 
-### M1 — Boolean/temporal DSL (B) for operators — ✅ CLOSED (perf caveat)
+### M1 — Boolean/temporal DSL (B) for operators — ⚠️ OPEN — exit criterion NOT met
+
+> **Status**: reverted from CLOSED (2025-08) — exit criterion "P50 < 1 s" NOT
+> met (measured 2.5 s @ 50k rows vs target ≤ 50 M users). See
+> [docs/research/spec-gap-analysis.md](../docs/research/spec-gap-analysis.md).
+> Closure requires the perf fix (P1-1 read-connection pool) **and** human
+> confirmation (roadmap §4).
 
 **Specs touched**: 12, 21. **Exit**: an agent composes "bought SKU A in 30d,
 lapsed" via `/query` (sync) and gets guarded, parameterised results; P50 < 1 s
 on the seeded corpus. Guardrails reject an over-budget query. Shipped in T2
 (`90427f3`): DSL B + EXPLAIN pre-flight + guardrails (memory/threads/timeout/
-rows/scan/semaphore) + freshness. **Perf caveat**: the P50 < 1 s target is NOT
-met at scale — measured P50 2.5 s at 50k rows, dominated by the per-query
-DuckLake re-attach (P1-1); tracked in `docs/research/perf-calibration.md`.
+rows/scan/semaphore) + freshness. **Perf gap (blocking closure)**: the P50 < 1 s
+target is NOT met at scale — measured P50 2.5 s at 50k rows, dominated by the
+per-query DuckLake re-attach (P1-1); tracked in
+`docs/research/perf-calibration.md`. Guardrail row budget holds; the latency
+budget does not.
 
 ### M2 — Materialised audiences + delivery pull — ✅ CLOSED
 
@@ -86,7 +99,14 @@ Shipped in #7 (`5bf7c05`): idempotent `/suppression` (Q3), `Exclude` anti-join,
 config-driven rules (per-campaign no-repeat + global frequency cap); e2e
 asserts suppressed users absent from rerun + snapshot, cap enforced.
 
-### M5 — Hardening: J + P + budgets + security — ✅ CLOSED (perf caveat)
+### M5 — Hardening: J + P + budgets + security — ⚠️ OPEN — exit criteria NOT met
+
+> **Status**: reverted from CLOSED (2025-08) — exit criteria "perf budgets met"
+> and "G2/G3 hold" NOT met (measured 2.5–15 s P50 @ 50k rows; AC6 tenant
+> isolation deferred). See
+> [docs/research/spec-gap-analysis.md](../docs/research/spec-gap-analysis.md).
+> Closure requires: the perf fix (P1-1), tenant isolation (issue #10 AC6), and
+> human confirmation (roadmap §4).
 
 **Specs touched**: 12 (J/P), 70, 71, 72. **Exit**: JIT `Derive` over survivors
 works and is bounded; `Characterize` emits comparative profiles; perf budgets
@@ -94,11 +114,11 @@ met; security checklist green. G2/G3 hold. Shipped in #8/#9 (`5bf7c05`) +
 #10 (`8e01ed3`/`f089593`/`44fcccb`): Derive with measured (non-bypassable)
 survivor cap, Characterize segment-vs-baseline profiles, boundary lint gate
 (`make lint-boundary`), redacting Debug + log test, constant-time presign +
-expiry + access log. **Perf caveat**: the budgets are NOT met at scale
-(measured 2.5-15 s P50 at 50k rows; re-attach dominated) — tracked in
-`docs/research/perf-calibration.md`. **Security caveat**: AC6 tenant isolation
-deferred (no auth layer; single-tenant by construction) — `specs/93`
-T7c-TENANT.
+expiry + access log. **Perf gap (blocking closure)**: the budgets are NOT met
+at scale (measured 2.5–15 s P50 at 50k rows; re-attach dominated) — tracked in
+`docs/research/perf-calibration.md`. **Security gap (blocking closure)**: AC6
+tenant isolation deferred (single-tenant by construction) — `specs/93`
+T7c-TENANT; authN itself is implemented.
 
 ### (Phase 2 — not v1) S similarity + ML producers
 
@@ -121,7 +141,21 @@ producer, queryable as a `Feature` predicate with **no** runtime layer change
 Phases 0–M5 ≈ 10–17 weeks for one developer; parallelism collapses M2/M4 once
 the writer spine (M0) is stable. **Re-calibrate after Phase 0.**
 
-## 4. Cross-references
+## 4. Milestone closure process (binding)
+
+1. **Evidence before status.** A milestone closes only by human sign-off; the
+   closing note must map every exit criterion to concrete evidence (test name,
+   bench number, spec §).
+2. **No "closed with caveat".** If any exit criterion is unmet, the milestone
+   stays OPEN with the gap named. The gap is either fixed, or the exit
+   criterion is formally re-scoped in the spec — both require human sign-off.
+3. **Deferrals need sign-off.** Anything deferred out of a milestone
+   (`specs/93`) is listed in the closure note and explicitly accepted by the
+   human; deferred items are re-verified at every subsequent milestone review.
+4. **Roadmap status is the single source of truth.** README/docs claims mirror
+   roadmap status; a stale "closed" claim anywhere is a defect.
+
+## 5. Cross-references
 
 - Pair 1:1 with [91-impl-plan.md](./91-impl-plan.md) (different ordering —
   roadmap is user-feature, impl-plan is dependency).

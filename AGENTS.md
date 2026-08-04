@@ -29,6 +29,21 @@ IMPORTANT: Never enter plan mode automatically!!! Never enter plan mode automati
   - For new automation tasks, always add a Makefile target instead of creating shell scripts
   - Keep automation consistent and discoverable
 
+### Milestone Closure（里程碑关闭 = 人确认制）
+
+- A milestone / issue closes only when (a) **every** exit criterion is met with
+  concrete evidence (test name, bench number, spec §), (b) the closure note
+  lists that evidence and any deferrals, and (c) a **human signs off**.
+- There is no "CLOSED with caveat" state: any unmet exit criterion keeps the
+  milestone OPEN with the gap named in `specs/90-roadmap.md`; either fix the
+  gap or formally re-scope the criterion in the spec — both require human
+  sign-off.
+- Deferred items (`specs/93-improvements-review.md`) are listed in the closure
+  note and explicitly accepted by the human; re-verify them at every
+  subsequent milestone review. They are not silently folded into "by design".
+- Roadmap status is the single source of truth: README/docs claims must mirror
+  it; a stale "closed" claim anywhere is a defect.
+
 ## Documentation
 
 For specs, explore ./specs directory and put it to the right place, name the spec file as {feature-name}-{type}.md and update index.md accordingly. type can be prd, design, impl-plan, verification-plan, review, etc.
