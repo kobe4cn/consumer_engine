@@ -47,10 +47,11 @@
 
 ```sh
 cargo build --workspace
-cargo test --workspace --all-features      # 120 个测试，含可选 feature 套件
+cargo test --workspace --all-features      # 146 个测试，含可选 feature 套件
 cargo +nightly fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 make lint-boundary                          # 严格边界 lint（见下）
+make bench-queries                          # 性能门禁（见下；性能相关改动必跑）
 cargo doc --workspace --no-deps --all-features
 ```
 
@@ -80,6 +81,6 @@ cargo doc --workspace --no-deps --all-features
 
 - `semantic-llm`（由 `server` 转发）：真实 HTTP LLM/embedding 客户端取代确定性 stub。用 `--features semantic-llm` 构建/测试；若设置了 `EngineConfig.llm` 但 feature 关闭，server 会告警并回退到 stub。
 
-## 性能校准
+## 性能门禁（issue #25）
 
-`crates/query/examples/query_latency.rs` 播种合成语料（`CE_SCALE_ROWS`，默认 50k），经真实引擎报告 B/F/J/P 的 P50/P99：`make bench-queries`。实测现状与解锁路径见 [docs/research/perf-calibration.md](research/perf-calibration.md) —— 目标**当前未在规模下达成**（re-attach 主导）。
+`make bench-queries` 是**性能退出标准门禁**：`crates/query/examples/query_latency.rs` 播种合成语料（`CE_SCALE_ROWS`，默认 50k），经真实引擎（读池 + 写代数，issue #20）跑 B/F/J/P，断言锁定预算 **P50 ≤ 1 s / P99 ≤ 5 s**（specs/71 §3），未达标 **exit non-zero**。阈值可覆盖以便自测：`CE_MAX_P50_MS` / `CE_MAX_P99_MS`。实测数字与 M1 证据表见 [docs/research/perf-calibration.md](research/perf-calibration.md) —— 50k 行 P50 11–64 ms，远低于预算。

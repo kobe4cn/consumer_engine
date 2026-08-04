@@ -15,8 +15,11 @@ lint-boundary:
 	done
 	@echo "boundary lint: clean"
 
-# Query-latency calibration harness (issue #10 AC1; docs/research/perf-calibration.md).
-# Scale via CE_SCALE_ROWS (default 50000).
+# Query-latency GATE (issue #25; docs/research/perf-calibration.md §M1 evidence):
+# runs the real-engine bench over B/F/J/P at CE_SCALE_ROWS (default 50000) and
+# asserts the LOCKED budgets — P50 < 1s, P99 < 5s (specs/71 §3) — exiting
+# non-zero on breach, so the perf budget is a CI-enforced exit criterion, not a
+# soft target. Thresholds overridable for testing: CE_MAX_P50_MS / CE_MAX_P99_MS.
 bench-queries:
 	@cargo run --release -p consumer_engine-query --example query_latency
 

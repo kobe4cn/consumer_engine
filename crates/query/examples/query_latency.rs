@@ -17,6 +17,7 @@
 //! env var.
 
 use std::{
+    env, process,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -30,10 +31,7 @@ use consumer_engine_query::QueryEngine;
 use consumer_engine_storage::Writer;
 
 fn main() {
-    let scale: usize = std::env::var("CE_SCALE_ROWS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50_000);
+    let scale = env_u64("CE_SCALE_ROWS", 50_000) as usize;
     // Distinct-user divisor; guard tiny scales so the bench never divides by
     // zero (and always has at least one distinct user).
     let users = (scale / 10).max(1);
@@ -188,22 +186,51 @@ fn main() {
         "\n{:>4} {:>10} {:>10} {:>10}",
         "type", "p50(ms)", "p99(ms)", "mean(ms)"
     );
-    for (name, samples) in results {
-        let p50 = percentile(&samples, 0.50);
-        let p99 = percentile(&samples, 0.99);
+    // The gate thresholds are the LOCKED budgets (specs/71 §3: P50 < 1s,
+    // P99 < 5s), overridable via env so the gate itself is testable
+    // (issue #25: the perf budget is a CI-enforced exit criterion, not a soft
+    // target).
+    let max_p50_ms = env_u64("CE_MAX_P50_MS", 1000);
+    let max_p99_ms = env_u64("CE_MAX_P99_MS", 5000);
+    let mut failed = false;
+    for (name, samples) in &results {
+        let p50 = percentile(samples, 0.50);
+        let p99 = percentile(samples, 0.99);
         let mean = samples.iter().sum::<Duration>().as_secs_f64() / samples.len() as f64 * 1000.0;
+        let p50_ms = p50.as_secs_f64() * 1000.0;
+        let p99_ms = p99.as_secs_f64() * 1000.0;
+        let ok = p50_ms < max_p50_ms as f64 && p99_ms < max_p99_ms as f64;
+        failed |= !ok;
         println!(
-            "{name:>4} {:>10.2} {:>10.2} {:>10.2}",
-            p50.as_secs_f64() * 1000.0,
-            p99.as_secs_f64() * 1000.0,
-            mean
+            "{name:>4} {:>10.2} {:>10.2} {:>10.2}  {}",
+            p50_ms,
+            p99_ms,
+            mean,
+            if ok { "PASS" } else { "FAIL" }
         );
     }
     println!(
-        "\ncalibration corpus: {scale} rows (target ≤50M needs the file-backed DuckLake attach; \
-         see docs/research/perf-calibration.md)"
+        "\nbudgets: P50 < {max_p50_ms} ms, P99 < {max_p99_ms} ms (specs/71 §3 locked budgets; \
+         overridable via CE_MAX_P50_MS / CE_MAX_P99_MS)"
+    );
+    println!(
+        "calibration corpus: {scale} rows (target ≤50M needs the file-backed DuckLake attach; see \
+         docs/research/perf-calibration.md)"
     );
     ingestion.shutdown();
+    if failed {
+        // The gate: non-zero exit so `make bench-queries` / CI fails red.
+        eprintln!("BENCH GATE FAILED — P50/P99 budgets exceeded");
+        process::exit(1);
+    }
+}
+
+/// Read an env var as `u64` with a fallback.
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Run `dsl` `n` times synchronously, recording each wall-clock latency. A

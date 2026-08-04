@@ -133,8 +133,9 @@ for standalone/test readers. K = physical cores (specs/11 §2a).
    bottleneck).
 3. Re-run the harness at `CE_SCALE_ROWS=50000000` on the file-backed config and
    re-lock the guardrail numbers from the P50/P99 it reports.
-4. Bench gate with P50/P99 assertions (issue #25) lands once the read pool is
-   in, so the ≤1 s budget becomes CI-enforced.
+4. ~~Bench gate with P50/P99 assertions (issue #25)~~ — **done**: `make
+   bench-queries` asserts P50 < 1 s / P99 < 5 s and exits non-zero on breach
+   (thresholds overridable for testing).
 
 ## Cross-references
 
@@ -142,3 +143,17 @@ for standalone/test readers. K = physical cores (specs/11 §2a).
   `specs/92-gap-closure-plan.md` (Phase 1).
 - Budgets: `specs/71-performance-budgets.md`.
 - Spike ticket: issue #12; read-pool implementation ticket: issue #20.
+
+## M1 exit-criteria evidence (roadmap §4 closure table, issue #25)
+
+M1's exit criteria (specs/90 §2) mapped to concrete evidence, ready for the
+human sign-off in #26:
+
+| Exit criterion | Evidence |
+| -------------- | -------- |
+| "bought SKU A in 30d, lapsed" composes via DSL and runs sync | e2e `test_should_run_recency_and_lapsed_over_rest`, `test_should_run_dsl_filter_query_over_rest` |
+| P50 < 1 s on the seeded corpus | **`make bench-queries` gate** (this file, issue #25): at 50k rows the gate run measured B/F/J/P P50 13–65 ms (P99 < 220 ms); the gate asserts P50 < 1 s / P99 < 5 s and exits non-zero on breach |
+| Guardrails reject an over-budget query | e2e `test_should_reject_over_budget_query_pre_execution`; guardrail unit `test_should_reject_query_over_max_output_rows` (memory is runtime-PRAGMA-bounded, not pre-flight — specs/12 §4) |
+| Parameterised results (no interpolated values) | `test_should_parameterise_all_user_values` (compiler unit) |
+| `freshness` label on every result | e2e `test_should_report_worst_source_freshness` (graded per-source since #22/#24) |
+| Full Rust gate green | `cargo build` + `cargo test --workspace --all-features` (146) + `cargo +nightly fmt` + `cargo clippy -- -D warnings` + `make lint-boundary` |

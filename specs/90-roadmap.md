@@ -54,21 +54,20 @@ read-only probe rejection, restart durability).
 
 ### M1 — Boolean/temporal DSL (B) for operators — ⚠️ OPEN — exit criterion NOT met
 
-> **Status**: reverted from CLOSED (2025-08) — exit criterion "P50 < 1 s" NOT
-> met (measured 2.5 s @ 50k rows vs target ≤ 50 M users). See
-> [docs/research/spec-gap-analysis.md](../docs/research/spec-gap-analysis.md).
-> Closure requires the perf fix (P1-1 read-connection pool) **and** human
-> confirmation (roadmap §4); 补缺路径见 [92-gap-closure-plan.md](./92-gap-closure-plan.md).
+> **Status**: reverted from CLOSED (2025-08) because "P50 < 1 s" was unmet; the
+> read pool (issue #20) fixed the re-attach root cause — the gate now measures
+> P50 13–65 ms @ 50k rows (`make bench-queries`, issue #25) and enforces
+> P50 < 1 s / P99 < 5 s. Closure requires the gate green + human sign-off
+> (roadmap §4); see [docs/research/perf-calibration.md](../docs/research/perf-calibration.md).
 
 **Specs touched**: 12, 21. **Exit**: an agent composes "bought SKU A in 30d,
 lapsed" via `/query` (sync) and gets guarded, parameterised results; P50 < 1 s
 on the seeded corpus. Guardrails reject an over-budget query. Shipped in T2
 (`90427f3`): DSL B + EXPLAIN pre-flight + guardrails (memory/threads/timeout/
-rows/scan/semaphore) + freshness. **Perf gap (blocking closure)**: the P50 < 1 s
-target is NOT met at scale — measured P50 2.5 s at 50k rows, dominated by the
-per-query DuckLake re-attach (P1-1); tracked in
-`docs/research/perf-calibration.md`. Guardrail row budget holds; the latency
-budget does not.
+rows/scan/semaphore) + freshness. **Perf (fixed, closing)**: the per-query DuckLake re-attach root cause (P1-1)
+was removed by the read pool (#20); the bench gate (#25) now measures
+P50 13–65 ms @ 50k rows and enforces P50 < 1 s / P99 < 5 s. The ≤50M-user
+corpus re-run on a file-backed attach is still the final scale validation.
 
 ### M2 — Materialised audiences + delivery pull — ✅ CLOSED
 
