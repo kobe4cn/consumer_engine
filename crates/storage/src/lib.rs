@@ -232,25 +232,21 @@ impl Writer {
                 .map_err(|e| Error::InvalidInput(format!("producer_id: {e}")))?;
         }
         self.ensure_feature_store_table()?;
-        let insert =
-            format!("INSERT INTO {WRITE_CATALOG_ALIAS}.feature_store VALUES (?, ?, ?, ?, ?)");
-        let mut stmt = self
-            .conn
-            .prepare(&insert)
-            .map_err(|e| Error::Storage(BoxError::from(e)))?;
-        let mut written = 0usize;
-        for r in rows {
-            written += stmt
-                .execute(duckdb::params![
-                    r.user_id,
-                    r.feature_name,
-                    r.num_value,
-                    r.as_of_ts,
-                    r.producer_id
-                ])
-                .map_err(|e| Error::Storage(BoxError::from(e)))?;
-        }
-        Ok(written)
+        insert_chunked(
+            &self.conn,
+            &format!("INSERT INTO {WRITE_CATALOG_ALIAS}.feature_store VALUES "),
+            5,
+            rows,
+            |r| {
+                vec![
+                    Value::Text(r.user_id.clone()),
+                    Value::Text(r.feature_name.clone()),
+                    Value::Double(r.num_value),
+                    Value::Text(r.as_of_ts.clone()),
+                    Value::Text(r.producer_id.clone()),
+                ]
+            },
+        )
     }
 
     /// Append catalog rows to `semantic_catalog`. The embedding is written via a
@@ -488,22 +484,20 @@ impl Writer {
         if rows.is_empty() {
             return Ok(0);
         }
-        let placeholders = format!("({})", vec!["?"; columns.len()].join(", "));
-        let insert = format!(
-            "INSERT INTO {WRITE_CATALOG_ALIAS}.{table} ({cols_names}) VALUES {placeholders}"
-        );
-        let mut stmt = self
-            .conn
-            .prepare(&insert)
-            .map_err(|e| Error::Storage(BoxError::from(e)))?;
-        let mut bound = 0usize;
-        for row in rows {
-            let params: Vec<Option<&str>> = row.iter().map(|v| v.as_deref()).collect();
-            bound += stmt
-                .execute(duckdb::params_from_iter(params))
-                .map_err(|e| Error::Storage(BoxError::from(e)))?;
-        }
-        Ok(bound)
+        insert_chunked(
+            &self.conn,
+            &format!("INSERT INTO {WRITE_CATALOG_ALIAS}.{table} ({cols_names}) VALUES "),
+            columns.len(),
+            rows,
+            |row| {
+                row.iter()
+                    .map(|v| match v {
+                        Some(s) => Value::Text(s.clone()),
+                        None => Value::Null,
+                    })
+                    .collect()
+            },
+        )
     }
 
     /// Run DuckLake compaction on a table. Uses `ducklake_merge_adjacent_files`
@@ -601,6 +595,53 @@ impl Writer {
     }
 }
 
+/// Chunked multi-row INSERT helper shared by [`Writer::ingest_raw`] and
+/// [`Writer::write_feature_rows`].
+///
+/// Why chunked: a per-row autocommit path creates **one DuckLake snapshot per
+/// row** (a 50k-row seed produced 55k snapshots), which ballooned the catalog
+/// and made every read-only attach cost ~500 ms — the real root of the P1-1
+/// latency gap (read_path_spike, issue #12). A multi-row `VALUES` statement is
+/// one commit, so a chunk keeps the catalog at one file/snapshot per chunk.
+///
+/// `cols` is the row width; the per-chunk row count is capped so the bound
+/// parameters never exceed DuckDB's per-statement limit (`MAX_PARAMS`),
+/// independent of how wide `cols` is. `bind` maps one row to its bound values.
+/// Returns the total rows affected (DuckDB reports a multi-row `VALUES`
+/// insert's row count).
+fn insert_chunked<R>(
+    conn: &Connection,
+    insert_prefix: &str,
+    cols: usize,
+    rows: &[R],
+    bind: impl Fn(&R) -> Vec<Value>,
+) -> Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    // DuckDB's default maximum bound parameters per prepared statement.
+    const MAX_PARAMS: usize = 65_535;
+    // 500 rows per chunk at typical widths; narrower automatically when wide
+    // (e.g. a 1024-column table → 500 × 1024 = 512k params would exceed the
+    // limit, so the chunk shrinks to 63 rows).
+    const CHUNK_ROWS: usize = 500;
+    let chunk_rows = CHUNK_ROWS.min(MAX_PARAMS / cols.max(1));
+    let mut affected = 0usize;
+    for chunk in rows.chunks(chunk_rows) {
+        let row_sql = format!("({})", vec!["?"; cols].join(", "));
+        let multi = vec![row_sql.as_str(); chunk.len()].join(", ");
+        let sql = format!("{insert_prefix}{multi}");
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let params: Vec<Value> = chunk.iter().flat_map(&bind).collect();
+        affected += stmt
+            .execute(duckdb::params_from_iter(params.iter()))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+    }
+    Ok(affected)
+}
+
 /// Build the `ATTACH ... AS dro (READ_ONLY)` SQL for the catalog. Centralised
 /// so the execution reader can re-issue it to refresh its snapshot (a
 /// long-lived read-only attach does not see commits made after attach).
@@ -670,6 +711,58 @@ mod tests {
             .query_row("SELECT count(*) FROM dl.raw_erp_users", [], |r| r.get(0))
             .expect("count");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_should_ingest_multi_chunk_returns_total_and_keeps_catalog_small() {
+        // Regression for the per-row-commit defect (issue #12): a multi-chunk
+        // ingest must return the TOTAL row count (not per-statement), and must
+        // not create one DuckLake snapshot per row — the catalog stays at a
+        // handful of snapshots, which is what keeps the read attach cheap.
+        let (_tmp, w) = tmp_writer();
+        let rows: Vec<Vec<Option<String>>> = (0..1200)
+            .map(|i| vec![Some(format!("u{i}")), Some("A".into())])
+            .collect();
+        let n = w
+            .ingest_raw("erp", "orders", &["user_id".into(), "sku".into()], &rows)
+            .expect("ingest");
+        assert_eq!(n, 1200, "returned count must be the total rows inserted");
+        let count: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM dl.raw_erp_orders", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1200);
+        let snaps: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM ducklake_snapshots('dl')", [], |r| {
+                r.get(0)
+            })
+            .expect("snapshots");
+        assert!(
+            snaps < 10,
+            "1200 rows over 500-row chunks must stay at a handful of snapshots, got {snaps}"
+        );
+    }
+
+    #[test]
+    fn test_should_write_features_multi_chunk_returns_total() {
+        let (_tmp, w) = tmp_writer();
+        let rows: Vec<FeatureRow> = (0..1200)
+            .map(|i| FeatureRow {
+                user_id: format!("u{i}"),
+                feature_name: "cadence.regularity".into(),
+                num_value: 0.5,
+                as_of_ts: "2025-01-01T00:00:00Z".into(),
+                producer_id: "cadence_sql".into(),
+            })
+            .collect();
+        let n = w.write_feature_rows(&rows).expect("write features");
+        assert_eq!(n, 1200, "returned count must be the total rows inserted");
+        let count: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM dl.feature_store", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 1200);
     }
 
     #[test]

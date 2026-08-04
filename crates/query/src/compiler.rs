@@ -30,6 +30,25 @@ pub struct CompileOptions<'a> {
     pub derive_limit: Option<u64>,
 }
 
+impl<'a> CompileOptions<'a> {
+    /// A compile context with an explicit alias, suppression rules and derive
+    /// limit (the engine passes its suppression rules and the measured
+    /// survivor count). `#[non_exhaustive]` keeps future fields additive; this
+    /// is the only supported construction path.
+    #[must_use]
+    pub const fn new(
+        alias: &'a str,
+        suppression: &'a SuppressionRules,
+        derive_limit: Option<u64>,
+    ) -> Self {
+        Self {
+            alias,
+            suppression,
+            derive_limit,
+        }
+    }
+}
+
 /// A compiled query: SQL text, bound parameters (in placeholder order), and the
 /// source datasets touched (for the freshness label, D5).
 #[derive(Debug, Clone, PartialEq)]
