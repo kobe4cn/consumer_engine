@@ -3,6 +3,15 @@
 Engineering documentation. Specs (the design contract) live in
 [../specs/](../specs/); research memos (prior art + spike evidence) live here.
 
+## Guides
+
+| Guide | What it covers |
+| ----- | -------------- |
+| [development.md](./development.md) | crate boundaries, toolchain, Rust gates, conventions, features |
+| [usage.md](./usage.md) | REST surface, DSL syntax, runnable walkthrough, error codes |
+| [testing.md](./testing.md) | testing strategy, commands, scenario map, coverage gaps |
+| [deployment.md](./deployment.md) | config reference, security checklist, operational notes, limits |
+
 ## Research
 
 Load-bearing memos that validated (or corrected) spec assumptions before code.
