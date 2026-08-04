@@ -76,10 +76,31 @@ impl Engine {
         // Graded per-source freshness registry (D5).
         let freshness = Arc::new(FreshnessRegistry::new());
 
-        // Semantic layer (M3 stub clients: deterministic, no network).
-        let embed: Arc<dyn consumer_engine_semantic::EmbeddingModel> =
-            Arc::new(StubEmbed::default());
-        let llm: Arc<dyn consumer_engine_semantic::LlmClient> = Arc::new(StubLlm);
+        // Semantic layer: real HTTP clients when `llm` is configured (spec 13
+        // §4), otherwise the deterministic stubs (M3 default, no network).
+        let (embed, llm): (
+            Arc<dyn consumer_engine_semantic::EmbeddingModel>,
+            Arc<dyn consumer_engine_semantic::LlmClient>,
+        ) = match &config.llm {
+            Some(cfg) => {
+                #[cfg(feature = "semantic-llm")]
+                {
+                    (
+                        Arc::new(consumer_engine_semantic::HttpEmbedding::new(cfg)),
+                        Arc::new(consumer_engine_semantic::HttpLlm::new(cfg)),
+                    )
+                }
+                #[cfg(not(feature = "semantic-llm"))]
+                {
+                    let _ = cfg;
+                    tracing::warn!(
+                        "llm configured but the `semantic-llm` feature is off; using stubs"
+                    );
+                    (Arc::new(StubEmbed::default()), Arc::new(StubLlm))
+                }
+            }
+            None => (Arc::new(StubEmbed::default()), Arc::new(StubLlm)),
+        };
         let profiler = Arc::new(Profiler::new(reader.clone(), llm, Arc::clone(&embed)));
         let intent_rag = Arc::new(IntentRag::new(reader.clone(), Arc::clone(&embed)));
 
@@ -118,6 +139,16 @@ impl Engine {
         let materialise_slots = Arc::new(tokio::sync::Semaphore::new(
             config.guardrails.threads.max(1),
         ));
+        // Bearer authN: hash the configured token once; the middleware compares
+        // hashes in constant time (AGENTS.md § Crypto).
+        let auth_token_hash = config
+            .auth_token
+            .as_deref()
+            .map(|t| Arc::new(consumer_engine_ingress::auth::hash_token(t)));
+        let sql_approval_hash = config
+            .sql_approval_token
+            .as_deref()
+            .map(|t| Arc::new(consumer_engine_ingress::auth::hash_token(t)));
         let state = AppState {
             ingestion: ingestion.clone(),
             query_engine,
@@ -127,6 +158,8 @@ impl Engine {
             jobs: Arc::clone(&jobs),
             materialise_slots,
             signing_key: Arc::new(signing_key),
+            auth_token_hash,
+            sql_approval_hash,
         };
         let router = router(state);
         let engine = Engine {

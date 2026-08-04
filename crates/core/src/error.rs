@@ -31,6 +31,11 @@ pub enum Error {
     /// Caller-supplied input failed validation at the trust boundary.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// The semantic catalogue is unavailable (spec 13 §4): the agent must not
+    /// guess columns when retrieval cannot complete.
+    #[error("semantic catalogue unavailable")]
+    CatalogueUnavailable,
 }
 
 /// Convenience `Result` alias used throughout the engine.

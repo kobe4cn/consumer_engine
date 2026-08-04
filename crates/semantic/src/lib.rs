@@ -18,6 +18,13 @@ pub mod intent_rag;
 pub mod llm;
 pub mod profiler;
 
+// Real HTTP LLM/embedding clients behind the same trait seams (spec 13 §4),
+// compiled only with the `semantic-llm` feature.
+#[cfg(feature = "semantic-llm")]
+pub mod http;
+
+#[cfg(feature = "semantic-llm")]
+pub use http::{HttpEmbedding, HttpLlm};
 pub use intent_rag::IntentRag;
 pub use llm::{EmbeddingModel, LlmClient, StubEmbed, StubLlm};
 pub use profiler::Profiler;

@@ -361,6 +361,46 @@ impl QueryEngine {
         })
     }
 
+    /// Run an **approved** raw-SQL escape-hatch statement (specs/21 §4 E2)
+    /// under the same guardrails as the DSL path: concurrency cap, statement
+    /// timeout, output-row cap. The caller is responsible for having verified
+    /// the approval token (the ingress layer does, and audit-logs). Freshness
+    /// is unknown for arbitrary SQL (no parsed sources) → the default label.
+    ///
+    /// # Errors
+    /// [`QueryError::Guardrail`] on timeout/row-cap; [`QueryError::Execution`]
+    /// on reader failure.
+    pub async fn run_sql_approved(&self, sql: &str) -> Result<SyncResult> {
+        let _permit = self
+            .inflight
+            .acquire()
+            .await
+            .map_err(|e| QueryError::Execution {
+                source: Error::Execution(BoxError::from(e)),
+            })?;
+        let timeout = Duration::from_secs(self.guardrails.statement_timeout_secs);
+        let qr = tokio::time::timeout(timeout, self.reader.query(sql))
+            .await
+            .map_err(|_| QueryError::Guardrail {
+                rule: "statement_timeout".into(),
+                limit: format!("{}s", self.guardrails.statement_timeout_secs),
+            })??;
+        if qr.rows.len() as u64 > self.guardrails.max_output_rows {
+            return Err(QueryError::Guardrail {
+                rule: "max_output_rows".into(),
+                limit: self.guardrails.max_output_rows.to_string(),
+            });
+        }
+        let count = qr.rows.len() as u64;
+        Ok(SyncResult {
+            columns: qr.columns,
+            rows: qr.rows,
+            count,
+            freshness: Freshness::batch(0),
+            query_id: format!("q_{}", uuid::Uuid::now_v7()),
+        })
+    }
+
     /// Materialise a validated DSL segment into `audience_snapshot` via the
     /// single writer, returning the opaque snapshot id `snap_<uuidv7>`.
     ///

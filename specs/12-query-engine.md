@@ -72,9 +72,13 @@ guardrail verdict (allow / reject-with-reason).
 ## 4. Behaviour
 
 - **Mode selection (D14).** `plan()` picks sync iff estimated rows ≤
-  `sync_row_cap` (default 100k) **and** estimated cost ≤ `sync_cost_cap`
-  (default 1 s). Otherwise it returns `Plan { mode: Async }` and the caller
-  submits to `/jobs`. Materialisation is always async (writes DuckLake via Q2).
+  `sync_row_cap` (default 100k). DuckDB's EXPLAIN exposes only an estimated
+  output-cardinality — **not cost or bytes-scanned** — so the cost/scan budgets
+  are bounded at runtime (`memory_limit` PRAGMA + statement timeout), not
+  pre-flight (this replaces the earlier `sync_cost_cap`/`max_bytes_scanned`
+  fields, which EXPLAIN cannot feed). Otherwise it returns `Plan { mode: Async }`
+  and the caller submits to `/jobs`. Materialisation is always async (writes
+  DuckLake via Q2).
 - **J (JIT) bounding (I5/D7).** A `Derive` node compiles to a CTE whose input
   is the survivor subquery; the compiler injects an inner `LIMIT` equal to the
   survivor count reported by the prior B/F stages' `plan`. If that survivor
@@ -82,8 +86,8 @@ guardrail verdict (allow / reject-with-reason).
   agent must narrow first or precompute the feature (F).
 - **Guardrail defaults** (calibrate in [71](./71-performance-budgets.md)):
   `memory_limit` 8 GB, `threads` = cores, `statement_timeout` 30 s,
-  `max_output_rows` 1 M, `max_bytes_scanned` per-query budget, in-flight
-  `Semaphore` = cores.
+  `max_output_rows` 1 M, in-flight `Semaphore` = cores. EXPLAIN pre-flight
+  bounds rows only; memory/scan are runtime-bounded (PRAGMA + timeout).
 - **Exclude semantics.** `Exclude { suppression.of(campaign) }` compiles to an
   anti-join against `suppression` for that campaign, considering frequency-cap
   rules ([20 §5](./20-ingestion.md)).

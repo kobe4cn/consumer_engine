@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use consumer_engine_core::{CatalogHit, READ_ONLY_CATALOG_ALIAS, Result, SemanticType};
+use consumer_engine_core::{CatalogHit, Error, READ_ONLY_CATALOG_ALIAS, Result, SemanticType};
 use consumer_engine_execution::Reader;
 use serde_json::Value;
 
@@ -69,7 +69,14 @@ impl IntentRag {
         );
         let qr = self.reader.query_with_params(&query, Vec::new()).await?;
 
-        let utterance_emb = self.embed.embed(utterance);
+        // A failed utterance embedding means retrieval cannot be trusted —
+        // surface `CatalogueUnavailable` so the agent never guesses columns
+        // (spec 13 §4).
+        let utterance_emb = self
+            .embed
+            .embed(utterance)
+            .await
+            .map_err(|_| Error::CatalogueUnavailable)?;
         let mut scored: Vec<(f64, CatalogHit)> = Vec::new();
         for row in &qr.rows {
             let system = cell_string(row.first());
@@ -168,10 +175,11 @@ mod tests {
     use super::*;
     use crate::llm::StubEmbed;
 
-    fn tmp_with_catalog() -> (tempfile::TempDir, Reader) {
+    async fn tmp_with_catalog() -> (tempfile::TempDir, Reader) {
         let tmp = tempfile::tempdir().expect("tmp");
         let writer =
             Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        // Embeddings are deterministic with the stub.
         let embed = StubEmbed::default();
         let rows = vec![
             CatalogRow {
@@ -184,7 +192,10 @@ mod tests {
                 description: "The user identifier of the orders table".into(),
                 pii_flag: false,
                 sample_values: Value::Array(vec![]),
-                embedding: embed.embed("The user identifier of the orders table"),
+                embedding: embed
+                    .embed("The user identifier of the orders table")
+                    .await
+                    .expect("embed"),
             },
             CatalogRow {
                 entity_type: "column".into(),
@@ -196,7 +207,10 @@ mod tests {
                 description: "The monetary amount spent on an order".into(),
                 pii_flag: false,
                 sample_values: Value::Array(vec![]),
-                embedding: embed.embed("The monetary amount spent on an order"),
+                embedding: embed
+                    .embed("The monetary amount spent on an order")
+                    .await
+                    .expect("embed"),
             },
         ];
         writer.write_catalog_rows(&rows).expect("write catalog");
@@ -214,7 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_retrieve_bounded_candidates() {
-        let (_tmp, reader) = tmp_with_catalog();
+        let (_tmp, reader) = tmp_with_catalog().await;
         let rag = IntentRag::new(reader, Arc::new(StubEmbed::default()));
         // I3: retrieval must be bounded by k even when the catalogue is larger.
         let hits = rag

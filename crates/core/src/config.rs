@@ -37,6 +37,22 @@ pub struct EngineConfig {
     /// DuckLake compaction tuning (specs/71 §4, spike-microbatch-compaction).
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// Bearer auth token protecting every route except /healthz and /readyz
+    /// (specs/21 I1). `None` leaves the engine unauthenticated — development
+    /// convenience only; production deployments MUST set it (a tokenless engine
+    /// lets any caller mint presigned exports, IDOR).
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// Token that authorises the raw-SQL escape hatch (specs/21 §4 E2):
+    /// `POST /query { sql, approvalToken }` runs only with a matching token,
+    /// under the same guardrails, always audit-logged. `None` disables the
+    /// hatch entirely.
+    #[serde(default)]
+    pub sql_approval_token: Option<String>,
+    /// HTTP LLM/embedding service config (spec 13 §4). `None` uses the
+    /// deterministic stubs (M3 default, no network).
+    #[serde(default)]
+    pub llm: Option<LlmConfig>,
 }
 
 const fn default_compaction_interval() -> u64 {
@@ -68,15 +84,9 @@ pub struct GuardrailConfig {
     /// Row count above which a sync query becomes async.
     #[serde(default = "default_sync_row_cap")]
     pub sync_row_cap: u64,
-    /// Estimated-cost cap (seconds) above which a sync query becomes async.
-    #[serde(default = "default_sync_cost_cap")]
-    pub sync_cost_cap_secs: u64,
     /// Maximum rows ever returned inline.
     #[serde(default = "default_max_output_rows")]
     pub max_output_rows: u64,
-    /// Maximum bytes scanned per query (calibrate on target storage).
-    #[serde(default = "default_max_bytes_scanned")]
-    pub max_bytes_scanned: u64,
     /// JIT (`Derive`) survivor-set cap above which a derive is rejected.
     #[serde(default = "default_j_survivor_cap")]
     pub j_survivor_cap: u64,
@@ -107,16 +117,8 @@ const fn default_sync_row_cap() -> u64 {
     100_000
 }
 
-const fn default_sync_cost_cap() -> u64 {
-    1
-}
-
 const fn default_max_output_rows() -> u64 {
     1_000_000
-}
-
-const fn default_max_bytes_scanned() -> u64 {
-    10 * 1024 * 1024 * 1024 // 10 GiB
 }
 
 const fn default_j_survivor_cap() -> u64 {
@@ -135,9 +137,7 @@ impl Default for GuardrailConfig {
             threads: default_threads(),
             statement_timeout_secs: default_statement_timeout(),
             sync_row_cap: default_sync_row_cap(),
-            sync_cost_cap_secs: default_sync_cost_cap(),
             max_output_rows: default_max_output_rows(),
-            max_bytes_scanned: default_max_bytes_scanned(),
             j_survivor_cap: default_j_survivor_cap(),
             enforce_catalogue: default_enforce_catalogue(),
         }
@@ -230,6 +230,9 @@ impl Default for EngineConfig {
             guardrails: GuardrailConfig::default(),
             suppression: SuppressionRules::default(),
             compaction: CompactionConfig::default(),
+            auth_token: None,
+            sql_approval_token: None,
+            llm: None,
         }
     }
 }
@@ -290,4 +293,19 @@ data_path: /tmp/data
         let res = EngineConfig::from_yaml_str(yaml);
         assert!(res.is_err(), "deny_unknown_fields must reject bogus");
     }
+}
+
+/// HTTP LLM/embedding service configuration (spec 13 §4). When set, the server
+/// builds real HTTP clients (with timeout + retry) instead of the deterministic
+/// stubs; the embedding dimension must match the service's output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LlmConfig {
+    /// Base URL of the OpenAI-compatible service (e.g. `http://llm:8080`).
+    pub base_url: String,
+    /// API key sent as `Authorization: Bearer <key>`.
+    pub api_key: String,
+    /// Fixed embedding dimension returned by the service (must match the
+    /// `semantic_catalog` embeddings the Profiler writes).
+    pub embedding_dim: usize,
 }

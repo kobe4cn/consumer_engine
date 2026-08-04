@@ -322,14 +322,17 @@ Append-only.
 - **Citation**: issue #10 AC6 ("Tenant isolation enforced — cross-tenant access
   is impossible by construction"); `specs/21-rest-api.md` §3 I2 (the compiler
   injects `tenant_id` into every SQL).
-- **Finding**: the engine has **no tenant model** — authN/AuthZ is stubbed from
-  M1 (no auth middleware, no tokens beyond the presigned-export HMAC), so there
-  is no `tenant_id` to extract or inject. AC6 is not implementable without an
-  auth layer + `tenant_id` columns on every engine table + compiler injection,
-  which is a standalone feature, not a hardening item.
-- **What holds today**: the engine is single-tenant by construction (one
+- **Finding**: the engine has **no tenant model** — there is no `tenant_id` to
+  extract or inject.
+- **What holds today (partial fix landed, whole-project review)**: bearer-token
+  **authN** is implemented (`EngineConfig.auth_token`, constant-time middleware
+  gating every route except healthz/readyz, e2e-covered) — the IDOR surface
+  (any caller minting presigned exports) is closed on authenticated
+  deployments. The engine remains **single-tenant** by construction (one
   catalog, one writer); there is no cross-tenant surface to leak.
-- **Fix shape (later)**: auth middleware (axum-login/oauth2) extracting
+- **Fix shape (later)**: `tenant_id` columns on every engine table + compiler
+  injection + auth claims carrying the tenant; test that a tenant-B token
+  cannot read tenant-A data.
   `tenant_id` from the verified token → `tenant_id` column on `raw_*`/
   `feature_store`/`suppression`/`audience_snapshot`/`semantic_catalog` → the
   compiler filters every query by the caller's tenant; test that a tenant-B

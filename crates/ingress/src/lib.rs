@@ -27,8 +27,11 @@ use consumer_engine_ingestion::IngestionHandle;
 use consumer_engine_query::{QueryEngine, QueryError};
 use consumer_engine_semantic::{IntentRag, Profiler};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 pub mod audience;
+pub mod auth;
 pub mod catalog;
 pub mod jobs;
 pub mod presign;
@@ -70,6 +73,12 @@ pub struct AppState {
     /// HMAC-SHA256 signing key for presigned export URLs (32 bytes of OS
     /// randomness; minted once at server startup).
     pub signing_key: Arc<[u8; 32]>,
+    /// SHA-256 hash of the configured bearer auth token (`None` = tokenless
+    /// dev engine; production must set `auth_token`).
+    pub auth_token_hash: Option<Arc<[u8; 32]>>,
+    /// SHA-256 hash of the raw-SQL escape-hatch approval token (`None` =
+    /// hatch disabled).
+    pub sql_approval_hash: Option<Arc<[u8; 32]>>,
 }
 
 /// `POST /sources/onboard` request body.
@@ -139,8 +148,10 @@ pub struct QueryResponse {
     query_id: String,
 }
 
-/// Build the router with `state` and a bounded request body.
+/// Build the router with `state` and a bounded request body. Every route is
+/// authN-gated (specs/21 I1) except `/healthz` and `/readyz`.
 pub fn router(state: AppState) -> Router {
+    let auth_layer = axum::middleware::from_fn_with_state(state.clone(), auth::require_auth);
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -154,6 +165,7 @@ pub fn router(state: AppState) -> Router {
         .route("/audience/{snapshot_id}", get(audience::get_audience))
         .route("/audience/{snapshot_id}/export", get(audience::get_export))
         .layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(auth_layer)
         .with_state(state)
 }
 
@@ -272,17 +284,27 @@ async fn query(
     let res = match (req.dsl, req.sql) {
         (Some(dsl), _) => state.query_engine.run(dsl).await?,
         (None, Some(sql)) => {
-            // Cap the escape-hatch payload even though it is rejected in M1.
+            // Cap the escape-hatch payload (AGENTS.md § Input Validation).
             if sql.len() > MAX_SQL_BYTES {
                 return Err(
                     Error::InvalidInput(format!("sql exceeds {MAX_SQL_BYTES} bytes")).into(),
                 );
             }
-            // M1: the raw-SQL escape hatch is closed. The approval-token gate
-            // lands with the DSL's long tail (spec 21 §4).
-            return Err(ApiError::Query(QueryError::InvalidDsl(
-                "raw-SQL escape hatch is not enabled in M1; submit a 'dsl' instead".into(),
-            )));
+            // Specs/21 §4 E2: raw SQL needs an approval token (constant-time
+            // compare); without it the hatch is closed.
+            let approved = match (&state.sql_approval_hash, &req.approval_token) {
+                (Some(expected), Some(provided)) => {
+                    let h = Sha256::digest(provided.as_bytes());
+                    bool::from(expected.as_ref().ct_eq(h.as_slice()))
+                }
+                _ => false,
+            };
+            if !approved {
+                return Err(ApiError::Unauthorized);
+            }
+            // Audit log (specs/21 §4: always audit-logged).
+            tracing::info!(sql = %sql, "approved raw-SQL escape hatch executed");
+            state.query_engine.run_sql_approved(&sql).await?
         }
         (None, None) => {
             return Err(Error::InvalidInput(
@@ -330,6 +352,10 @@ impl IntoResponse for ApiError {
             ApiError::Core(Error::WriterAlreadyHeld) => {
                 (StatusCode::CONFLICT, "writer already held".into())
             }
+            ApiError::Core(Error::CatalogueUnavailable) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "semantic catalogue unavailable".into(),
+            ),
             ApiError::Core(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             ApiError::Query(QueryError::InvalidDsl(m)) => (StatusCode::BAD_REQUEST, m),
             ApiError::Query(QueryError::TooLarge) => (

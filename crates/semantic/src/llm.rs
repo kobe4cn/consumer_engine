@@ -29,14 +29,19 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<String>;
 }
 
-/// A deterministic embedding model: maps text to a fixed-dimension unit vector.
-/// Used for both the Profiler (embed the *description*, never PII values — I4)
-/// and the IntentRag (embed the utterance).
+/// An embedding model: maps text to a fixed-dimension vector. Async because a
+/// real HTTP service is behind it (spec 13 §4); failures surface as an error
+/// so the caller can decide (Profiler degrades, IntentRag propagates
+/// `CatalogueUnavailable`). `dyn`-dispatched, hence `async_trait`.
+#[async_trait]
 pub trait EmbeddingModel: Send + Sync {
     /// The fixed dimension of every emitted vector.
     fn dim(&self) -> usize;
-    /// Embed `text` as a unit vector of length [`Self::dim`].
-    fn embed(&self, text: &str) -> Vec<f32>;
+    /// Embed `text` as a vector of length [`Self::dim`].
+    ///
+    /// # Errors
+    /// [`consumer_engine_core::Error`] when the embedding service is unreachable.
+    async fn embed(&self, text: &str) -> consumer_engine_core::Result<Vec<f32>>;
 }
 
 /// A heuristic, deterministic LLM stub (no network). Produces a short
@@ -90,12 +95,13 @@ impl Default for StubEmbed {
     }
 }
 
+#[async_trait]
 impl EmbeddingModel for StubEmbed {
     fn dim(&self) -> usize {
         self.dim
     }
 
-    fn embed(&self, text: &str) -> Vec<f32> {
+    async fn embed(&self, text: &str) -> consumer_engine_core::Result<Vec<f32>> {
         let mut v = vec![0.0_f32; self.dim];
         // Mix each byte into a dimension via an FNV-1a-style fold so the
         // contribution depends on both the byte and its position (spreading
@@ -124,7 +130,7 @@ impl EmbeddingModel for StubEmbed {
                 *x = (f64::from(*x) / norm) as f32;
             }
         }
-        v
+        Ok(v)
     }
 }
 
@@ -132,10 +138,10 @@ impl EmbeddingModel for StubEmbed {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_should_embed_to_unit_length() {
+    #[tokio::test]
+    async fn test_should_embed_to_unit_length() {
         let model = StubEmbed::new(16);
-        let v = model.embed("the orders table");
+        let v = model.embed("the orders table").await.expect("embed");
         let norm: f64 = v
             .iter()
             .map(|x| f64::from(*x) * f64::from(*x))
@@ -147,12 +153,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_should_embed_deterministically() {
+    #[tokio::test]
+    async fn test_should_embed_deterministically() {
         let model = StubEmbed::new(32);
         assert_eq!(
-            model.embed("periodic buyers"),
-            model.embed("periodic buyers")
+            model.embed("periodic buyers").await.expect("embed"),
+            model.embed("periodic buyers").await.expect("embed")
         );
     }
 

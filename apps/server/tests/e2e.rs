@@ -165,6 +165,39 @@ async fn spawn_with(
     guardrails: consumer_engine_core::GuardrailConfig,
     suppression: consumer_engine_core::SuppressionRules,
 ) -> String {
+    spawn_full(guardrails, suppression, None, None).await
+}
+
+/// Like [`spawn_with`] but with a bearer auth token protecting every route
+/// (specs/21 I1).
+async fn spawn_authed(token: &str) -> String {
+    spawn_full(
+        consumer_engine_core::GuardrailConfig::default(),
+        consumer_engine_core::SuppressionRules::default(),
+        Some(token.to_string()),
+        None,
+    )
+    .await
+}
+
+/// Like [`spawn_authed`] but also enables the raw-SQL escape hatch with an
+/// approval token (specs/21 §4 E2).
+async fn spawn_with_escape_hatch(token: &str, approval: &str) -> String {
+    spawn_full(
+        consumer_engine_core::GuardrailConfig::default(),
+        consumer_engine_core::SuppressionRules::default(),
+        Some(token.to_string()),
+        Some(approval.to_string()),
+    )
+    .await
+}
+
+async fn spawn_full(
+    guardrails: consumer_engine_core::GuardrailConfig,
+    suppression: consumer_engine_core::SuppressionRules,
+    auth_token: Option<String>,
+    sql_approval_token: Option<String>,
+) -> String {
     let tmp = tempfile::tempdir().expect("tmp");
     let cfg = EngineConfig {
         catalog_path: tmp.path().join("cat.db"),
@@ -172,6 +205,8 @@ async fn spawn_with(
         compaction_interval_secs: 0, // disable periodic compaction in tests
         guardrails,
         suppression,
+        auth_token,
+        sql_approval_token,
         ..EngineConfig::default()
     };
     let (router, engine) = Engine::build(&cfg).expect("build engine");
@@ -1590,4 +1625,163 @@ async fn test_should_complete_concurrent_jobs_under_slot_cap() {
         assert_eq!(status["status"], "done", "job {id} must complete: {status}");
         assert!(status["snapshotId"].as_str().is_some());
     }
+}
+
+#[tokio::test]
+async fn test_should_require_bearer_auth_when_configured() {
+    // specs/21 I1: AuthN on every request. With auth_token set, all routes
+    // except healthz/readyz require the bearer token; a tokenless or wrong
+    // caller is 401 (the IDOR surface is closed).
+    let base = spawn_authed("super-secret-token").await;
+    let client = reqwest::Client::new();
+
+    // healthz/readyz stay open.
+    for path in ["healthz", "readyz"] {
+        let resp = client
+            .get(format!("{base}/{path}"))
+            .send()
+            .await
+            .expect("probe");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "{path} must stay open"
+        );
+    }
+
+    // No token / wrong token / non-bearer -> 401.
+    let no_token = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({ "dsl": {"source":{"system":"erp","entity":"users"},"key":"id","ops":[]} }))
+        .send()
+        .await
+        .expect("query");
+    assert_eq!(no_token.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let wrong = client
+        .post(format!("{base}/query"))
+        .header("Authorization", "Bearer wrong")
+        .json(&serde_json::json!({ "dsl": {"source":{"system":"erp","entity":"users"},"key":"id","ops":[]} }))
+        .send()
+        .await
+        .expect("query");
+    assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let non_bearer = client
+        .post(format!("{base}/query"))
+        .header("Authorization", "Basic abc")
+        .json(&serde_json::json!({ "dsl": {"source":{"system":"erp","entity":"users"},"key":"id","ops":[]} }))
+        .send()
+        .await
+        .expect("query");
+    assert_eq!(non_bearer.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Correct token -> auth gate passes; onboard + query with the token work.
+    let authed = reqwest::Client::builder()
+        .default_headers(
+            [("authorization", "Bearer super-secret-token")]
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        reqwest::header::HeaderName::from_static(k),
+                        reqwest::header::HeaderValue::from_static(v),
+                    )
+                })
+                .collect(),
+        )
+        .build()
+        .expect("client");
+    let onboard = authed
+        .post(format!("{base}/sources/onboard"))
+        .json(&serde_json::json!({
+            "system": "erp", "entity": "users",
+            "columns": ["id"], "rows": [["u1"]]
+        }))
+        .send()
+        .await
+        .expect("onboard");
+    assert_eq!(onboard.status(), reqwest::StatusCode::OK);
+    let ok = authed
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({ "dsl": {"source":{"system":"erp","entity":"users"},"key":"id","ops":[]} }))
+        .send()
+        .await
+        .expect("query");
+    assert_eq!(ok.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_should_run_approved_raw_sql_escape_hatch() {
+    // specs/21 §4 E2: with a matching approvalToken, raw SQL runs under the
+    // guardrails (read-only); wrong/missing token is 401; never enabled when
+    // no approval token is configured.
+    let base = spawn_with_escape_hatch("auth-tok", "approve-123").await;
+    let authed = reqwest::Client::builder()
+        .default_headers(
+            [("authorization", "Bearer auth-tok")]
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        reqwest::header::HeaderName::from_static(k),
+                        reqwest::header::HeaderValue::from_static(v),
+                    )
+                })
+                .collect(),
+        )
+        .build()
+        .expect("client");
+    onboard(
+        &authed,
+        &base,
+        "erp",
+        "users",
+        &["id", "name"],
+        vec![vec!["u1", "alice"]],
+    )
+    .await;
+
+    // Correct approval token -> 200, read-only SELECT works.
+    let resp = authed
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({"sql": "SELECT id FROM dro.raw_erp_users", "approvalToken": "approve-123"}))
+        .send()
+        .await
+        .expect("escape hatch");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "approved SQL must run"
+    );
+    let v: Value = resp.json().await.expect("json");
+    assert_eq!(v["rows"][0][0], "u1");
+
+    // Wrong approval token -> 401.
+    let resp = authed
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({"sql": "SELECT 1", "approvalToken": "wrong"}))
+        .send()
+        .await
+        .expect("escape hatch");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Missing approval token -> 401.
+    let resp = authed
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({"sql": "SELECT 1"}))
+        .send()
+        .await
+        .expect("escape hatch");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // The hatch stays closed when no approval token is configured (default
+    // spawn): even a submitted token cannot open it.
+    let base2 = spawn().await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base2}/query"))
+        .json(&serde_json::json!({"sql": "SELECT 1", "approvalToken": "anything"}))
+        .send()
+        .await
+        .expect("escape hatch");
+    assert!(
+        !resp.status().is_success(),
+        "hatch must stay closed by default"
+    );
 }

@@ -11,6 +11,12 @@ documentation.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = []
+# Real HTTP LLM/embedding clients (spec 13 §4); without this feature the
+# deterministic stubs are used (M3 default, no network).
+semantic-llm = ["dep:reqwest", "dep:tokio"]
+
 [dependencies]
 consumer_engine-core.workspace = true
 consumer_engine-execution.workspace = true
@@ -19,9 +25,12 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 regex = "1"
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json"] }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 tokio.workspace = true
 consumer_engine-storage.workspace = true
 duckdb.workspace = true
+wiremock = "0.6"

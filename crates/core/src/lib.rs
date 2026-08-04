@@ -20,7 +20,9 @@ pub mod snapshot;
 pub mod suppression;
 
 pub use catalog::{READ_ONLY_CATALOG_ALIAS, WRITE_CATALOG_ALIAS};
-pub use config::{CompactionConfig, EngineConfig, FrequencyCap, GuardrailConfig, SuppressionRules};
+pub use config::{
+    CompactionConfig, EngineConfig, FrequencyCap, GuardrailConfig, LlmConfig, SuppressionRules,
+};
 pub use dataset::Dataset;
 pub use error::{Error, Result};
 pub use feature::{FeatureRow, split_feature_name};

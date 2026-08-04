@@ -121,8 +121,16 @@ impl Profiler {
                     format!("Column '{column}' of {system}.{table}")
                 }
             };
-            // I4: only the description is embedded, never PII values.
-            let embedding = self.embed.embed(&description);
+            // I4: only the description is embedded, never PII values. A failure
+            // degrades to a zero vector (warn) — the description is still
+            // persisted and human-editable (spec 13 §4 degrade gracefully).
+            let embedding = match self.embed.embed(&description).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, %column, "embedding failed; using zero vector");
+                    vec![0.0; self.embed.dim()]
+                }
+            };
 
             rows.push(CatalogRow {
                 entity_type: "column".into(),
