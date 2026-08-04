@@ -1,126 +1,85 @@
-# Development Guide
+# 开发指南
 
-How the engine is built, the crate boundaries, the gates, and the conventions a
-contributor must follow. The design contract is the spec set
-([specs/index.md](../specs/index.md)); this guide is about the code.
+引擎如何构建、crate 边界、门禁、以及贡献者必须遵守的约定。设计契约是 spec 集
+（[specs/index.md](../specs/index.md)）；本指南讲代码本身。
 
-## Toolchain
+## 工具链
 
-- **Rust 2024 edition**, pinned in [rust-toolchain.toml](../rust-toolchain.toml)
-  (currently 1.97.0). `cargo +nightly fmt` is the formatter
-  ([rustfmt.toml](../rustfmt.toml)).
-- Workspace members: `crates/*` + `apps/*`
-  ([Cargo.toml](../Cargo.toml)); shared deps live in `[workspace.dependencies]`.
+- **Rust 2024 edition**，版本钉在 [rust-toolchain.toml](../rust-toolchain.toml)（当前 1.97.0）。格式化用 `cargo +nightly fmt`（[rustfmt.toml](../rustfmt.toml)）。
+- Workspace 成员：`crates/*` + `apps/*`（[Cargo.toml](../Cargo.toml)）；共享依赖放 `[workspace.dependencies]`。
 
-## Architecture (how the pieces fit)
+## 架构（各部分如何协作）
 
-The engine is a set of actors communicating over channels
-([specs/11-runtime-core.md](../specs/11-runtime-core.md)):
+引擎由一组通过通道通信的 actor 组成（[specs/11-runtime-core.md](../specs/11-runtime-core.md)）：
 
 ```
-           ingress (axum, trust boundary)
+           ingress (axum, 信任边界)
                  │  DSL / onboard / suppression / jobs / catalog
                  ▼
-          query engine (compile → guard → run)
-                 │  read-only                          │ write via
-                 ▼                                     ▼
-       execution::Reader (single thread)      ingestion::IngestionActor
-       (dro attach, re-attach per query)      (dl attach; Q1 raw / Q2 snapshots /
-                                              Q3 suppression; producers; compaction)
+          query engine (编译 → 守卫 → 执行)
+                 │  只读                                 │ 经写入
+                 ▼                                       ▼
+       execution::Reader (单线程)             ingestion::IngestionActor
+       (dro attach, 每查询重 attach)          (dl attach; Q1 原始 / Q2 快照 /
+                                              Q3 抑制; producers; 压缩)
 ```
 
-- **Single writer**: `storage::Writer` is move-only, holds an exclusive file
-  lock; a second attach is refused (`Error::WriterAlreadyHeld`). All writes go
-  through the ingestion actor's flume channel (never from async handlers
-  directly).
-- **Read-only reader**: `execution::Reader` re-issues `DETACH dro; ATTACH …`
-  before every query so it sees DuckLake commits (the P1-1 workaround — see
-  [perf-calibration.md](research/perf-calibration.md)).
-- **Trust boundary**: `ingress` validates every value (`validate_ident`,
-  byte caps, closed enums, `deny_unknown_fields`), gates authN, and maps typed
-  errors to HTTP codes. Everything below assumes validated input.
+- **单写者**：`storage::Writer` 只移不克隆，持有排它文件锁；第二个 attach 被拒（`Error::WriterAlreadyHeld`）。所有写入都经过 ingestion actor 的 flume 通道（异步 handler 从不直接写）。
+- **只读 reader**：`execution::Reader` 每次查询前重新执行 `DETACH dro; ATTACH …` 以看到 DuckLake 提交（P1-1 的变通 —— 见 [perf-calibration.md](research/perf-calibration.md)）。
+- **信任边界**：`ingress` 校验每个值（`validate_ident`、字节上限、闭集枚举、`deny_unknown_fields`）、做 authN 门禁、把类型化错误映射为 HTTP 码。其下所有代码都假设输入已校验。
 
-Key crate roles (detail in each crate's docs and the spec it implements):
+各 crate 关键职责（详见各 crate 文档与对应 spec）：
 
-| Crate | Implements | Spec |
-| ----- | ---------- | ---- |
-| `core` | `Error`, `EngineConfig`, domain DTOs, `validate_ident`/`validate_feature_name`, `FreshnessRegistry` | 00, 10 |
-| `storage` | `Writer` (attach, DDL, writes), `open_reader` | 10, 20 §4 |
-| `execution` | `Reader`, `QueryResult`, `value_to_json` | 11 |
-| `ingestion` | `IngestionHandle` actor, `FeatureProducer` + registry, cadence producer, micro-batch/compaction | 20 |
-| `query` | DSL AST/parse/compile (B/F/J/P/Exclude), guardrails, `QueryEngine`, `run_sql_approved` | 12, 21 §4 |
-| `semantic` | `Profiler` (L0), `IntentRag` (L1), stub + HTTP LLM/embedding clients | 13 |
-| `ingress` | axum router, authN middleware, handlers, presign | 21, 70 |
-| `server` | `Engine::build` wiring + binary | 11, 21 |
+| Crate | 实现 | Spec |
+| ----- | ---- | ---- |
+| `core` | `Error`、`EngineConfig`、领域 DTO、`validate_ident`/`validate_feature_name`、`FreshnessRegistry` | 00, 10 |
+| `storage` | `Writer`（attach、DDL、写入）、`open_reader` | 10, 20 §4 |
+| `execution` | `Reader`、`QueryResult`、`value_to_json` | 11 |
+| `ingestion` | `IngestionHandle` actor、`FeatureProducer` + 注册表、cadence producer、微批/压缩 | 20 |
+| `query` | DSL AST/解析/编译（B/F/J/P/Exclude）、守卫、`QueryEngine`、`run_sql_approved` | 12, 21 §4 |
+| `semantic` | `Profiler`（L0）、`IntentRag`（L1）、stub + HTTP LLM/embedding 客户端 | 13 |
+| `ingress` | axum 路由、authN 中间件、handlers、presign | 21, 70 |
+| `server` | `Engine::build` 装配 + 二进制 | 11, 21 |
 
-## Rust gates (run before finishing a change)
+## Rust 门禁（改动完成前必须跑）
 
-Per [AGENTS.md](../AGENTS.md) § Toolchain & Build:
+按 [AGENTS.md](../AGENTS.md) § Toolchain & Build：
 
 ```sh
 cargo build --workspace
-cargo test --workspace --all-features      # 120 tests incl. the optional-feature suite
+cargo test --workspace --all-features      # 120 个测试，含可选 feature 套件
 cargo +nightly fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-make lint-boundary                          # strict boundary lint (see below)
+make lint-boundary                          # 严格边界 lint（见下）
 cargo doc --workspace --no-deps --all-features
 ```
 
-- **Boundary lint** (`make lint-boundary`): `-W clippy::unwrap_used
-  -W clippy::indexing_slicing -W clippy::panic -W clippy::expect_used` on the
-  lib surfaces of the five boundary crates (`ingress`, `query`, `storage`,
-  `semantic`, `ingestion`). Provably-safe indexing is rewritten defensively
-  (`get`/`get_mut`/destructuring) — never `#[allow]` without a justification
-  comment.
-- **No `unsafe`**: `#![forbid(unsafe_code)]` crate-wide.
-- **Docs**: `#![warn(missing_docs, missing_debug_implementations)]`; public
-  items carry `///` docs with `# Errors` sections.
-- **No `unwrap`/`expect`/`panic` on external input** — `?`, `match`,
-  `ok_or_else`, `Result`-returning parsers.
-- `cargo audit` / `cargo deny check` when dependencies change.
+- **边界 lint**（`make lint-boundary`）：对五个边界 crate（`ingress`、`query`、`storage`、`semantic`、`ingestion`）的 lib 表面启用 `-W clippy::unwrap_used -W clippy::indexing_slicing -W clippy::panic -W clippy::expect_used`。可证明安全的索引改写为防御式（`get`/`get_mut`/解构）——绝不无理由 `#[allow]`。
+- **无 `unsafe`**：全 crate `#![forbid(unsafe_code)]`。
+- **文档**：`#![warn(missing_docs, missing_debug_implementations)]`；公开项带 `///` 文档，含 `# Errors` 小节。
+- **外部输入上禁止 `unwrap`/`expect`/`panic`** —— 用 `?`、`match`、`ok_or_else`、返回 `Result` 的解析器。
+- 依赖变化时跑 `cargo audit` / `cargo deny check`。
 
-## Conventions (from AGENTS.md, abridged)
+## 约定（AGENTS.md 摘要）
 
-- Errors: `thiserror` enums (library) / `anyhow` (apps); `Result<T>` not
-  `Option<T>` for fallible paths; `#[source]` chaining.
-- Async: Tokio; **message passing over shared state** (channels, `DashMap`,
-  `ArcSwap`); never `Mutex<HashMap>`; handle task panics (`JoinSet`);
-  `async-trait` for object-safe `dyn` traits (documented at each trait).
-- Type design: newtypes for domain primitives, `NonZeroU32` where zero is
-  invalid, `#[non_exhaustive]` on library structs, `FromStr`/`TryFrom` for
-  parsing, `typed-builder` for >5-field builders.
-- Safety/security: validate at the boundary (byte caps, allowlists — identifiers
-  are `^[a-zA-Z0-9_]{1,64}$`, **no `-`**), parameterised SQL only, constant-time
-  comparisons (`subtle`), redacting `Debug` for anything carrying tokens/secrets
-  (with tests), structured `tracing` logging (never `println!`).
-- Serialization: `serde` + `rename_all = "camelCase"` + `deny_unknown_fields`;
-  strongly-typed DTOs (not `serde_json::Value`) unless the schema is truly
-  dynamic.
+- 错误：库用 `thiserror` 枚举 / app 用 `anyhow`；可失败路径返回 `Result<T>` 而非 `Option<T>`；`#[source]` 链式。
+- 异步：Tokio；**优先消息传递而非共享状态**（通道、`DashMap`、`ArcSwap`）；绝不 `Mutex<HashMap>`；处理任务 panic（`JoinSet`）；对象安全的 `dyn` trait 用 `async-trait`（各 trait 处注明原因）。
+- 类型设计：领域原语用 newtype，零值非法用 `NonZeroU32`，库结构体 `#[non_exhaustive]`，解析用 `FromStr`/`TryFrom`，超过 5 字段的 builder 用 `typed-builder`。
+- 安全：边界处校验（字节上限、allowlist —— 标识符为 `^[a-zA-Z0-9_]{1,64}$`，**不含 `-`**）；SQL 只用参数化；机密比较用常数时间（`subtle`）；任何携带 token/机密的结构体用脱敏 `Debug`（并带测试）；结构化 `tracing` 日志（绝不 `println!`）。
+- 序列化：`serde` + `rename_all = "camelCase"` + `deny_unknown_fields`；用强类型 DTO（除非 schema 真正动态，否则不用 `serde_json::Value`）。
 
-## Testing
+## 测试
 
-See [docs/testing.md](testing.md) for the strategy and the full scenario map.
-Short version:
+策略与完整场景映射见 [docs/testing.md](testing.md)。要点：
 
-- **REST-seam e2e** in `apps/server/tests/e2e.rs` (30 tests) — the spec-level
-  behavior seam, against a real DuckLake tmp catalogue.
-- **In-file unit tests** (`#[cfg(test)]`, `test_should_*`) for pure logic:
-  parser, compiler SQL shape (assert parameterised), guardrail verdicts,
-  freshness grading, presign, redaction, producer math.
-- Feature-gated tests (HTTP LLM via `wiremock`) run under
-  `--all-features`.
+- **REST-seam e2e**：`apps/server/tests/e2e.rs`（30 个测试）——规格级行为缝，针对真实 DuckLake 临时目录。
+- **文件内单测**（`#[cfg(test)]`、`test_should_*`）覆盖纯逻辑：解析器、编译器 SQL 形状（断言参数化）、守卫判定、新鲜度分级、presign、脱敏、producer 数学。
+- feature 门控测试（HTTP LLM 用 `wiremock`）在 `--all-features` 下运行。
 
-## Optional features
+## 可选 feature
 
-- `semantic-llm` (forwarded from `server`): real HTTP LLM/embedding clients
-  instead of the deterministic stubs. Build/test with
-  `--features semantic-llm`; the server warns and falls back to stubs if
-  `EngineConfig.llm` is set but the feature is off.
+- `semantic-llm`（由 `server` 转发）：真实 HTTP LLM/embedding 客户端取代确定性 stub。用 `--features semantic-llm` 构建/测试；若设置了 `EngineConfig.llm` 但 feature 关闭，server 会告警并回退到 stub。
 
-## Perf calibration
+## 性能校准
 
-`crates/query/examples/query_latency.rs` seeds a synthetic corpus
-(`CE_SCALE_ROWS`, default 50k) and reports B/F/J/P P50/P99 through the real
-engine: `make bench-queries`. Measured reality and the unblocking path are in
-[docs/research/perf-calibration.md](research/perf-calibration.md) — targets are
-**not met** at scale today (re-attach dominated).
+`crates/query/examples/query_latency.rs` 播种合成语料（`CE_SCALE_ROWS`，默认 50k），经真实引擎报告 B/F/J/P 的 P50/P99：`make bench-queries`。实测现状与解锁路径见 [docs/research/perf-calibration.md](research/perf-calibration.md) —— 目标**当前未在规模下达成**（re-attach 主导）。

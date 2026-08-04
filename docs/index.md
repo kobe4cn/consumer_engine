@@ -1,16 +1,15 @@
 # Docs Index — Consumer Engine
 
-Engineering documentation. Specs (the design contract) live in
-[../specs/](../specs/); research memos (prior art + spike evidence) live here.
+工程文档。设计契约（spec）在 [../specs/](../specs/)；研究备忘（先例 + spike 证据）在此目录。
 
-## Guides
+## 指南
 
-| Guide | What it covers |
-| ----- | -------------- |
-| [development.md](./development.md) | crate boundaries, toolchain, Rust gates, conventions, features |
-| [usage.md](./usage.md) | REST surface, DSL syntax, runnable walkthrough, error codes |
-| [testing.md](./testing.md) | testing strategy, commands, scenario map, coverage gaps |
-| [deployment.md](./deployment.md) | config reference, security checklist, operational notes, limits |
+| 指南 | 内容 |
+| ----- | ----- |
+| [development.md](./development.md) | crate 边界、工具链、Rust 门禁、约定、可选 feature |
+| [usage.md](./usage.md) | REST 面、DSL 语法、可运行走查、错误码 |
+| [testing.md](./testing.md) | 测试策略、命令、场景映射、覆盖缺口 |
+| [deployment.md](./deployment.md) | 配置参考、安全清单、运维注意、限制 |
 
 ## Research
 

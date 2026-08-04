@@ -1,93 +1,79 @@
 # Consumer Engine
 
-An **AI-agent-facing audience filtering engine** written in Rust: a marketing
-operator describes a target audience in plain language, an agent composes a
-structured DSL, and the engine compiles it to **guarded** DuckDB SQL over a
-**DuckLake** house, materialising versioned audience snapshots with audit +
-suppression.
+一个**面向 AI 代理的受众筛选引擎**（Rust 编写）：营销运营用自然语言描述目标受众，代理据此组合结构化 DSL，引擎将其编译为 DuckLake 之上的**受守卫的** DuckDB SQL，并物化为带审计 + 抑制的**版本化受众快照**。
 
-**Milestones M0–M5 are CLOSED** (see [specs/90-roadmap.md](specs/90-roadmap.md));
-the PRD and every child issue are closed. The v1 capability set:
+**里程碑 M0–M5 已全部关闭**（见 [specs/90-roadmap.md](specs/90-roadmap.md)）；PRD 及全部子 issue 均已关闭。v1 能力集：
 
-- **B** — Boolean/temporal-relational predicates over raw events.
-- **F** — predicates over a precomputed per-user Feature Store.
-- **J** — just-in-time derived metrics over the survivor set, under a measured
-  non-bypassable cap.
-- **P** — comparative characterisation of a segment vs the whole population.
-- **S** (phase 2) — similarity/lookalike, out of v1 scope.
+- **B** — 原始事件上的布尔/时间-关系谓词。
+- **F** — 预计算逐用户 **Feature Store** 上的谓词。
+- **J** — 幸存集上的即时派生指标，受**实测、不可绕过**的上限约束。
+- **P** — 段 vs 全量人群的对比画像。
+- **S**（阶段 2）— 相似度/相似人群，不在 v1 范围。
 
-## Quick start
+## 快速开始
 
 ```sh
-# build + test the whole workspace (all features incl. the optional HTTP LLM)
+# 构建 + 测试整个 workspace（含可选 HTTP LLM 的 all-features）
 cargo build --workspace
 cargo test --workspace --all-features
 
-# run the server (default config; no auth — dev only)
+# 启动服务（默认配置；无认证 —— 仅开发）
 cargo run -p consumer_engine-server
-# or with a config file:  cargo run -p consumer_engine-server -- --config config.yaml
+# 或指定配置文件：  cargo run -p consumer_engine-server -- --config config.yaml
 
-# boundary lint (no unwrap/indexing/panic/expect on the lib surfaces)
+# 边界 lint（lib 表面禁用 unwrap/indexing/panic/expect）
 make lint-boundary
 
-# query-latency calibration harness (scale via CE_SCALE_ROWS)
+# 查询延迟校准基准（规模用 CE_SCALE_ROWS 控制）
 make bench-queries
 ```
 
-Then talk to `http://127.0.0.1:8080`:
+然后访问 `http://127.0.0.1:8080`：
 
 ```sh
-# health
+# 健康检查
 curl localhost:8080/healthz
 
-# onboard a source table (auto-profiled into the semantic catalogue)
+# 注册数据源表（自动画像进语义目录）
 curl -X POST localhost:8080/sources/onboard -H 'content-type: application/json' -d '{
   "system":"erp","entity":"orders","columns":["user_id","sku"],
   "rows":[["u1","A"],["u2","B"]]}'
 
-# a DSL query — "users who bought SKU A"
+# DSL 查询 —— "购买过 SKU A 的用户"
 curl -X POST localhost:8080/query -H 'content-type: application/json' -d '{
   "dsl": {"source":{"system":"erp","entity":"orders"},"key":"user_id",
           "ops":[{"kind":"filter","predicate":{"column":"sku","op":"eq","value":"A"}}]}}'
 ```
 
-> **Production MUST set `auth_token`** — a tokenless engine lets any caller
-> mint presigned exports (IDOR). See [docs/deployment.md](docs/deployment.md).
+> **生产环境必须配置 `auth_token`** —— 无认证的引擎允许任何调用者签发 presigned 导出（IDOR）。见 [docs/deployment.md](docs/deployment.md)。
 
-## Documentation
+## 文档
 
-| What | Where |
-| ---- | ----- |
-| The design contract (PRD, data model, DSL AST, REST, security, budgets) | [specs/](specs/) — start at [specs/index.md](specs/index.md) |
-| Component guidance — develop / use / test / deploy | [docs/](docs/) — [docs/index.md](docs/index.md) |
-| Research memos (DuckLake spikes, CDC survey, perf calibration) | [docs/research/](docs/research/) |
-| Issue tracker (all v1 issues closed) | GitHub `kobe4cn/consumer_engine` |
-| Rust gate / lint / bench automation | [Makefile](Makefile) |
+| 内容 | 位置 |
+| ---- | ---- |
+| 设计契约（PRD、数据模型、DSL AST、REST、安全、预算） | [specs/](specs/) —— 从 [specs/index.md](specs/index.md) 开始 |
+| 组件指南 —— 开发 / 使用 / 测试 / 部署 | [docs/](docs/) —— [docs/index.md](docs/index.md) |
+| 研究备忘（DuckLake spike、CDC 调研、性能校准） | [docs/research/](docs/research/) |
+| Issue 追踪（v1 全部 issue 已关闭） | GitHub `kobe4cn/consumer_engine` |
+| Rust 门禁 / lint / 基准自动化 | [Makefile](Makefile) |
 
-## Workspace layout
+## Workspace 结构
 
 ```text
-crates/core         types, error model, config, domain primitives (dep root)
-crates/storage      the single writable DuckLake handle + table DDL/writers
-crates/execution    read-only DuckDB reader (single-threaded, channel-driven)
-crates/ingestion    the writer actor (Q1/Q2/Q3) + FeatureProducer + cadence
-crates/query        DSL AST/parser/compiler + B/F/J/P + guardrails + engine
-crates/semantic     L0 Profiler + L1 Intent RAG + LLM/embedding clients
-crates/ingress      axum REST: the single trust boundary (authN, validation)
-apps/server         binary wiring everything from EngineConfig
+crates/core        类型、错误模型、配置、领域原语（依赖根）
+crates/storage     唯一可写 DuckLake 句柄 + 表 DDL/写入器
+crates/execution   只读 DuckDB reader（单线程、通道驱动）
+crates/ingestion   写入 actor（Q1/Q2/Q3）+ FeatureProducer + cadence
+crates/query       DSL AST/解析/编译 + B/F/J/P + 守卫 + 引擎
+crates/semantic    L0 Profiler + L1 Intent RAG + LLM/embedding 客户端
+crates/ingress     axum REST：唯一信任边界（authN、校验）
+apps/server        用 EngineConfig 装配一切的二进制
 ```
 
-Dependency direction is acyclic with `core` at the root (specs/11 §2).
+依赖方向无环，`core` 在根（specs/11 §2）。
 
-## Status & known limitations
+## 现状与已知限制
 
-- **Performance targets are NOT met at scale**: measured B/F/J/P P50
-  2.5–15 s at 50k rows, dominated by the per-query DuckLake re-attach (P1-1).
-  Guardrail budgets stay as locked targets; the fix path (read-connection pool,
-  file-backed DuckLake) is tracked in
-  [docs/research/perf-calibration.md](docs/research/perf-calibration.md).
-- Deferred items are logged in
-  [specs/93-improvements-review.md](specs/93-improvements-review.md): snapshot
-  point-in-time bounding (T4-I3), catalogue freshness warning (T5-I5),
-  multi-tenant schema (T7c-TENANT — authN itself is implemented), CDC adapter
-  (P3-4), DuckDB server-side statement timeout (unavailable in this build).
+- **性能目标在规模下未达成**：实测 B/F/J/P P50 2.5–15 s（50k 行），主因是每次查询的 DuckLake 重新 attach（P1-1）。守卫预算保持为锁定目标；修复路径（读连接池、文件后端 DuckLake）跟踪于
+  [docs/research/perf-calibration.md](docs/research/perf-calibration.md)。
+- 延后项记录在 [specs/93-improvements-review.md](specs/93-improvements-review.md)：快照级 point-in-time（T4-I3）、目录新鲜度告警（T5-I5）、多租户 schema（T7c-TENANT —— authN 本身已实现）、CDC adapter（P3-4）、DuckDB 服务端语句超时（本 build 不可用）。
