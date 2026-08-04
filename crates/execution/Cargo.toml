@@ -18,3 +18,8 @@ flume.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+consumer_engine-storage.workspace = true
+tempfile = "3"
+tokio.workspace = true

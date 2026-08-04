@@ -32,6 +32,12 @@ pub struct EngineConfig {
     /// (specs/71 §4). `0` disables age-based flush.
     #[serde(default = "default_micro_batch_flush_age")]
     pub micro_batch_flush_age_secs: u64,
+    /// Read-pool cadence backstop: a pooled read worker re-attaches at least
+    /// this often even without writes, keeping its DuckLake attach warm
+    /// (specs/71 §3 freshness SLA; issue #20 — the primary refresh trigger is
+    /// the writer's generation bump, this bounds the no-write case).
+    #[serde(default = "default_read_refresh_interval")]
+    pub read_refresh_interval_secs: u64,
     /// Bind address for the REST ingress.
     #[serde(default = "default_bind")]
     pub bind: String,
@@ -72,6 +78,10 @@ const fn default_micro_batch_rows() -> u64 {
 
 const fn default_micro_batch_flush_age() -> u64 {
     30
+}
+
+const fn default_read_refresh_interval() -> u64 {
+    5
 }
 
 fn default_bind() -> String {
@@ -238,6 +248,7 @@ impl Default for EngineConfig {
             compaction_interval_secs: default_compaction_interval(),
             micro_batch_flush_rows: default_micro_batch_rows(),
             micro_batch_flush_age_secs: default_micro_batch_flush_age(),
+            read_refresh_interval_secs: default_read_refresh_interval(),
             bind: default_bind(),
             guardrails: GuardrailConfig::default(),
             suppression: SuppressionRules::default(),

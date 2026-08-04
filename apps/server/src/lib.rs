@@ -49,10 +49,16 @@ impl Engine {
     /// # Errors
     /// Propagates storage/execution/ingestion setup errors.
     pub fn build(config: &EngineConfig) -> Result<(Router, Engine)> {
-        let writer = Writer::attach_with_compaction(
+        // Shared write generation (issue #20 / P1-1): the single writer bumps
+        // it after every committed write; the pooled readers re-attach only
+        // when it advances — the hot path is attach-free, and readers never
+        // serve stale data after a commit.
+        let write_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = Writer::attach_with_gen(
             &config.catalog_path,
             &config.data_path,
             &config.compaction,
+            Some(Arc::clone(&write_gen)),
         )?;
         // Initialise the materialise schema up front so read-only `snapshot_meta`
         // queries never hit a missing `audience_snapshot` table before the first
@@ -67,13 +73,29 @@ impl Engine {
         // path creates it lazily too, but a startup init keeps Exclude reads
         // clean on a fresh engine).
         writer.ensure_suppression_table()?;
-        let read_conn = storage::open_reader(&config.catalog_path, &config.data_path)?;
         let attach_sql = storage::read_only_attach_sql(&config.catalog_path, &config.data_path);
         let limits = ReaderLimits {
             memory_limit: config.guardrails.memory_limit.clone(),
             threads: config.guardrails.threads,
         };
-        let reader = Reader::start(read_conn, attach_sql, limits)?;
+        // Read pool (specs/11 §2a): one read-only worker per guardrail thread,
+        // refreshed on the writer's generation bump (P1-1, issue #20) with the
+        // cadence as a warm-connection backstop.
+        let workers = config.guardrails.threads.max(1);
+        let mut conns = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            conns.push(storage::open_reader(
+                &config.catalog_path,
+                &config.data_path,
+            )?);
+        }
+        let reader = Reader::start_pooled(
+            conns,
+            attach_sql,
+            limits,
+            Some(Arc::clone(&write_gen)),
+            Duration::from_secs(config.read_refresh_interval_secs),
+        )?;
 
         // Graded per-source freshness registry (D5).
         let freshness = Arc::new(FreshnessRegistry::new());

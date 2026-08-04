@@ -76,14 +76,15 @@ Findings:
 
 ## Locked decisions (feed specs/92 Phase 1 / issue #20)
 
-1. **Read pool = K connections, wall-clock cadence refresh.** K = physical
-   cores (analytic default; validate at scale in #20), each attached read-only
-   once at startup, re-attached in the background every T seconds (default
-   5 s, aligned with the 71 §2 CDC freshness SLA). Queries borrow the freshest
-   idle connection; per-query attach cost → 0; freshness lag ≤ T. With
-   26 ms/attach and T = 5 s the background cost is ~0.5 % of one core. A lazy
-   dirty-check refresh is **rejected with data** (finding 2: neither
-   snapshots-from-pinned-attach nor catalog mtime signals a commit).
+1. **Read pool = K connections, refresh on the writer's generation, cadence
+   backstop.** K = physical cores (validated in #20), each attached read-only
+   once at startup. The original spike concluded "refresh must be wall-clock
+   cadence driven" because no **reader-side** dirty signal exists; the shipped
+   design refines this by making the **single writer** (D3) the signal source —
+   an `AtomicU64` generation bumped after every committed write, so a worker
+   re-attaches exactly when the catalog changed (zero staleness, zero
+   steady-state attach cost), with the 5 s cadence kept as a connection-warmth
+   backstop. See the shipped-numbers table below.
 2. **EXPLAIN pre-flight unchanged (保留).** B/F/J measured at 0.6–0.8 ms
    (0.08–0.15× of exec) — noise; it keeps the row estimate driving sync/async
    mode selection and the row-budget guardrail. Revisit only at 1M+ rows.
@@ -94,11 +95,39 @@ Findings:
    ~ms. (This change landed in the spike as a measurement-correcting fix; its
    behavior is pinned by the multi-chunk storage tests.)
 
+## Read pool shipped (issue #20, 2025-08) — numbers at 50k rows
+
+The pool landed as a **refinement of decision 1 above**: refresh is driven by
+an `AtomicU64` **write generation** the single writer bumps after every
+committed write (the reliable commit signal the spike found no reader-side
+proxy for), with the 5 s cadence demoted to a connection-warmth backstop. This
+preserves write→query immediacy (pure cadence would serve stale rows right
+after a commit) while keeping the hot path attach-free in steady state.
+
+`bench` (`query_latency`, production path: pooled reader + generation):
+
+| type | before pool (ms) | after pool p50 (ms) | p99 (ms) |
+| ---- | ---------------- | ------------------- | -------- |
+| B (filter)      | 115.7 | **10.65** | 138.6 |
+| F (feature)     | 158.9 | **11.89** | 24.1 |
+| J (derive)      | 160.9 | **21.10** | 184.5 |
+| P (characterize)| 183.2 | **36.53** | 41.6 |
+
+5–13× faster; **P50 < 1 s / P99 < 5 s met at 50k rows with 2–3 orders of
+magnitude of headroom** (the exec floor is 5–10 ms; the residual is the
+EXPLAIN pre-flight + catalogue probes, now attach-free). Re-run at
+`CE_SCALE_ROWS=50000000` on the file-backed attach to re-lock the guardrail
+numbers (still open — bench-gate #25 will CI-enforce the ≤ 1 s budget).
+
+Pool details: `consumer_engine-execution::Reader::start_pooled(conns, …,
+write_gen, interval)`; workers re-attach only when the generation advances or
+`interval` elapses. `Reader::start` (no generation) keeps the per-query refresh
+for standalone/test readers. K = physical cores (specs/11 §2a).
+
 ## What unlocks the targets (later phase, tracked)
 
-1. **Read pool (issue #20, per the locked design above)**: removes the
-   remaining 3–5 attach costs per query — expect B/F/J/P full path at 50k rows
-   to drop from ~115–180 ms toward the ~5–10 ms exec floor.
+1. ~~Read pool (issue #20)~~ — **done**: 50k-row full-path P50 is now 11–37 ms
+   (see the table above); the residual is EXPLAIN + probes, not attach.
 2. **File-backed DuckLake attach** with real parallel Parquet scan (the dev
    in-memory attach inlines the catalog; at 50M users seeding itself is the
    bottleneck).

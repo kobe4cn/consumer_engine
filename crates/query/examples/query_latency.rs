@@ -40,8 +40,17 @@ fn main() {
     println!("seeding corpus of {scale} rows ({users} users)...");
 
     let tmp = tempfile::tempdir().expect("tmp");
-    let writer = Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data"))
-        .expect("attach writer");
+    // The bench measures the production read path (issue #20 / P1-1): the
+    // writer bumps a shared generation after every committed write, and the
+    // pooled readers re-attach only when it advances — no per-query attach.
+    let write_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let writer = Writer::attach_with_gen(
+        &tmp.path().join("cat.db"),
+        &tmp.path().join("data"),
+        &consumer_engine_core::CompactionConfig::default(),
+        Some(std::sync::Arc::clone(&write_gen)),
+    )
+    .expect("attach writer");
 
     // A corpus of orders: `user_id` (pseudonymous), `ts` (ISO-8601), `amount`
     // (numeric as VARCHAR — raw tables are VARCHAR), `category`.
@@ -103,14 +112,30 @@ fn main() {
 
     let ingestion =
         IngestionHandle::start(writer, Arc::new(ProducerRegistry::new())).expect("ingestion");
-    let read_conn =
-        consumer_engine_storage::open_reader(&tmp.path().join("cat.db"), &tmp.path().join("data"))
-            .expect("read attach");
     let attach_sql = consumer_engine_storage::read_only_attach_sql(
         &tmp.path().join("cat.db"),
         &tmp.path().join("data"),
     );
-    let reader = Reader::start(read_conn, attach_sql, ReaderLimits::default()).expect("reader");
+    // Read pool: one read-only worker per physical core, refreshed on the
+    // writer's generation bump (the production wiring, specs/11 §2a).
+    let workers = ReaderLimits::default().threads.max(1);
+    let conns: Vec<duckdb::Connection> = (0..workers)
+        .map(|_| {
+            consumer_engine_storage::open_reader(
+                &tmp.path().join("cat.db"),
+                &tmp.path().join("data"),
+            )
+            .expect("read attach")
+        })
+        .collect();
+    let reader = Reader::start_pooled(
+        conns,
+        attach_sql,
+        ReaderLimits::default(),
+        Some(write_gen),
+        std::time::Duration::from_secs(5),
+    )
+    .expect("reader");
     let engine = QueryEngine::new(
         reader,
         ingestion.clone(),

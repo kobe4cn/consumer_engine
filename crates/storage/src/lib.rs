@@ -13,7 +13,13 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use consumer_engine_core::{
     BoxError, CatalogRow, Error, FeatureRow, READ_ONLY_CATALOG_ALIAS, Result, SnapshotSpec,
@@ -48,6 +54,11 @@ pub struct Writer {
     /// Held until drop; releases the exclusive catalog lock.
     #[allow(clippy::disallowed_types)]
     _lock: std::fs::File,
+    /// Advanced after every successful write (issue #20 / P1-1): the read
+    /// pool's `OnWrite` refresh policy re-attaches a worker only when this
+    /// changes — the single writer (D3) is the reliable commit signal the
+    /// spike found no reader-side proxy for.
+    write_gen: Option<Arc<AtomicU64>>,
 }
 
 impl std::fmt::Debug for Writer {
@@ -128,7 +139,37 @@ impl Writer {
         Ok(Self {
             conn,
             _lock: lock_file,
+            write_gen: None,
         })
+    }
+
+    /// Like [`Self::attach_with_compaction`] but wired to a shared write
+    /// generation counter: every successful write bumps it, so a read pool
+    /// running the `OnWrite` refresh policy (issue #20 / P1-1) re-attaches
+    /// exactly when the catalog changed. Pass the same `Arc` to
+    /// `consumer_engine_execution::Reader::start_pooled`.
+    ///
+    /// # Errors
+    /// - [`Error::WriterAlreadyHeld`] if the catalog is already locked.
+    /// - [`Error::Storage`] if DuckDB/DuckLake attach or the compaction SET fails.
+    pub fn attach_with_gen(
+        catalog_path: &Path,
+        data_path: &Path,
+        compaction: &consumer_engine_core::CompactionConfig,
+        write_gen: Option<Arc<AtomicU64>>,
+    ) -> Result<Self> {
+        let mut writer = Self::attach_with_compaction(catalog_path, data_path, compaction)?;
+        writer.write_gen = write_gen;
+        Ok(writer)
+    }
+
+    /// Record a committed write: advance the shared generation so pooled
+    /// readers re-attach on their next query. Called after every successful
+    /// write; harmless if no counter is wired.
+    fn bump_write(&self) {
+        if let Some(g) = &self.write_gen {
+            g.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Create the `feature_store` table if absent. No PRIMARY KEY — DuckLake
@@ -211,6 +252,7 @@ impl Writer {
                 ])
                 .map_err(|e| Error::Storage(BoxError::from(e)))?;
         }
+        self.bump_write();
         Ok(written)
     }
 
@@ -232,7 +274,7 @@ impl Writer {
                 .map_err(|e| Error::InvalidInput(format!("producer_id: {e}")))?;
         }
         self.ensure_feature_store_table()?;
-        insert_chunked(
+        let n = insert_chunked(
             &self.conn,
             &format!("INSERT INTO {WRITE_CATALOG_ALIAS}.feature_store VALUES "),
             5,
@@ -246,7 +288,8 @@ impl Writer {
                     Value::Text(r.producer_id.clone()),
                 ]
             },
-        )
+        )?;
+        Ok(n)
     }
 
     /// Append catalog rows to `semantic_catalog`. The embedding is written via a
@@ -312,6 +355,7 @@ impl Writer {
                 .execute(duckdb::params_from_iter(params.iter()))
                 .map_err(|e| Error::Storage(BoxError::from(e)))?;
         }
+        self.bump_write();
         Ok(written)
     }
 
@@ -357,6 +401,7 @@ impl Writer {
                 self.conn
                     .execute_batch("COMMIT")
                     .map_err(|e| Error::Storage(BoxError::from(e)))?;
+                self.bump_write();
                 Ok(n)
             }
             Err(e) => {
@@ -484,7 +529,7 @@ impl Writer {
         if rows.is_empty() {
             return Ok(0);
         }
-        insert_chunked(
+        let n = insert_chunked(
             &self.conn,
             &format!("INSERT INTO {WRITE_CATALOG_ALIAS}.{table} ({cols_names}) VALUES "),
             columns.len(),
@@ -497,7 +542,9 @@ impl Writer {
                     })
                     .collect()
             },
-        )
+        )?;
+        self.bump_write();
+        Ok(n)
     }
 
     /// Upsert a dimension batch by `key` (specs/20 §4): rows are **deduplicated
@@ -594,6 +641,7 @@ impl Writer {
                 .execute(duckdb::params_from_iter(params))
                 .map_err(|e| Error::Storage(BoxError::from(e)))?;
         }
+        self.bump_write();
         Ok(affected)
     }
 
@@ -637,6 +685,7 @@ impl Writer {
                 .execute(duckdb::params_from_iter(params))
                 .map_err(|e| Error::Storage(BoxError::from(e)))?;
         }
+        self.bump_write();
         Ok(affected)
     }
 
@@ -659,6 +708,7 @@ impl Writer {
         self.conn
             .execute_batch(&sql)
             .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        self.bump_write();
         Ok(())
     }
 
@@ -714,6 +764,7 @@ impl Writer {
             .conn
             .execute(&sql, duckdb::params_from_iter(params.iter()))
             .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        self.bump_write();
         Ok(n as u64)
     }
 

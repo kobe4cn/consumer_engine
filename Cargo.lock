@@ -520,10 +520,13 @@ name = "consumer_engine-execution"
 version = "0.1.0"
 dependencies = [
  "consumer_engine-core",
+ "consumer_engine-storage",
  "duckdb",
  "flume",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
