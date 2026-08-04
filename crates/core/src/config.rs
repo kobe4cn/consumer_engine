@@ -56,12 +56,17 @@ pub struct EngineConfig {
     /// DuckLake compaction tuning (specs/71 §4, spike-microbatch-compaction).
     #[serde(default)]
     pub compaction: CompactionConfig,
-    /// Bearer auth token protecting every route except /healthz and /readyz
-    /// (specs/21 I1). `None` leaves the engine unauthenticated — development
-    /// convenience only; production deployments MUST set it (a tokenless engine
-    /// lets any caller mint presigned exports, IDOR).
+    /// Bearer auth token for the engine's own tenant (specs/21 I1). `None`
+    /// leaves the engine unauthenticated — development convenience only;
+    /// production deployments MUST set it (a tokenless engine lets any caller
+    /// mint presigned exports, IDOR).
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Additional tenants with their own bearer tokens (issue #22): each
+    /// resolves to a distinct `tenant_id`, so data, snapshots and suppression
+    /// are isolated per tenant by construction (specs/21 I2).
+    #[serde(default)]
+    pub tenants: Vec<TenantCredentials>,
     /// Token that authorises the raw-SQL escape hatch (specs/21 §4 E2):
     /// `POST /query { sql, approvalToken }` runs only with a matching token,
     /// under the same guardrails, always audit-logged. `None` disables the
@@ -274,6 +279,7 @@ impl Default for EngineConfig {
             suppression: SuppressionRules::default(),
             compaction: CompactionConfig::default(),
             auth_token: None,
+            tenants: Vec::new(),
             sql_approval_token: None,
             llm: None,
         }
@@ -337,6 +343,16 @@ data_path: /tmp/data
         let res = EngineConfig::from_yaml_str(yaml);
         assert!(res.is_err(), "deny_unknown_fields must reject bogus");
     }
+}
+
+/// A tenant's credentials: the bearer token that resolves to `id` (issue #22).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TenantCredentials {
+    /// The tenant id stamped on the tenant's rows and injected into its queries.
+    pub id: String,
+    /// The bearer token that authenticates as this tenant.
+    pub token: String,
 }
 
 /// HTTP LLM/embedding service configuration (spec 13 §4). When set, the server

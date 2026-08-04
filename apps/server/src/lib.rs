@@ -175,12 +175,23 @@ impl Engine {
         let materialise_slots = Arc::new(tokio::sync::Semaphore::new(
             config.guardrails.threads.max(1),
         ));
-        // Bearer authN: hash the configured token once; the middleware compares
-        // hashes in constant time (AGENTS.md § Crypto).
+        // Bearer authN: hash the configured tokens once; the middleware
+        // compares hashes in constant time and resolves the caller's tenant
+        // (AGENTS.md § Crypto, issue #22).
         let auth_token_hash = config
             .auth_token
             .as_deref()
             .map(|t| Arc::new(consumer_engine_ingress::auth::hash_token(t)));
+        let tenants: Vec<(String, [u8; 32])> = config
+            .tenants
+            .iter()
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    consumer_engine_ingress::auth::hash_token(&t.token),
+                )
+            })
+            .collect();
         let sql_approval_hash = config
             .sql_approval_token
             .as_deref()
@@ -195,6 +206,8 @@ impl Engine {
             materialise_slots,
             signing_key: Arc::new(signing_key),
             auth_token_hash,
+            tenants,
+            default_tenant: config.tenant_id.clone(),
             sql_approval_hash,
         };
         let router = router(state);

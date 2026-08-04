@@ -16,14 +16,14 @@ use std::{
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
 };
 use consumer_engine_core::validate_ident;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::{ApiError, AppState};
+use crate::{ApiError, AppState, Tenant};
 
 /// How long a finished/expired job stays in the registry before it is dropped
 /// on the next poll. Bounds the registry so it cannot grow without limit
@@ -146,6 +146,7 @@ pub struct JobResponse {
 /// materialise work under a concurrency cap, and return `202 { jobId }`.
 pub async fn post_jobs(
     State(st): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
     Json(req): Json<JobsRequest>,
 ) -> Result<(StatusCode, Json<JobsResponse>), ApiError> {
     validate_ident(&req.materialize.campaign_id)?;
@@ -180,7 +181,12 @@ pub async fn post_jobs(
         let qe_inner = qe.clone();
         let q_owned = q;
         let camp_inner = campaign_id.clone();
-        let inner = tokio::spawn(async move { qe_inner.materialize(&q_owned, &camp_inner).await });
+        let tenant_inner = tenant.clone();
+        let inner = tokio::spawn(async move {
+            qe_inner
+                .materialize(&q_owned, &camp_inner, &tenant_inner)
+                .await
+        });
         match inner.await {
             Ok(Ok(snapshot)) => jobs.set_done(&job_id, snapshot),
             Ok(Err(e)) => jobs.set_failed(&job_id, e.to_string()),

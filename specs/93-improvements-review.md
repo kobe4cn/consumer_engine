@@ -381,3 +381,14 @@ Append-only.
 - **Fix shape (upstream)**: re-enable `Writer::expire_snapshots` /
   `delete_orphaned_files` after a DuckLake upgrade that binds TSTZ procedure
   parameters; the capability probe flips automatically (issue #17 stays OPEN).
+
+### GC-FRESHNESS-TENANT — freshness registry is tenant-agnostic (by design, #22 scope)
+
+- **Citation**: `crates/core/src/freshness.rs` (`FreshnessRegistry` keyed by
+  `{system}.{entity}` only); engine `enforce_catalogue` uses it for the I5
+  staleness warn.
+- **Finding**: two tenants ingesting the same source name share one epoch →
+  a cross-tenant `lagSeconds`/stale-catalogue signal. Observability-only (no
+  data leak; the compiler's tenant filter is the isolation boundary).
+- **Fix shape (later)**: key the registry by `(tenant, system, entity)` and
+  thread the tenant into the freshness label + staleness check.

@@ -23,6 +23,42 @@ async fn spawn() -> String {
     spawn_guardrails(consumer_engine_core::GuardrailConfig::default()).await
 }
 
+/// Spawn the engine with two tenants (`tenant_a`/`tenant_b`) behind their own
+/// bearer tokens (issue #22 / AC6): all routes require a matching token, and
+/// each token resolves to its tenant.
+async fn spawn_two_tenants() -> String {
+    use consumer_engine_core::TenantCredentials;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let cfg = EngineConfig {
+        catalog_path: tmp.path().join("cat.db"),
+        data_path: tmp.path().join("data"),
+        compaction_interval_secs: 0,
+        micro_batch_flush_rows: 1,
+        tenants: vec![
+            TenantCredentials {
+                id: "tenant_a".into(),
+                token: "TOKEN_A".into(),
+            },
+            TenantCredentials {
+                id: "tenant_b".into(),
+                token: "TOKEN_B".into(),
+            },
+        ],
+        ..EngineConfig::default()
+    };
+    let (router, engine) = Engine::build(&cfg).expect("build engine");
+    std::mem::forget(engine);
+    std::mem::forget(tmp);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{addr}")
+}
+
 /// Onboard a source table; asserts the ingest succeeds.
 async fn onboard(
     client: &reqwest::Client,
@@ -1894,5 +1930,195 @@ async fn test_should_run_approved_raw_sql_escape_hatch() {
     assert!(
         !resp.status().is_success(),
         "hatch must stay closed by default"
+    );
+}
+
+#[tokio::test]
+async fn test_should_isolate_tenants_by_construction() {
+    // Issue #22 / PRD AC6: tenant-B cannot read tenant-A's data, snapshots or
+    // suppression — the compiler injects the caller's tenant into every SQL
+    // (never caller-supplied filtering), and /audience + presigned exports are
+    // tenant-scoped (IDOR closed).
+    let base = spawn_two_tenants().await;
+    let client_with = |token: &str| {
+        reqwest::Client::builder()
+            .default_headers(reqwest::header::HeaderMap::from_iter([(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(token).expect("header value"),
+            )]))
+            .build()
+            .expect("client")
+    };
+    let client_a = client_with("Bearer TOKEN_A");
+    let client_b = client_with("Bearer TOKEN_B");
+
+    // Tenant A onboards data + a suppression writeback.
+    let resp = client_a
+        .post(format!("{base}/sources/onboard"))
+        .json(&serde_json::json!({
+            "system": "erp", "entity": "orders",
+            "columns": ["user_id", "sku"],
+            "rows": [["u1", "A"], ["u2", "A"]]
+        }))
+        .send()
+        .await
+        .expect("onboard a");
+    assert!(
+        resp.status().is_success(),
+        "tenant A onboard: {}",
+        resp.status()
+    );
+    // Tenant B onboards its OWN row to the same table (so cross-tenant
+    // suppression assertions are meaningful — B has data that must survive
+    // A's writebacks).
+    let resp = client_b
+        .post(format!("{base}/sources/onboard"))
+        .json(&serde_json::json!({
+            "system": "erp", "entity": "orders",
+            "columns": ["user_id", "sku"],
+            "rows": [["u_b1", "A"]]
+        }))
+        .send()
+        .await
+        .expect("onboard b");
+    assert!(
+        resp.status().is_success(),
+        "tenant B onboard: {}",
+        resp.status()
+    );
+    let resp = client_a
+        .post(format!("{base}/suppression"))
+        .json(&serde_json::json!({
+            "suppressionId": "11111111-2222-3333-4444-555555555555",
+            "campaignId": "c1", "userId": "u1", "channel": "email",
+            "action": "delivered", "occurredTs": "2025-01-01T00:00:00Z"
+        }))
+        .send()
+        .await
+        .expect("suppression a");
+    assert!(
+        resp.status().is_success(),
+        "tenant A suppression: {}",
+        resp.status()
+    );
+
+    // Tenant B queries the same shape: only B's own row (the compiler injects
+    // B's tenant into the SQL — A's rows are invisible by construction).
+    let dsl = serde_json::json!({
+        "source": {"system":"erp","entity":"orders"}, "key": "user_id",
+        "ops": [{"kind":"filter","predicate":{"column":"sku","op":"eq","value":"A"}}]
+    });
+    let resp = client_b
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({ "dsl": dsl.clone() }))
+        .send()
+        .await
+        .expect("query b");
+    assert!(
+        resp.status().is_success(),
+        "tenant B query: {}",
+        resp.status()
+    );
+    let v: Value = resp.json().await.expect("json");
+    let users_b = v["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r.as_array().and_then(|c| c.first()).and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        users_b,
+        vec!["u_b1"],
+        "tenant B must see ONLY its own row (compiler-injected tenant filter): {v}"
+    );
+    // Tenant A sees its own rows.
+    let resp = client_a
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({ "dsl": dsl.clone() }))
+        .send()
+        .await
+        .expect("query a");
+    let v: Value = resp.json().await.expect("json");
+    assert_eq!(v["count"], 2, "tenant A sees its own rows: {v}");
+
+    // A's suppression excludes u1 for A only; B's Exclude is unaffected.
+    let exclude = serde_json::json!({
+        "source": {"system":"erp","entity":"orders"}, "key": "user_id",
+        "ops": [{"kind":"exclude","campaignId":"c1"}]
+    });
+    let resp = client_a
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({ "dsl": exclude.clone() }))
+        .send()
+        .await
+        .expect("exclude a");
+    let v: Value = resp.json().await.expect("json");
+    let users_a = v["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r.as_array().and_then(|c| c.first()).and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(
+        !users_a.contains(&"u1"),
+        "tenant A's suppression must exclude u1 for A: {users_a:?}"
+    );
+    let resp = client_b
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({ "dsl": exclude }))
+        .send()
+        .await
+        .expect("exclude b");
+    let v: Value = resp.json().await.expect("json");
+    let users_b = v["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter_map(|r| r.as_array().and_then(|c| c.first()).and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        users_b,
+        vec!["u_b1"],
+        "tenant B's Exclude must be unaffected by A's suppression (B's own row survives): \
+         {users_b:?}"
+    );
+
+    // IDOR: A materialises a snapshot; B cannot read it (404) nor export it.
+    let resp = client_a
+        .post(format!("{base}/jobs"))
+        .json(&serde_json::json!({
+            "dsl": dsl,
+            "materialize": {"campaignId": "c1"}
+        }))
+        .send()
+        .await
+        .expect("jobs a");
+    assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+    let job: Value = resp.json().await.expect("job json");
+    let job_id = job["jobId"].as_str().expect("jobId").to_string();
+    let status = poll_until_done(&client_a, &base, &job_id).await;
+    let snap = status["snapshotId"]
+        .as_str()
+        .expect("snapshotId")
+        .to_string();
+    let resp = client_b
+        .get(format!("{base}/audience/{snap}"))
+        .send()
+        .await
+        .expect("b reads a's snapshot");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "tenant B must not read tenant A's snapshot (IDOR closed)"
+    );
+    let resp = client_a
+        .get(format!("{base}/audience/{snap}"))
+        .send()
+        .await
+        .expect("a reads own snapshot");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "tenant A reads its own"
     );
 }

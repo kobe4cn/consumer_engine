@@ -145,6 +145,7 @@ fn main() {
                             Some("B".into()),
                         ],
                     ],
+                    "default",
                 )
                 .await
         })
@@ -206,6 +207,7 @@ fn main() {
                         Some("3".into()),
                         Some("C".into()),
                     ]],
+                    "default",
                 )
                 .await
         })
@@ -266,7 +268,10 @@ fn main() {
         let q = parse::parse(dsl.clone()).expect("parse");
         let full = runtime.block_on(async {
             time_ns_async(samples_full, || async {
-                let _ = engine.run(dsl.clone()).await.expect("engine.run");
+                let _ = engine
+                    .run(dsl.clone(), "default")
+                    .await
+                    .expect("engine.run");
             })
             .await
         });
@@ -285,6 +290,7 @@ fn main() {
                         READ_ONLY_CATALOG_ALIAS,
                         &SuppressionRules::default(),
                         Some(users as u64),
+                        "default",
                     ),
                 )
                 .expect("compile J"),

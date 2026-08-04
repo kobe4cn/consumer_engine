@@ -213,7 +213,10 @@ fn main() {
 /// latency worth calibrating).
 async fn sample(engine: &QueryEngine, dsl: &serde_json::Value, n: usize) -> Vec<Duration> {
     // Warm-up: one run, assert a non-empty result.
-    let warm = engine.run(dsl.clone()).await.expect("warm-up query");
+    let warm = engine
+        .run(dsl.clone(), "default")
+        .await
+        .expect("warm-up query");
     assert!(
         !warm.rows.is_empty(),
         "warm-up query returned no rows — the calibration would be meaningless"
@@ -221,7 +224,7 @@ async fn sample(engine: &QueryEngine, dsl: &serde_json::Value, n: usize) -> Vec<
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let t = Instant::now();
-        let res = engine.run(dsl.clone()).await.expect("query");
+        let res = engine.run(dsl.clone(), "default").await.expect("query");
         assert!(
             !res.rows.is_empty(),
             "query returned no rows during sampling"

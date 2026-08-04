@@ -42,6 +42,8 @@ enum Cmd {
         columns: Vec<String>,
         /// Rows of optional string cells.
         rows: Vec<Vec<Option<String>>>,
+        /// The caller's tenant, stamped on every row (issue #22).
+        tenant: String,
         /// Reply channel carrying the inserted row count.
         reply: flume::Sender<Result<usize>>,
     },
@@ -66,6 +68,8 @@ enum Cmd {
         key_column: String,
         /// The snapshot's scalar row payload.
         spec: SnapshotSpec,
+        /// The caller's tenant, stamped on the snapshot (issue #22).
+        tenant: String,
         /// Reply channel carrying the inserted row count.
         reply: flume::Sender<Result<u64>>,
     },
@@ -92,6 +96,8 @@ enum Cmd {
         key: String,
         /// Rows of optional string cells.
         rows: Vec<Vec<Option<String>>>,
+        /// The caller's tenant, stamped on every row (issue #22).
+        tenant: String,
         /// Reply channel carrying the rows affected.
         reply: flume::Sender<Result<usize>>,
     },
@@ -105,6 +111,8 @@ enum Cmd {
         key: String,
         /// Key values to delete.
         keys: Vec<String>,
+        /// The caller's tenant — deletes are tenant-scoped (issue #22).
+        tenant: String,
         /// Reply channel carrying the rows affected.
         reply: flume::Sender<Result<usize>>,
     },
@@ -113,6 +121,8 @@ enum Cmd {
     WriteFeatures {
         /// The feature rows to append.
         rows: Vec<FeatureRow>,
+        /// The caller's tenant, stamped on every row (issue #22).
+        tenant: String,
         /// Reply channel carrying the inserted row count.
         reply: flume::Sender<Result<usize>>,
     },
@@ -120,6 +130,8 @@ enum Cmd {
     WriteCatalog {
         /// The catalog rows to append.
         rows: Vec<CatalogRow>,
+        /// The caller's tenant, stamped on every row (issue #22).
+        tenant: String,
         /// Reply channel carrying the inserted row count.
         reply: flume::Sender<Result<usize>>,
     },
@@ -127,6 +139,8 @@ enum Cmd {
     WriteSuppression {
         /// The suppression rows to append (deduped by `suppression_id`).
         rows: Vec<SuppressionRow>,
+        /// The caller's tenant, stamped on every row (issue #22).
+        tenant: String,
         /// Reply channel carrying the inserted row count.
         reply: flume::Sender<Result<usize>>,
     },
@@ -185,11 +199,14 @@ impl Default for MicroBatchConfig {
     }
 }
 
-/// A not-yet-flushed raw batch for one `(system, entity)`, with its shape and
-/// buffering start time (decision D6).
+/// A not-yet-flushed raw batch for one `(tenant, system, entity)`, with its
+/// shape, its owning tenant, and buffering start time (decision D6). The tenant
+/// is part of the KEY (issue #22): interleaved tenants' rows never merge into
+/// one batch, so a flush can never stamp one tenant's rows with another's.
 struct PendingBatch {
     columns: Vec<String>,
     rows: Vec<Vec<Option<String>>>,
+    tenant: String,
     since: std::time::Instant,
 }
 
@@ -242,6 +259,7 @@ impl IngestionHandle {
         entity: &str,
         columns: Vec<String>,
         rows: Vec<Vec<Option<String>>>,
+        tenant: &str,
     ) -> Result<usize> {
         let (rtx, rrx) = flume::bounded(1);
         self.tx
@@ -250,6 +268,7 @@ impl IngestionHandle {
                 entity: entity.to_string(),
                 columns,
                 rows,
+                tenant: tenant.to_string(),
                 reply: rtx,
             })
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
@@ -291,6 +310,7 @@ impl IngestionHandle {
         subquery_params: Vec<Value>,
         key_column: &str,
         spec: SnapshotSpec,
+        tenant: &str,
     ) -> Result<u64> {
         let (rtx, rrx) = flume::bounded(1);
         self.tx
@@ -299,6 +319,7 @@ impl IngestionHandle {
                 subquery_params,
                 key_column: key_column.to_string(),
                 spec,
+                tenant: tenant.to_string(),
                 reply: rtx,
             })
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
@@ -331,10 +352,14 @@ impl IngestionHandle {
     ///
     /// # Errors
     /// Propagates validation/storage errors from the writer.
-    pub async fn write_features(&self, rows: Vec<FeatureRow>) -> Result<usize> {
+    pub async fn write_features(&self, rows: Vec<FeatureRow>, tenant: &str) -> Result<usize> {
         let (rtx, rrx) = flume::bounded(1);
         self.tx
-            .send(Cmd::WriteFeatures { rows, reply: rtx })
+            .send(Cmd::WriteFeatures {
+                rows,
+                tenant: tenant.to_string(),
+                reply: rtx,
+            })
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
         rrx.recv_async()
             .await
@@ -345,10 +370,14 @@ impl IngestionHandle {
     ///
     /// # Errors
     /// Propagates validation/storage errors from the writer.
-    pub async fn write_catalog(&self, rows: Vec<CatalogRow>) -> Result<usize> {
+    pub async fn write_catalog(&self, rows: Vec<CatalogRow>, tenant: &str) -> Result<usize> {
         let (rtx, rrx) = flume::bounded(1);
         self.tx
-            .send(Cmd::WriteCatalog { rows, reply: rtx })
+            .send(Cmd::WriteCatalog {
+                rows,
+                tenant: tenant.to_string(),
+                reply: rtx,
+            })
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
         rrx.recv_async()
             .await
@@ -360,10 +389,18 @@ impl IngestionHandle {
     ///
     /// # Errors
     /// Propagates storage errors from the writer.
-    pub async fn write_suppression(&self, rows: Vec<SuppressionRow>) -> Result<usize> {
+    pub async fn write_suppression(
+        &self,
+        rows: Vec<SuppressionRow>,
+        tenant: &str,
+    ) -> Result<usize> {
         let (rtx, rrx) = flume::bounded(1);
         self.tx
-            .send(Cmd::WriteSuppression { rows, reply: rtx })
+            .send(Cmd::WriteSuppression {
+                rows,
+                tenant: tenant.to_string(),
+                reply: rtx,
+            })
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
         rrx.recv_async()
             .await
@@ -382,6 +419,7 @@ impl IngestionHandle {
         columns: Vec<String>,
         key: String,
         rows: Vec<Vec<Option<String>>>,
+        tenant: &str,
     ) -> Result<usize> {
         let (rtx, rrx) = flume::bounded(1);
         self.tx
@@ -391,6 +429,7 @@ impl IngestionHandle {
                 columns,
                 key,
                 rows,
+                tenant: tenant.to_string(),
                 reply: rtx,
             })
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
@@ -410,6 +449,7 @@ impl IngestionHandle {
         entity: &str,
         key: String,
         keys: Vec<String>,
+        tenant: &str,
     ) -> Result<usize> {
         let (rtx, rrx) = flume::bounded(1);
         self.tx
@@ -418,6 +458,7 @@ impl IngestionHandle {
                 entity: entity.to_string(),
                 key,
                 keys,
+                tenant: tenant.to_string(),
                 reply: rtx,
             })
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
@@ -433,13 +474,13 @@ impl IngestionHandle {
     /// # Errors
     /// - [`Error::InvalidInput`] if `id` is not a registered producer.
     /// - Propagates producer read/compute and writer storage errors.
-    pub async fn run_producer(&self, id: &str, as_of: &str) -> Result<usize> {
+    pub async fn run_producer(&self, id: &str, as_of: &str, tenant: &str) -> Result<usize> {
         let producer = self
             .registry
             .get(id)
             .ok_or_else(|| Error::InvalidInput(format!("unknown producer {id:?}")))?;
         let output = producer.run(as_of).await?;
-        self.write_features(output.rows).await
+        self.write_features(output.rows, tenant).await
     }
 
     /// Ask the writer thread to stop after a graceful drain (specs/11 I3).
@@ -472,34 +513,38 @@ impl IngestionHandle {
 /// on every timeout — a slow trickle of small batches is committed by wall
 /// clock, not only when a command happens to arrive (specs/71 §4 freshness
 /// SLA: flush age 30 s ⇒ end-to-end freshness well inside the ≤ 5 min bound).
-fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>, micro: MicroBatchConfig) {
+fn writer_loop(mut writer: Writer, rx: flume::Receiver<Cmd>, micro: MicroBatchConfig) {
     let mut known: HashSet<(String, String)> = HashSet::new();
-    let mut pending: std::collections::BTreeMap<(String, String), PendingBatch> =
+    let mut pending: std::collections::BTreeMap<(String, String, String), PendingBatch> =
         std::collections::BTreeMap::new();
     loop {
         let cmd = match rx.recv_timeout(AGE_TICK) {
             Ok(cmd) => cmd,
             Err(flume::RecvTimeoutError::Timeout) => {
-                flush_expired(&writer, &mut pending, &mut known, micro.flush_age_secs);
+                flush_expired(&mut writer, &mut pending, &mut known, micro.flush_age_secs);
                 continue;
             }
             // All senders dropped: no graceful shutdown was requested — flush
             // what is buffered so nothing acked is lost, then exit.
             Err(flume::RecvTimeoutError::Disconnected) => {
-                flush_pending(&writer, &mut pending, &mut known);
+                flush_pending(&mut writer, &mut pending, &mut known);
                 break;
             }
         };
         // Age-based flush before every command (incl. shutdown).
-        flush_expired(&writer, &mut pending, &mut known, micro.flush_age_secs);
+        flush_expired(&mut writer, &mut pending, &mut known, micro.flush_age_secs);
         match cmd {
             Cmd::IngestRaw {
                 system,
                 entity,
                 columns,
                 rows,
+                tenant,
                 reply,
             } => {
+                // The writer stamps its current tenant on every committed row
+                // — set it to the caller's before buffering (issue #22).
+                writer.set_tenant(tenant.clone());
                 let res = if micro.flush_rows == 0 {
                     // Buffering disabled: flush immediately (pre-micro-batch path).
                     let r = writer.ingest_raw(&system, &entity, &columns, &rows);
@@ -508,25 +553,30 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>, micro: MicroBatchConfig
                     }
                     r
                 } else {
-                    let key = (system.clone(), entity.clone());
+                    // The buffer is keyed by (tenant, system, entity): two
+                    // tenants ingesting to the same table never share a batch,
+                    // so a flush can never stamp one tenant's rows with the
+                    // other's (issue #22).
+                    let key = (tenant.clone(), system.clone(), entity.clone());
                     // A schema change (different columns) forces the old batch out
                     // first — buffered rows must not mix shapes.
                     if let Some(existing) = pending.get(&key)
                         && existing.columns != columns
                         && let Some(old) = pending.remove(&key)
-                        && let Err(e) = flush_batch(&writer, &key, &old, &mut known)
+                        && let Err(e) = flush_batch(&mut writer, &key, &old, &mut known)
                     {
                         tracing::warn!(error = %e, "schema-change flush failed");
                     }
                     let batch = pending.entry(key.clone()).or_insert_with(|| PendingBatch {
                         columns: columns.clone(),
                         rows: Vec::new(),
+                        tenant: tenant.clone(),
                         since: std::time::Instant::now(),
                     });
                     batch.rows.extend(rows);
                     if batch.rows.len() as u64 >= micro.flush_rows {
                         match pending.remove(&key) {
-                            Some(batch) => flush_batch(&writer, &key, &batch, &mut known),
+                            Some(batch) => flush_batch(&mut writer, &key, &batch, &mut known),
                             None => Ok(0),
                         }
                     } else {
@@ -544,7 +594,7 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>, micro: MicroBatchConfig
                 // Buffered rows are part of the table's latest state; compact
                 // only after they land, then expire old snapshots and reclaim
                 // orphaned files (issue #17).
-                flush_pending(&writer, &mut pending, &mut known);
+                flush_pending(&mut writer, &mut pending, &mut known);
                 let mut last: Result<()> = Ok(());
                 for (s, e) in &known {
                     if let Err(err) = writer.compact(s, e) {
@@ -565,8 +615,10 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>, micro: MicroBatchConfig
                 columns,
                 key,
                 rows,
+                tenant,
                 reply,
             } => {
+                writer.set_tenant(tenant);
                 let res = writer.upsert_raw(&system, &entity, &columns, &key, &rows);
                 if res.is_ok() {
                     known.insert((system, entity));
@@ -578,8 +630,10 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>, micro: MicroBatchConfig
                 entity,
                 key,
                 keys,
+                tenant,
                 reply,
             } => {
+                writer.set_tenant(tenant);
                 let res = writer.delete_raw(&system, &entity, &key, &keys);
                 if res.is_ok() {
                     known.insert((system, entity));
@@ -591,8 +645,10 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>, micro: MicroBatchConfig
                 subquery_params,
                 key_column,
                 spec,
+                tenant,
                 reply,
             } => {
+                writer.set_tenant(tenant);
                 let res = writer.materialize_snapshot(
                     &subquery_sql,
                     &subquery_params,
@@ -609,22 +665,37 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>, micro: MicroBatchConfig
                 let res = writer.export_snapshot_parquet(&snapshot_id, &dest);
                 let _ = reply.send(res);
             }
-            Cmd::WriteFeatures { rows, reply } => {
+            Cmd::WriteFeatures {
+                rows,
+                tenant,
+                reply,
+            } => {
+                writer.set_tenant(tenant);
                 let res = writer.write_features_and_refresh(&rows);
                 let _ = reply.send(res);
             }
-            Cmd::WriteCatalog { rows, reply } => {
+            Cmd::WriteCatalog {
+                rows,
+                tenant,
+                reply,
+            } => {
+                writer.set_tenant(tenant);
                 let res = writer.write_catalog_rows(&rows);
                 let _ = reply.send(res);
             }
-            Cmd::WriteSuppression { rows, reply } => {
+            Cmd::WriteSuppression {
+                rows,
+                tenant,
+                reply,
+            } => {
+                writer.set_tenant(tenant);
                 let res = writer.write_suppression_idempotent(&rows);
                 let _ = reply.send(res);
             }
             Cmd::Shutdown { ack } => {
                 // Graceful drain (specs/11 I3): force-flush every buffered batch
                 // so no acked ingest is lost on shutdown, then ack and exit.
-                flush_pending(&writer, &mut pending, &mut known);
+                flush_pending(&mut writer, &mut pending, &mut known);
                 let _ = ack.send(());
                 break;
             }
@@ -639,13 +710,17 @@ const AGE_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// Flush one pending batch through the writer; registers the table as known on
 /// success (so compaction covers it).
 fn flush_batch(
-    writer: &Writer,
-    key: &(String, String),
+    writer: &mut Writer,
+    key: &(String, String, String),
     batch: &PendingBatch,
     known: &mut HashSet<(String, String)>,
 ) -> Result<usize> {
-    let n = writer.ingest_raw(&key.0, &key.1, &batch.columns, &batch.rows)?;
-    known.insert(key.clone());
+    // The batch carries its own tenant — an age/shutdown drain may run after
+    // other tenants' commands, so stamp the BATCH's tenant, not the writer's
+    // current one (issue #22).
+    writer.set_tenant(batch.tenant.clone());
+    let n = writer.ingest_raw(&key.1, &key.2, &batch.columns, &batch.rows)?;
+    known.insert((key.1.clone(), key.2.clone()));
     Ok(n)
 }
 
@@ -654,12 +729,12 @@ fn flush_batch(
 /// the rows are dropped (a retry would need a CDC-style offset, which is #24's
 /// scope).
 fn flush_some(
-    writer: &Writer,
-    pending: &mut std::collections::BTreeMap<(String, String), PendingBatch>,
+    writer: &mut Writer,
+    pending: &mut std::collections::BTreeMap<(String, String, String), PendingBatch>,
     known: &mut HashSet<(String, String)>,
-    should_flush: impl Fn(&(String, String), &PendingBatch) -> bool,
+    should_flush: impl Fn(&(String, String, String), &PendingBatch) -> bool,
 ) {
-    let keys: Vec<(String, String)> = pending
+    let keys: Vec<(String, String, String)> = pending
         .iter()
         .filter(|(k, b)| should_flush(k, b))
         .map(|(k, _)| k.clone())
@@ -670,8 +745,9 @@ fn flush_some(
         {
             tracing::warn!(
                 error = %e,
-                system = %k.0,
-                entity = %k.1,
+                tenant = %k.0,
+                system = %k.1,
+                entity = %k.2,
                 "micro-batch flush failed"
             );
         }
@@ -681,8 +757,8 @@ fn flush_some(
 /// Flush every pending batch (compaction pre-step and shutdown drain,
 /// specs/11 I3).
 fn flush_pending(
-    writer: &Writer,
-    pending: &mut std::collections::BTreeMap<(String, String), PendingBatch>,
+    writer: &mut Writer,
+    pending: &mut std::collections::BTreeMap<(String, String, String), PendingBatch>,
     known: &mut HashSet<(String, String)>,
 ) {
     flush_some(writer, pending, known, |_, _| true);
@@ -692,8 +768,8 @@ fn flush_pending(
 /// disables). Called on every loop wake (command arrival or [`AGE_TICK`] timeout)
 /// so freshness is wall-clock, not command-gated.
 fn flush_expired(
-    writer: &Writer,
-    pending: &mut std::collections::BTreeMap<(String, String), PendingBatch>,
+    writer: &mut Writer,
+    pending: &mut std::collections::BTreeMap<(String, String, String), PendingBatch>,
     known: &mut HashSet<(String, String)>,
     age_secs: u64,
 ) {
@@ -739,6 +815,7 @@ mod tests {
                 "orders",
                 cols.clone(),
                 vec![vec![Some("u1".into()), Some("A".into())]],
+                "default",
             )
             .await
             .expect("ingest 1");
@@ -748,6 +825,7 @@ mod tests {
                 "orders",
                 cols.clone(),
                 vec![vec![Some("u2".into()), Some("B".into())]],
+                "default",
             )
             .await
             .expect("ingest 2");
@@ -760,6 +838,7 @@ mod tests {
                 "orders",
                 cols.clone(),
                 vec![vec![Some("u3".into()), Some("C".into())]],
+                "default",
             )
             .await
             .expect("ingest 3");
@@ -801,6 +880,7 @@ mod tests {
                 "orders",
                 vec!["user_id".into(), "sku".into()],
                 vec![vec![Some("u1".into()), Some("A".into())]],
+                "default",
             )
             .await
             .expect("ingest");
@@ -845,6 +925,7 @@ mod tests {
                 "orders",
                 vec!["user_id".into(), "sku".into()],
                 vec![vec![Some("u1".into()), Some("A".into())]],
+                "default",
             )
             .await
             .expect("ingest");
@@ -897,6 +978,7 @@ mod tests {
                 vec![Value::Text("A".into())],
                 "user_id",
                 spec.clone(),
+                "default",
             )
             .await
             .expect("materialize");
@@ -957,6 +1039,7 @@ mod tests {
                     vec![Some("u1".into()), Some("gold".into())],
                     vec![Some("u2".into()), Some("silver".into())],
                 ],
+                "default",
             )
             .await
             .expect("upsert");
@@ -971,11 +1054,12 @@ mod tests {
                     vec![Some("u1".into()), Some("platinum".into())],
                     vec![Some("u3".into()), Some("diamond".into())],
                 ],
+                "default",
             )
             .await
             .expect("upsert 2");
         let deleted = handle
-            .delete_raw("erp", "users", "id".into(), vec!["u2".into()])
+            .delete_raw("erp", "users", "id".into(), vec!["u2".into()], "default")
             .await
             .expect("delete");
         assert_eq!(deleted, 1, "u2 logically deleted");
@@ -1050,7 +1134,7 @@ mod tests {
 
         let handle = IngestionHandle::start(writer, registry).expect("start handle");
         let n = handle
-            .run_producer("cadence_sql", "2025-12-31T00:00:00Z")
+            .run_producer("cadence_sql", "2025-12-31T00:00:00Z", "default")
             .await
             .expect("run");
         assert_eq!(n, 1, "one feature row for the single regular buyer");
@@ -1086,25 +1170,31 @@ mod tests {
 
         // Batch 1: cadence.regularity only.
         handle
-            .write_features(vec![FeatureRow {
-                user_id: "u1".into(),
-                feature_name: "cadence.regularity".into(),
-                num_value: 0.9,
-                as_of_ts: "2025-01-01T00:00:00Z".into(),
-                producer_id: "cadence_sql".into(),
-            }])
+            .write_features(
+                vec![FeatureRow {
+                    user_id: "u1".into(),
+                    feature_name: "cadence.regularity".into(),
+                    num_value: 0.9,
+                    as_of_ts: "2025-01-01T00:00:00Z".into(),
+                    producer_id: "cadence_sql".into(),
+                }],
+                "default",
+            )
             .await
             .expect("write batch 1");
 
         // Batch 2: cadence.volume only — a subset that omits regularity.
         handle
-            .write_features(vec![FeatureRow {
-                user_id: "u1".into(),
-                feature_name: "cadence.volume".into(),
-                num_value: 5.0,
-                as_of_ts: "2025-01-01T00:00:00Z".into(),
-                producer_id: "cadence_sql".into(),
-            }])
+            .write_features(
+                vec![FeatureRow {
+                    user_id: "u1".into(),
+                    feature_name: "cadence.volume".into(),
+                    num_value: 5.0,
+                    as_of_ts: "2025-01-01T00:00:00Z".into(),
+                    producer_id: "cadence_sql".into(),
+                }],
+                "default",
+            )
             .await
             .expect("write batch 2");
 

@@ -5,12 +5,12 @@
 
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Extension, Query, State},
 };
 use consumer_engine_core::{CatalogHit, Error};
 use serde::Deserialize;
 
-use crate::{ApiError, AppState};
+use crate::{ApiError, AppState, Tenant};
 
 /// Maximum bytes accepted for the `q` query string (bounded boundary input).
 const MAX_Q_BYTES: usize = 1024;
@@ -36,6 +36,7 @@ pub struct CatalogQuery {
 /// [`ApiError::Core`] if `q` exceeds the byte cap or retrieval fails.
 pub async fn get_catalog(
     State(st): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
     Query(q): Query<CatalogQuery>,
 ) -> Result<Json<Vec<CatalogHit>>, ApiError> {
     let utterance = q.q.unwrap_or_default();
@@ -45,6 +46,6 @@ pub async fn get_catalog(
         ))));
     }
     let k = q.k.unwrap_or(DEFAULT_K).clamp(1, MAX_K);
-    let hits = st.intent_rag.retrieve(&utterance, k).await?;
+    let hits = st.intent_rag.retrieve(&utterance, k, &tenant).await?;
     Ok(Json(hits))
 }

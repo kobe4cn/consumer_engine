@@ -7,13 +7,17 @@
 //! (specs/21 §4, specs/20 §5). This is the only external write path into the
 //! engine.
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::{Extension, State},
+    http::StatusCode,
+};
 use consumer_engine_core::{
     Error, SuppressionAction, SuppressionChannel, SuppressionRow, validate_ident,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{ApiError, AppState};
+use crate::{ApiError, AppState, Tenant};
 
 /// Maximum bytes for a free-form string field (campaign/user ids, timestamps).
 const MAX_FIELD_BYTES: usize = 256;
@@ -53,6 +57,7 @@ pub struct SuppressionResponse {
 /// - [`ApiError::Core`] on invalid ids/channel/action/timestamp or write failure.
 pub async fn post_suppression(
     State(st): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
     Json(req): Json<SuppressionRequest>,
 ) -> Result<(StatusCode, Json<SuppressionResponse>), ApiError> {
     validate_ident(&req.campaign_id)?;
@@ -96,7 +101,7 @@ pub async fn post_suppression(
     };
     // Idempotent: a duplicate suppression_id inserts 0 rows but still returns
     // the (client-supplied) id — the client sees the same outcome either way.
-    st.ingestion.write_suppression(vec![row]).await?;
+    st.ingestion.write_suppression(vec![row], &tenant).await?;
     Ok((
         StatusCode::CREATED,
         Json(SuppressionResponse { suppression_id }),

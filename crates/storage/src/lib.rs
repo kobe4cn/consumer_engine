@@ -519,8 +519,9 @@ impl Writer {
             return Ok(());
         }
         self.ensure_feature_store_table()?;
-        let mut cols = Vec::with_capacity(feature_short_names.len() + 1);
+        let mut cols = Vec::with_capacity(feature_short_names.len() + 2);
         cols.push("user_id".to_string());
+        cols.push("tenant_id".to_string());
         for short in feature_short_names {
             validate_ident(short)?;
             // Constant string literal: validated identifier parts only, so the
@@ -540,7 +541,7 @@ impl Writer {
         let sql = format!(
             "CREATE OR REPLACE VIEW {WRITE_CATALOG_ALIAS}.feature_wide_{family} AS SELECT \
              {select} FROM {WRITE_CATALOG_ALIAS}.feature_store WHERE starts_with(feature_name, \
-             '{family}.') GROUP BY user_id"
+             '{family}.') GROUP BY user_id, tenant_id"
         );
         self.conn
             .execute_batch(&sql)

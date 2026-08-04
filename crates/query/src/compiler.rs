@@ -28,23 +28,28 @@ pub struct CompileOptions<'a> {
     pub suppression: &'a SuppressionRules,
     /// Survivor-set count for a `Derive` CTE `LIMIT` (`None` = no Derive).
     pub derive_limit: Option<u64>,
+    /// The caller's tenant, injected as a filter into every compiled SQL
+    /// (issue #22 / specs/21 I2: tenant isolation is enforced by the compiler,
+    /// never trusted from caller-supplied filtering).
+    pub tenant: &'a str,
 }
 
 impl<'a> CompileOptions<'a> {
-    /// A compile context with an explicit alias, suppression rules and derive
-    /// limit (the engine passes its suppression rules and the measured
-    /// survivor count). `#[non_exhaustive]` keeps future fields additive; this
+    /// A compile context with an explicit alias, suppression rules, derive
+    /// limit and tenant. `#[non_exhaustive]` keeps future fields additive; this
     /// is the only supported construction path.
     #[must_use]
     pub const fn new(
         alias: &'a str,
         suppression: &'a SuppressionRules,
         derive_limit: Option<u64>,
+        tenant: &'a str,
     ) -> Self {
         Self {
             alias,
             suppression,
             derive_limit,
+            tenant,
         }
     }
 }
@@ -75,6 +80,7 @@ pub fn compile(q: &SegmentQuery) -> Result<CompiledQuery> {
             alias: READ_ONLY_CATALOG_ALIAS,
             suppression: &SuppressionRules::default(),
             derive_limit: None,
+            tenant: DEFAULT_TENANT,
         },
     )
 }
@@ -94,6 +100,7 @@ pub fn compile_with_alias(q: &SegmentQuery, alias: &str) -> Result<CompiledQuery
             alias,
             suppression: &SuppressionRules::default(),
             derive_limit: None,
+            tenant: DEFAULT_TENANT,
         },
     )
 }
@@ -111,6 +118,11 @@ pub fn compile_with_opts(q: &SegmentQuery, opts: &CompileOptions<'_>) -> Result<
 /// recursion limit; AGENTS.md § Resource Limits — set explicit depth limits).
 const MAX_NESTING: u8 = 8;
 
+/// The tenant used when a compile has no caller context (`compile` /
+/// `compile_with_alias` — tests, examples, and the write-path alias renders).
+/// The engine always passes the caller's resolved tenant.
+const DEFAULT_TENANT: &str = "default";
+
 fn compile_at(q: &SegmentQuery, depth: u8, opts: &CompileOptions<'_>) -> Result<CompiledQuery> {
     let alias = opts.alias;
     if depth > MAX_NESTING {
@@ -121,6 +133,9 @@ fn compile_at(q: &SegmentQuery, depth: u8, opts: &CompileOptions<'_>) -> Result<
     let mut params: Vec<Value> = Vec::new();
     let mut sources: Vec<Dataset> = vec![q.source.clone()];
     let mut conjuncts: Vec<String> = Vec::new();
+    // Tenant isolation (issue #22): every base-relation scan is scoped to the
+    // caller's tenant by the compiler — never by caller-supplied filtering.
+    conjuncts.push(tenant_eq("base", &mut params, opts.tenant));
 
     let mut setop: Option<(&SetOpKind, &SegmentQuery)> = None;
     for op in &q.ops {
@@ -153,6 +168,7 @@ fn compile_at(q: &SegmentQuery, depth: u8, opts: &CompileOptions<'_>) -> Result<
                     predicate.as_ref(),
                     &mut params,
                     alias,
+                    opts.tenant,
                 )?);
             }
             Op::Lapsed {
@@ -172,6 +188,7 @@ fn compile_at(q: &SegmentQuery, depth: u8, opts: &CompileOptions<'_>) -> Result<
                     predicate.as_ref(),
                     &mut params,
                     alias,
+                    opts.tenant,
                 )?);
             }
             Op::Feature { name, op, value } => {
@@ -182,6 +199,7 @@ fn compile_at(q: &SegmentQuery, depth: u8, opts: &CompileOptions<'_>) -> Result<
                     &q.key,
                     &mut params,
                     alias,
+                    opts.tenant,
                 )?);
             }
             Op::SetOp { op, other } => {
@@ -205,7 +223,14 @@ fn compile_at(q: &SegmentQuery, depth: u8, opts: &CompileOptions<'_>) -> Result<
                 // The metric's event table is a freshness source (D5).
                 sources.push(metric_event(metric).clone());
                 let survivor = survivor_cte(&q.source, &q.key, &conjuncts, alias, limit);
-                let sql = compile_derive_metric(&survivor, name, metric, &mut params, alias)?;
+                let sql = compile_derive_metric(
+                    &survivor,
+                    name,
+                    metric,
+                    &mut params,
+                    alias,
+                    opts.tenant,
+                )?;
                 return Ok(CompiledQuery {
                     sql,
                     params,
@@ -269,6 +294,14 @@ fn base_select(source: &Dataset, key: &str, conjuncts: &[String], alias: &str) -
 /// Qualified raw table name `<alias>.raw_<system>_<entity>` (idents pre-validated).
 fn raw_table(d: &Dataset, alias: &str) -> String {
     format!("{alias}.raw_{}_{}", d.system, d.entity)
+}
+
+/// The tenant-scoping conjunct for `rel` (`rel.tenant_id = ?`), pushing the
+/// tenant param IN THE SAME ORDER the placeholder appears (issue #22 — an
+/// off-by-one here is a cross-tenant read).
+fn tenant_eq(rel: &str, params: &mut Vec<Value>, tenant: &str) -> String {
+    params.push(Value::Text(tenant.to_string()));
+    format!("{rel}.tenant_id = ?")
 }
 
 /// Render a predicate on alias `rel` (e.g. `base` or `e`), pushing its value(s)
@@ -354,9 +387,13 @@ fn compile_recency(
     predicate: Option<&Predicate>,
     params: &mut Vec<Value>,
     alias: &str,
+    tenant: &str,
 ) -> Result<String> {
     let table = raw_table(event, alias);
-    let mut where_parts = vec![format!("e.{user_key} = base.{base_key}")];
+    let mut where_parts = vec![
+        format!("e.{user_key} = base.{base_key}"),
+        tenant_eq("e", params, tenant),
+    ];
     if let Some(p) = predicate {
         where_parts.push(compile_predicate("e", p, params)?);
     }
@@ -384,9 +421,13 @@ fn compile_lapsed(
     predicate: Option<&Predicate>,
     params: &mut Vec<Value>,
     alias: &str,
+    tenant: &str,
 ) -> Result<String> {
     let table = raw_table(event, alias);
-    let mut before_parts = vec![format!("e.{user_key} = base.{base_key}")];
+    let mut before_parts = vec![
+        format!("e.{user_key} = base.{base_key}"),
+        tenant_eq("e", params, tenant),
+    ];
     if let Some(p) = predicate {
         before_parts.push(compile_predicate("e", p, params)?);
     }
@@ -394,7 +435,10 @@ fn compile_lapsed(
         "CAST(e.{ts_column} AS TIMESTAMP) < CAST(now() AS TIMESTAMP) - INTERVAL '{within_days}' \
          DAY"
     ));
-    let mut recent_parts = vec![format!("e.{user_key} = base.{base_key}")];
+    let mut recent_parts = vec![
+        format!("e.{user_key} = base.{base_key}"),
+        tenant_eq("e", params, tenant),
+    ];
     if let Some(p) = predicate {
         recent_parts.push(compile_predicate("e", p, params)?);
     }
@@ -463,6 +507,7 @@ fn compile_derive_metric(
     metric: &JitMetric,
     params: &mut Vec<Value>,
     alias: &str,
+    tenant: &str,
 ) -> Result<String> {
     let (event, agg): (&Dataset, String) = match metric {
         JitMetric::Count { event } => (event, "count(*)".to_string()),
@@ -473,12 +518,13 @@ fn compile_derive_metric(
         JitMetric::Min { event, column } => (event, format!("min(CAST(e.{column} AS DOUBLE))")),
         JitMetric::Max { event, column } => (event, format!("max(CAST(e.{column} AS DOUBLE))")),
     };
-    // Bind the metric name (I1: no interpolated user values).
+    // Bind the metric name (I1: no interpolated user values) + the tenant.
     params.push(Value::Text(name.to_string()));
+    let tenant = tenant_eq("e", params, tenant);
     let table = raw_table(event, alias);
     Ok(format!(
         "WITH survivor AS ({survivor}) SELECT ? AS name, {agg} AS value FROM survivor s JOIN \
-         {table} e ON e.user_id = s.user_id",
+         {table} e ON e.user_id = s.user_id AND {tenant}",
     ))
 }
 
@@ -526,7 +572,10 @@ pub fn compile_characterize(
     let seg = compile_with_opts(&narrowing, opts)?;
     let with_seg = format!("WITH segment AS ({})", seg.sql);
     let event_table = raw_table(event, opts.alias);
-    let params = seg.params.clone();
+    // Tenant isolation (issue #22): the event reads are scoped to the caller's
+    // tenant — the population (baseline) is that tenant's data.
+    let mut params = seg.params.clone();
+    let ev_tenant = tenant_eq("e", &mut params, opts.tenant);
     let mut sources = seg.sources.clone();
     sources.push(event.clone());
 
@@ -535,15 +584,15 @@ pub fn compile_characterize(
         sql: format!(
             "{with_seg}, ev AS (SELECT e.user_id, CAST(e.{monetary_column} AS DOUBLE) AS amount, \
              (s.user_id IS NOT NULL) AS in_seg FROM {event_table} e LEFT JOIN segment s ON \
-             s.user_id = e.user_id) SELECT (SELECT count(*) FROM segment) AS seg_users, (SELECT \
-             count(DISTINCT user_id) FROM ev) AS base_users, (SELECT sum(amount) FROM ev WHERE \
-             in_seg) * 1.0 / NULLIF((SELECT count(*) FROM ev WHERE in_seg), 0) AS seg_aov, \
-             (SELECT sum(amount) FROM ev) * 1.0 / NULLIF((SELECT count(*) FROM ev), 0) AS \
-             base_aov, (SELECT count(*) FROM ev WHERE in_seg) * 1.0 / NULLIF((SELECT \
-             count(DISTINCT user_id) FROM ev WHERE in_seg), 0) AS seg_freq, (SELECT count(*) FROM \
-             ev) * 1.0 / NULLIF((SELECT count(DISTINCT user_id) FROM ev), 0) AS base_freq, \
-             (SELECT count(*) FROM ev WHERE in_seg) AS seg_orders, (SELECT count(*) FROM ev) AS \
-             base_orders",
+             s.user_id = e.user_id WHERE {ev_tenant}) SELECT (SELECT count(*) FROM segment) AS \
+             seg_users, (SELECT count(DISTINCT user_id) FROM ev) AS base_users, (SELECT \
+             sum(amount) FROM ev WHERE in_seg) * 1.0 / NULLIF((SELECT count(*) FROM ev WHERE \
+             in_seg), 0) AS seg_aov, (SELECT sum(amount) FROM ev) * 1.0 / NULLIF((SELECT count(*) \
+             FROM ev), 0) AS base_aov, (SELECT count(*) FROM ev WHERE in_seg) * 1.0 / \
+             NULLIF((SELECT count(DISTINCT user_id) FROM ev WHERE in_seg), 0) AS seg_freq, \
+             (SELECT count(*) FROM ev) * 1.0 / NULLIF((SELECT count(DISTINCT user_id) FROM ev), \
+             0) AS base_freq, (SELECT count(*) FROM ev WHERE in_seg) AS seg_orders, (SELECT \
+             count(*) FROM ev) AS base_orders",
         ),
         params: params.clone(),
         sources: sources.clone(),
@@ -554,11 +603,11 @@ pub fn compile_characterize(
         sql: format!(
             "{with_seg}, ev AS (SELECT e.user_id, CAST(e.{ts_column} AS TIMESTAMP) AS ts, \
              (s.user_id IS NOT NULL) AS in_seg FROM {event_table} e LEFT JOIN segment s ON \
-             s.user_id = e.user_id), per_user AS (SELECT user_id, bool_or(in_seg) AS in_seg, \
-             max(ts) AS last_ts FROM ev GROUP BY user_id) SELECT avg(extract(epoch FROM \
-             (CAST(now() AS TIMESTAMP) - last_ts)) / 86400.0) FILTER (WHERE in_seg) AS \
-             seg_recency_days, avg(extract(epoch FROM (CAST(now() AS TIMESTAMP) - last_ts)) / \
-             86400.0) AS base_recency_days FROM per_user",
+             s.user_id = e.user_id WHERE {ev_tenant}), per_user AS (SELECT user_id, \
+             bool_or(in_seg) AS in_seg, max(ts) AS last_ts FROM ev GROUP BY user_id) SELECT \
+             avg(extract(epoch FROM (CAST(now() AS TIMESTAMP) - last_ts)) / 86400.0) FILTER \
+             (WHERE in_seg) AS seg_recency_days, avg(extract(epoch FROM (CAST(now() AS TIMESTAMP) \
+             - last_ts)) / 86400.0) AS base_recency_days FROM per_user",
         ),
         params: params.clone(),
         sources: sources.clone(),
@@ -569,8 +618,8 @@ pub fn compile_characterize(
         sql: format!(
             "{with_seg}, ev AS (SELECT e.user_id, e.{category_column} AS category, (s.user_id IS \
              NOT NULL) AS in_seg FROM {event_table} e LEFT JOIN segment s ON s.user_id = \
-             e.user_id) SELECT category, count(*) FILTER (WHERE in_seg) AS seg_n, count(*) AS \
-             base_n FROM ev GROUP BY category ORDER BY seg_n DESC LIMIT 3",
+             e.user_id WHERE {ev_tenant}) SELECT category, count(*) FILTER (WHERE in_seg) AS \
+             seg_n, count(*) AS base_n FROM ev GROUP BY category ORDER BY seg_n DESC LIMIT 3",
         ),
         params,
         sources,
@@ -614,20 +663,23 @@ fn compile_exclude(
 ) -> Result<String> {
     let mut clauses: Vec<String> = Vec::new();
     if opts.suppression.per_campaign_no_repeat {
+        let tenant = tenant_eq("s", params, opts.tenant);
         params.push(Value::Text(campaign_id.to_string()));
         clauses.push(format!(
             "NOT EXISTS (SELECT 1 FROM {alias}.suppression s WHERE s.user_id = base.{base_key} \
-             AND s.campaign_id = ? AND s.action IN ('targeted', 'delivered'))",
+             AND {tenant} AND s.campaign_id = ? AND s.action IN ('targeted', 'delivered'))",
             alias = opts.alias,
         ));
     }
     if let Some(cap) = opts.suppression.frequency_cap {
         let (n, d) = (cap.max_contacts.get(), cap.window_days.get());
+        params.push(Value::Text(opts.tenant.to_string()));
         params.push(Value::BigInt(i64::from(n)));
         clauses.push(format!(
             "NOT EXISTS (SELECT 1 FROM {alias}.suppression s WHERE s.user_id = base.{base_key} \
-             AND s.action = 'targeted' AND s.occurred_ts >= CAST(CAST(now() AS TIMESTAMP) - \
-             INTERVAL '{d}' DAY AS TIMESTAMPTZ) GROUP BY s.user_id HAVING count(*) >= ?)",
+             AND s.tenant_id = ? AND s.action = 'targeted' AND s.occurred_ts >= CAST(CAST(now() \
+             AS TIMESTAMP) - INTERVAL '{d}' DAY AS TIMESTAMPTZ) GROUP BY s.user_id HAVING \
+             count(*) >= ?)",
             alias = opts.alias,
         ));
     }
@@ -644,14 +696,17 @@ fn compile_feature(
     base_key: &str,
     params: &mut Vec<Value>,
     alias: &str,
+    tenant: &str,
 ) -> Result<String> {
     let (family, short) =
         split_feature_name(name).map_err(|e| QueryError::InvalidDsl(e.to_string()))?;
     let cmp = cmp_symbol(op)?;
+    // Placeholder order: `f.tenant_id = ?` precedes `f.{short} {cmp} ?`.
+    let tenant = tenant_eq("f", params, tenant);
     params.push(Value::Double(value));
     Ok(format!(
         "EXISTS (SELECT 1 FROM {alias}.feature_wide_{family} f WHERE f.user_id = base.{base_key} \
-         AND f.{short} {cmp} ?)"
+         AND {tenant} AND f.{short} {cmp} ?)"
     ))
 }
 
@@ -742,7 +797,10 @@ mod tests {
             c.sql
         );
         assert!(c.sql.contains("?"), "expected a placeholder: {}", c.sql);
-        assert_eq!(c.params, vec![Value::Text("A".into())]);
+        assert_eq!(
+            c.params,
+            vec![Value::Text("default".into()), Value::Text("A".into())]
+        );
         assert!(c.sql.contains("dro.raw_erp_orders"));
     }
 
@@ -764,7 +822,9 @@ mod tests {
         }]);
         let c = compile(&q).expect("compile");
         // Predicate value bound once per subquery (before + recent).
-        assert_eq!(c.params.len(), 2);
+        // base tenant + tenant (before window) + predicate + tenant (recent) +
+        // predicate.
+        assert_eq!(c.params.len(), 5);
         assert!(c.sql.contains("INTERVAL '30' DAY"));
         assert!(c.sql.contains("NOT EXISTS"));
     }
@@ -779,7 +839,7 @@ mod tests {
             },
         }]);
         let c = compile(&q).expect("compile");
-        assert_eq!(c.params.len(), 3);
+        assert_eq!(c.params.len(), 4);
         assert!(c.sql.contains("IN (?, ?, ?)"));
     }
 
@@ -839,7 +899,14 @@ mod tests {
             "expected bound value on short name: {}",
             c.sql
         );
-        assert_eq!(c.params, vec![Value::Double(0.7)]);
+        assert_eq!(
+            c.params,
+            vec![
+                Value::Text("default".into()),
+                Value::Text("default".into()),
+                Value::Double(0.7),
+            ]
+        );
         // The feature view must NOT contribute to freshness sources (D5).
         assert!(
             c.sources.iter().all(|d| d.entity != "feature_wide_cadence"),
@@ -860,6 +927,7 @@ mod tests {
                 alias: READ_ONLY_CATALOG_ALIAS,
                 suppression: &SuppressionRules::default(),
                 derive_limit: None,
+                tenant: "default",
             },
         )
         .expect("compile");
@@ -875,7 +943,14 @@ mod tests {
             "no-repeat action set must be targeted/delivered: {}",
             c.sql
         );
-        assert_eq!(c.params, vec![Value::Text("c1".into())]);
+        assert_eq!(
+            c.params,
+            vec![
+                Value::Text("default".into()),
+                Value::Text("default".into()),
+                Value::Text("c1".into()),
+            ]
+        );
         // suppression must not become a freshness source.
         assert!(c.sources.iter().all(|d| d.entity != "suppression"));
     }
@@ -898,6 +973,7 @@ mod tests {
                     }),
                 },
                 derive_limit: None,
+                tenant: "default",
             },
         )
         .expect("compile");
@@ -912,7 +988,9 @@ mod tests {
             c.sql
         );
         // campaign_id + max_contacts bound.
-        assert_eq!(c.params.len(), 2);
+        // base tenant + tenant (before window) + predicate + tenant (recent) +
+        // predicate.
+        assert_eq!(c.params.len(), 5);
     }
 
     #[test]
@@ -930,6 +1008,7 @@ mod tests {
                     frequency_cap: None,
                 },
                 derive_limit: None,
+                tenant: "default",
             },
         )
         .expect("compile");
@@ -938,7 +1017,8 @@ mod tests {
             "all rules off must be a tautology: {}",
             c.sql
         );
-        assert!(c.params.is_empty());
+        // Only the injected tenant filter remains (base scan), nothing else.
+        assert_eq!(c.params, vec![Value::Text("default".into())]);
     }
 
     #[test]
@@ -969,13 +1049,14 @@ mod tests {
                 alias: READ_ONLY_CATALOG_ALIAS,
                 suppression: &SuppressionRules::default(),
                 derive_limit: Some(42),
+                tenant: "default",
             },
         )
         .expect("compile");
         assert!(
             c.sql.contains(
                 "WITH survivor AS (SELECT DISTINCT base.user_id AS user_id FROM \
-                 dro.raw_erp_orders base WHERE base.sku = ? LIMIT 42)"
+                 dro.raw_erp_orders base WHERE base.tenant_id = ? AND base.sku = ? LIMIT 42)"
             ),
             "expected survivor CTE with inner LIMIT: {}",
             c.sql
@@ -991,7 +1072,12 @@ mod tests {
         // sku bound + metric name bound (no interpolated values).
         assert_eq!(
             c.params,
-            vec![Value::Text("A".into()), Value::Text("total_revenue".into())]
+            vec![
+                Value::Text("default".into()),
+                Value::Text("A".into()),
+                Value::Text("total_revenue".into()),
+                Value::Text("default".into()),
+            ]
         );
     }
 
@@ -1014,6 +1100,7 @@ mod tests {
                 alias: READ_ONLY_CATALOG_ALIAS,
                 suppression: &SuppressionRules::default(),
                 derive_limit: None,
+                tenant: "default",
             },
         );
         assert!(matches!(res, Err(QueryError::InvalidDsl(_))));

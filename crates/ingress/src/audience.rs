@@ -11,13 +11,13 @@ use std::path::PathBuf;
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::{IntoResponse, Response},
 };
 use consumer_engine_core::{BoxError, Error};
 use serde::{Deserialize, Serialize};
 
-use crate::{ApiError, AppState, presign};
+use crate::{ApiError, AppState, Tenant, presign};
 
 /// `GET /audience/:id` response body.
 #[derive(Serialize)]
@@ -73,12 +73,13 @@ fn parse_snap_id(snap: &str) -> Result<String, ApiError> {
 /// its external host; the caller resolves it.
 pub async fn get_audience(
     State(st): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
     Path(id): Path<String>,
 ) -> Result<Json<AudienceResponse>, ApiError> {
     let bare = parse_snap_id(&id)?;
     let meta = st
         .query_engine
-        .snapshot_meta(&bare)
+        .snapshot_meta(&bare, &tenant)
         .await?
         .ok_or(ApiError::NotFound)?;
     let token = presign::sign(st.signing_key.as_ref(), &bare, presign::EXPORT_TTL_SECS)
@@ -97,6 +98,7 @@ pub async fn get_audience(
 /// snapshot to Parquet via the single writer, and stream the bytes.
 pub async fn get_export(
     State(st): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
     Path(id): Path<String>,
     Query(q): Query<ExportQuery>,
 ) -> Result<Response, ApiError> {
@@ -107,6 +109,16 @@ pub async fn get_export(
     let token = q.token.as_deref().unwrap_or("");
     if !presign::verify(st.signing_key.as_ref(), &bare, token) {
         return Err(ApiError::Unauthorized);
+    }
+    // IDOR closure (issue #22): even with a valid presigned token, the
+    // snapshot must belong to the caller's tenant.
+    if st
+        .query_engine
+        .snapshot_meta(&bare, &tenant)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
     }
     // Access logging (specs/21 §4: presigned access is logged). No token, no
     // query string — only the snapshot identity.

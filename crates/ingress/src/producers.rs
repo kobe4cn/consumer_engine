@@ -4,11 +4,15 @@
 //! `run(as_of)` and persists its feature rows + wide views via the single
 //! writer. The producer id and `asOf` are validated at the boundary.
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::{Extension, State},
+    http::StatusCode,
+};
 use consumer_engine_core::validate_feature_name;
 use serde::{Deserialize, Serialize};
 
-use crate::{ApiError, AppState};
+use crate::{ApiError, AppState, Tenant};
 
 /// Maximum bytes accepted for the `asOf` cut-off string (§ Input Validation:
 /// length limits on every external string, enforced in bytes).
@@ -38,6 +42,7 @@ pub struct RunProducerResponse {
 /// - [`ApiError::Core`] on a bad producer id or an unknown producer.
 pub async fn run_producer(
     State(st): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
     Json(req): Json<RunProducerRequest>,
 ) -> Result<(StatusCode, Json<RunProducerResponse>), ApiError> {
     validate_feature_name(&req.producer_id)?;
@@ -49,7 +54,10 @@ pub async fn run_producer(
         )));
     }
     let as_of = req.as_of.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-    let n = st.ingestion.run_producer(&req.producer_id, &as_of).await?;
+    let n = st
+        .ingestion
+        .run_producer(&req.producer_id, &as_of, &tenant)
+        .await?;
     Ok((
         StatusCode::OK,
         Json(RunProducerResponse { rows_written: n }),

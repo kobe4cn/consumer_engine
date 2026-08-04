@@ -19,6 +19,7 @@ semantic-llm = ["dep:reqwest", "dep:tokio"]
 
 [dependencies]
 consumer_engine-core.workspace = true
+duckdb.workspace = true
 consumer_engine-execution.workspace = true
 async-trait.workspace = true
 serde.workspace = true
@@ -32,5 +33,4 @@ tokio = { workspace = true, optional = true }
 tempfile = "3"
 tokio.workspace = true
 consumer_engine-storage.workspace = true
-duckdb.workspace = true
 wiremock = "0.6"

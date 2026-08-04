@@ -16,7 +16,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Extension, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -73,13 +73,45 @@ pub struct AppState {
     /// HMAC-SHA256 signing key for presigned export URLs (32 bytes of OS
     /// randomness; minted once at server startup).
     pub signing_key: Arc<[u8; 32]>,
-    /// SHA-256 hash of the configured bearer auth token (`None` = tokenless
-    /// dev engine; production must set `auth_token`).
+    /// SHA-256 hash of the engine tenant's bearer auth token (`None` =
+    /// tokenless dev engine; production must set `auth_token`).
     pub auth_token_hash: Option<Arc<[u8; 32]>>,
+    /// Additional tenants: `(tenant_id, SHA-256 token hash)` (issue #22).
+    pub tenants: Vec<(String, [u8; 32])>,
+    /// The default tenant id: what the engine's own token and tokenless mode
+    /// resolve to (issue #14).
+    pub default_tenant: String,
     /// SHA-256 hash of the raw-SQL escape-hatch approval token (`None` =
     /// hatch disabled).
     pub sql_approval_hash: Option<Arc<[u8; 32]>>,
 }
+
+impl AppState {
+    /// Resolve a bearer token to a tenant id (issue #22): an exact match in the
+    /// tenant list wins, then the engine's own token → `default_tenant`; with
+    /// no auth configured, every caller is the default tenant (dev mode). No
+    /// match → `None` (the caller must be rejected).
+    #[must_use]
+    pub fn resolve_tenant(&self, provided: Option<&str>) -> Option<String> {
+        let provided = provided?;
+        let hash = Sha256::digest(provided.as_bytes());
+        for (id, expected) in &self.tenants {
+            if bool::from(expected.as_slice().ct_eq(hash.as_slice())) {
+                return Some(id.clone());
+            }
+        }
+        if let Some(expected) = &self.auth_token_hash
+            && bool::from(expected.as_ref().ct_eq(hash.as_slice()))
+        {
+            return Some(self.default_tenant.clone());
+        }
+        None
+    }
+}
+
+/// The resolved caller's tenant, set by the auth middleware (issue #22).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tenant(pub String);
 
 /// `POST /sources/onboard` request body.
 #[derive(Debug, Deserialize)]
@@ -184,6 +216,7 @@ async fn readyz() -> impl IntoResponse {
 /// `POST /sources/onboard`.
 async fn onboard(
     State(state): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
     Json(req): Json<OnboardRequest>,
 ) -> Result<Json<OnboardResponse>, ApiError> {
     validate_ident(&req.system)?;
@@ -220,7 +253,7 @@ async fn onboard(
     }
     let n = state
         .ingestion
-        .ingest_raw(&req.system, &req.entity, req.columns, req.rows)
+        .ingest_raw(&req.system, &req.entity, req.columns, req.rows, &tenant)
         .await?;
     let source_type = parse_source_type(&req.source_type)?;
     let ingest_epoch = now_epoch();
@@ -246,7 +279,7 @@ async fn onboard(
                 r.source_epoch = ingest_epoch;
             }
             let cols: Vec<String> = rows.iter().filter_map(|r| r.column_name.clone()).collect();
-            match state.ingestion.write_catalog(rows).await {
+            match state.ingestion.write_catalog(rows, &tenant).await {
                 Ok(_) => (true, cols),
                 Err(e) => {
                     tracing::warn!(error = %e, "catalog write failed after profile");
@@ -297,10 +330,11 @@ fn parse_source_type(s: &Option<String>) -> Result<SourceType, ApiError> {
 /// `POST /query`.
 async fn query(
     State(state): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let res = match (req.dsl, req.sql) {
-        (Some(dsl), _) => state.query_engine.run(dsl).await?,
+        (Some(dsl), _) => state.query_engine.run(dsl, &tenant).await?,
         (None, Some(sql)) => {
             // Cap the escape-hatch payload (AGENTS.md § Input Validation).
             if sql.len() > MAX_SQL_BYTES {
@@ -320,9 +354,11 @@ async fn query(
             if !approved {
                 return Err(ApiError::Unauthorized);
             }
-            // Audit log (specs/21 §4: always audit-logged).
-            tracing::info!(sql = %sql, "approved raw-SQL escape hatch executed");
-            state.query_engine.run_sql_approved(&sql).await?
+            // Audit log (specs/21 §4: always audit-logged, with the tenant —
+            // issue #22: raw SQL is tenant-unscooped by nature; the audit must
+            // say who ran it).
+            tracing::info!(tenant = %tenant, sql = %sql, "approved raw-SQL escape hatch executed");
+            state.query_engine.run_sql_approved(&sql, &tenant).await?
         }
         (None, None) => {
             return Err(Error::InvalidInput(

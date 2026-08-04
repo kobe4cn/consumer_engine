@@ -58,7 +58,12 @@ impl IntentRag {
     ///
     /// # Errors
     /// `consumer_engine_core::Error::Execution` on a reader failure.
-    pub async fn retrieve(&self, utterance: &str, k: usize) -> Result<Vec<CatalogHit>> {
+    pub async fn retrieve(
+        &self,
+        utterance: &str,
+        k: usize,
+        tenant: &str,
+    ) -> Result<Vec<CatalogHit>> {
         let k = if k == 0 { self.default_k } else { k };
         // The read is bounded with a defensive row cap (AGENTS.md § Resource
         // Limits: bound every collection). M3 catalogues are far smaller than
@@ -66,14 +71,18 @@ impl IntentRag {
         // Only the NEWEST catalogue row per (system, table, column) is
         // retrievable (issue #18 / spec 13 I5): a re-onboard appends a versioned
         // delta, and the newest `source_epoch` wins — stale descriptions never
-        // rank against the fresh ones.
+        // rank against the fresh ones. The catalogue is scoped to the caller's
+        // tenant (issue #22): a tenant only retrieves its own rows.
         let query = format!(
             "SELECT system, table_name, column_name, semantic_type, description, embedding FROM \
-             {READ_ONLY_CATALOG_ALIAS}.semantic_catalog QUALIFY row_number() OVER (PARTITION BY \
-             system, table_name, column_name ORDER BY source_epoch DESC) = 1 LIMIT \
-             {MAX_CATALOG_SCAN}"
+             {READ_ONLY_CATALOG_ALIAS}.semantic_catalog WHERE tenant_id = ? QUALIFY row_number() \
+             OVER (PARTITION BY system, table_name, column_name ORDER BY source_epoch DESC) = 1 \
+             LIMIT {MAX_CATALOG_SCAN}"
         );
-        let qr = self.reader.query_with_params(&query, Vec::new()).await?;
+        let qr = self
+            .reader
+            .query_with_params(&query, vec![duckdb::types::Value::Text(tenant.to_string())])
+            .await?;
 
         // A failed utterance embedding means retrieval cannot be trusted —
         // surface `CatalogueUnavailable` so the agent never guesses columns
@@ -240,7 +249,7 @@ mod tests {
         let rag = IntentRag::new(reader, Arc::new(StubEmbed::default()));
         // I3: retrieval must be bounded by k even when the catalogue is larger.
         let hits = rag
-            .retrieve("show me the user id", 1)
+            .retrieve("show me the user id", 1, "default")
             .await
             .expect("retrieve");
         assert_eq!(hits.len(), 1, "k=1 must return at most 1 hit");
@@ -256,13 +265,22 @@ mod tests {
         );
 
         // k larger than the catalogue returns every catalogued row.
-        let hits = rag.retrieve("orders", 10).await.expect("retrieve");
+        let hits = rag
+            .retrieve("orders", 10, "default")
+            .await
+            .expect("retrieve");
         assert_eq!(hits.len(), 2, "must return all 2 catalogued columns");
 
         // Determinism: the stub embedding has no RNG, so identical queries rank
         // identically across calls.
-        let a = rag.retrieve("orders", 2).await.expect("retrieve");
-        let b = rag.retrieve("orders", 2).await.expect("retrieve");
+        let a = rag
+            .retrieve("orders", 2, "default")
+            .await
+            .expect("retrieve");
+        let b = rag
+            .retrieve("orders", 2, "default")
+            .await
+            .expect("retrieve");
         assert_eq!(a, b, "retrieval must be deterministic");
     }
 
@@ -282,7 +300,10 @@ mod tests {
         )
         .expect("reader");
         let rag = IntentRag::new(reader, Arc::new(StubEmbed::default()));
-        let hits = rag.retrieve("anything", 5).await.expect("retrieve");
+        let hits = rag
+            .retrieve("anything", 5, "default")
+            .await
+            .expect("retrieve");
         assert!(hits.is_empty(), "empty catalogue must yield no candidates");
     }
 }

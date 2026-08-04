@@ -22,6 +22,7 @@ pub mod suppression;
 pub use catalog::{READ_ONLY_CATALOG_ALIAS, WRITE_CATALOG_ALIAS};
 pub use config::{
     CompactionConfig, EngineConfig, FrequencyCap, GuardrailConfig, LlmConfig, SuppressionRules,
+    TenantCredentials,
 };
 pub use dataset::Dataset;
 pub use error::{Error, Result};

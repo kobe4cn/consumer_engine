@@ -82,13 +82,15 @@ impl QueryEngine {
         }
     }
 
-    /// Run a DSL JSON value end-to-end: parse/validate → compile → guard → run.
+    /// Run a DSL JSON value end-to-end: parse/validate → compile → guard → run,
+    /// scoped to `tenant` (issue #22: the compiler injects the caller's tenant
+    /// into every SQL — never trusted from the DSL).
     ///
     /// # Errors
     /// Propagates parse, guardrail, and execution errors.
-    pub async fn run(&self, dsl: serde_json::Value) -> Result<SyncResult> {
+    pub async fn run(&self, dsl: serde_json::Value, tenant: &str) -> Result<SyncResult> {
         let q = crate::parse::parse(dsl)?;
-        self.run_sync(&q).await
+        self.run_sync(&q, tenant).await
     }
 
     /// Run a read-only reader query under the statement-timeout guardrail
@@ -112,15 +114,16 @@ impl QueryEngine {
     /// engine's suppression rules so `Exclude` anti-joins honour the configured
     /// frequency cap (specs/20 §5). A terminal `Derive` is compiled with the
     /// survivor-set `LIMIT` from the prior B/F stages' EXPLAIN (specs/12 §4).
-    async fn compile_and_check(&self, q: &SegmentQuery) -> Result<CompiledQuery> {
-        self.enforce_catalogue(q).await?;
+    async fn compile_and_check(&self, q: &SegmentQuery, tenant: &str) -> Result<CompiledQuery> {
+        self.enforce_catalogue(q, tenant).await?;
         let base = CompileOptions {
             alias: READ_ONLY_CATALOG_ALIAS,
             suppression: &self.suppression,
             derive_limit: None,
+            tenant,
         };
         if has_derive(q) {
-            let limit = self.derive_survivor_limit(q).await?;
+            let limit = self.derive_survivor_limit(q, tenant).await?;
             return compile_with_opts(
                 q,
                 &CompileOptions {
@@ -137,7 +140,7 @@ impl QueryEngine {
     /// survivor count exceeds `j_survivor_cap` (specs/12 §4 I5 / I2: guardrails
     /// non-bypassable — an EXPLAIN estimate could both bypass the cap and
     /// silently truncate, so the count is measured, not estimated).
-    async fn derive_survivor_limit(&self, q: &SegmentQuery) -> Result<u64> {
+    async fn derive_survivor_limit(&self, q: &SegmentQuery, tenant: &str) -> Result<u64> {
         let narrowing = strip_derive(q);
         let c = compile_with_opts(
             &narrowing,
@@ -145,6 +148,7 @@ impl QueryEngine {
                 alias: READ_ONLY_CATALOG_ALIAS,
                 suppression: &self.suppression,
                 derive_limit: None,
+                tenant,
             },
         )?;
         let count_sql = format!("SELECT count(*) FROM ({}) sub", c.sql);
@@ -164,12 +168,13 @@ impl QueryEngine {
     /// Run a terminal `Characterize` segment (P): compile the three profile
     /// queries, run them read-only under the statement-timeout, and assemble a
     /// structured segment-vs-baseline profile (specs/12 §4, issue #9).
-    async fn run_characterize(&self, q: &SegmentQuery) -> Result<SyncResult> {
-        self.enforce_catalogue(q).await?;
+    async fn run_characterize(&self, q: &SegmentQuery, tenant: &str) -> Result<SyncResult> {
+        self.enforce_catalogue(q, tenant).await?;
         let opts = CompileOptions {
             alias: READ_ONLY_CATALOG_ALIAS,
             suppression: &self.suppression,
             derive_limit: None,
+            tenant,
         };
         let queries = crate::compiler::compile_characterize(q, &opts)?;
         let metrics = self
@@ -201,7 +206,7 @@ impl QueryEngine {
     ///
     /// # Errors
     /// [`QueryError::InvalidDsl`] naming the first missing column/feature.
-    async fn enforce_catalogue(&self, q: &SegmentQuery) -> Result<()> {
+    async fn enforce_catalogue(&self, q: &SegmentQuery, tenant: &str) -> Result<()> {
         if !self.guardrails.enforce_catalogue {
             return Ok(());
         }
@@ -251,9 +256,13 @@ impl QueryEngine {
                         &format!(
                             "SELECT max(source_epoch) FROM \
                              {READ_ONLY_CATALOG_ALIAS}.semantic_catalog WHERE system = ? AND \
-                             table_name = ?"
+                             table_name = ? AND tenant_id = ?"
                         ),
-                        vec![Value::Text(system.clone()), Value::Text(entity.clone())],
+                        vec![
+                            Value::Text(system.clone()),
+                            Value::Text(entity.clone()),
+                            Value::Text(tenant.to_string()),
+                        ],
                     )
                     .await?;
                 let catalogue_epoch = qr
@@ -280,9 +289,9 @@ impl QueryEngine {
                 .timed_read(
                     &format!(
                         "SELECT 1 FROM {READ_ONLY_CATALOG_ALIAS}.feature_store WHERE feature_name \
-                         = ? LIMIT 1"
+                         = ? AND tenant_id = ? LIMIT 1"
                     ),
-                    vec![Value::Text(name.clone())],
+                    vec![Value::Text(name.clone()), Value::Text(tenant.to_string())],
                 )
                 .await?;
             if qr.rows.is_empty() {
@@ -300,8 +309,8 @@ impl QueryEngine {
     ///
     /// # Errors
     /// Propagates compile/guardrail errors.
-    pub async fn plan(&self, q: &SegmentQuery) -> Result<Plan> {
-        let (plan, _compiled) = self.prepare(q).await?;
+    pub async fn plan(&self, q: &SegmentQuery, tenant: &str) -> Result<Plan> {
+        let (plan, _compiled) = self.prepare(q, tenant).await?;
         Ok(plan)
     }
 
@@ -310,8 +319,8 @@ impl QueryEngine {
     ///
     /// # Errors
     /// Propagates compile/guardrail errors.
-    async fn prepare(&self, q: &SegmentQuery) -> Result<(Plan, CompiledQuery)> {
-        let compiled = self.compile_and_check(q).await?;
+    async fn prepare(&self, q: &SegmentQuery, tenant: &str) -> Result<(Plan, CompiledQuery)> {
+        let compiled = self.compile_and_check(q, tenant).await?;
         let est = explain_cost(
             &self.reader,
             &compiled,
@@ -340,7 +349,7 @@ impl QueryEngine {
     /// [`QueryError::Guardrail`] on timeout or output-row cap;
     /// [`QueryError::TooLarge`] if the plan is async (not in M1);
     /// [`QueryError::Execution`] on reader failure.
-    pub async fn run_sync(&self, q: &SegmentQuery) -> Result<SyncResult> {
+    pub async fn run_sync(&self, q: &SegmentQuery, tenant: &str) -> Result<SyncResult> {
         // Concurrency cap (acquired before the EXPLAIN pre-flight + execute).
         let _permit = self
             .inflight
@@ -353,12 +362,12 @@ impl QueryEngine {
         // A terminal Characterize emits a structured profile, not rows — run
         // the profile path instead of the row pipeline.
         if has_characterize(q) {
-            return self.run_characterize(q).await;
+            return self.run_characterize(q, tenant).await;
         }
 
         // Pre-flight: compile + EXPLAIN + enforce budgets (AC#3: over-budget is
         // rejected here, before the query executes).
-        let (plan, compiled) = self.prepare(q).await?;
+        let (plan, compiled) = self.prepare(q, tenant).await?;
         if plan.mode == Mode::Async {
             return Err(QueryError::TooLarge);
         }
@@ -403,7 +412,11 @@ impl QueryEngine {
     /// # Errors
     /// [`QueryError::Guardrail`] on timeout/row-cap; [`QueryError::Execution`]
     /// on reader failure.
-    pub async fn run_sql_approved(&self, sql: &str) -> Result<SyncResult> {
+    pub async fn run_sql_approved(&self, sql: &str, tenant: &str) -> Result<SyncResult> {
+        // NOTE (issue #22): raw SQL cannot have a tenant filter injected by the
+        // compiler — it runs tenant-unscooped, gated only by the separate
+        // approval token. The caller (ingress) audit-logs it with the tenant.
+        let _ = tenant;
         let _permit = self
             .inflight
             .acquire()
@@ -455,7 +468,12 @@ impl QueryEngine {
     /// - [`QueryError::InvalidDsl`] if the segment fails to compile or the DSL cannot be serialised
     ///   as `hit_reason`.
     /// - [`QueryError::Execution`] propagating ingestion/storage failures.
-    pub async fn materialize(&self, q: &SegmentQuery, campaign_id: &str) -> Result<String> {
+    pub async fn materialize(
+        &self,
+        q: &SegmentQuery,
+        campaign_id: &str,
+        tenant: &str,
+    ) -> Result<String> {
         // A JIT Derive emits a metric, not a key set — it cannot materialise.
         if has_derive(q) {
             return Err(QueryError::InvalidDsl(
@@ -472,7 +490,7 @@ impl QueryEngine {
         // alias and surfaces a bad-DSL failure early, but does NOT enforce row
         // budgets (large is the point of materialising). Errors from EXPLAIN
         // (a real compile error) are surfaced via `compile` below.
-        let compiled = self.compile_and_check(q).await?;
+        let compiled = self.compile_and_check(q, tenant).await?;
         let est = explain_cost(
             &self.reader,
             &compiled,
@@ -493,7 +511,7 @@ impl QueryEngine {
 
         // Feature families known to the store (fresh read; the writer's
         // `feature_wide_*` views are at least as fresh).
-        let families = self.feature_families().await?;
+        let families = self.feature_families(tenant).await?;
 
         // Write path: recompile under the writable alias so the writer's
         // `INSERT … SELECT` resolves `dl.raw_*`.
@@ -503,6 +521,7 @@ impl QueryEngine {
                 alias: WRITE_CATALOG_ALIAS,
                 suppression: &self.suppression,
                 derive_limit: None,
+                tenant,
             },
         )?;
 
@@ -525,8 +544,9 @@ impl QueryEngine {
             let fa = format!("fs_{idx}");
             joins.push_str(&format!(
                 " LEFT JOIN {WRITE_CATALOG_ALIAS}.feature_wide_{family} {fa} ON {fa}.user_id = \
-                 s.{key}"
+                 s.{key} AND {fa}.tenant_id = ?"
             ));
+            wrap_params.push(Value::Text(tenant.to_string()));
             for short in shorts {
                 json_pairs.push(format!("'{family}.{short}', {fa}.{short}"));
             }
@@ -547,7 +567,7 @@ impl QueryEngine {
             as_of_ts,
         };
         self.ingestion
-            .materialize_snapshot(&wrap_sql, wrap_params, &q.key, spec)
+            .materialize_snapshot(&wrap_sql, wrap_params, &q.key, spec, tenant)
             .await?;
         Ok(format!("snap_{snapshot_id}"))
     }
@@ -561,11 +581,11 @@ impl QueryEngine {
     /// rows just carry `features={}` (D11 / issue #13: frozen features are an
     /// enrichment, not a prerequisite; the server ensures the table at startup
     /// anyway).
-    async fn feature_families(&self) -> Result<BTreeMap<String, Vec<String>>> {
+    async fn feature_families(&self, tenant: &str) -> Result<BTreeMap<String, Vec<String>>> {
         let qr = match self
             .timed_read(
-                "SELECT DISTINCT feature_name FROM dro.feature_store",
-                Vec::new(),
+                "SELECT DISTINCT feature_name FROM dro.feature_store WHERE tenant_id = ?",
+                vec![Value::Text(tenant.to_string())],
             )
             .await
         {
@@ -597,12 +617,24 @@ impl QueryEngine {
     ///
     /// # Errors
     /// [`QueryError::Execution`] on reader failure.
-    pub async fn snapshot_meta(&self, snap_uuid: &str) -> Result<Option<SnapshotMeta>> {
-        const SQL: &str = "SELECT campaign_id, CAST(as_of_ts AS VARCHAR), count(*) FROM \
-                           dro.audience_snapshot WHERE snapshot_id = CAST(? AS UUID) GROUP BY \
-                           campaign_id, as_of_ts";
+    pub async fn snapshot_meta(
+        &self,
+        snap_uuid: &str,
+        tenant: &str,
+    ) -> Result<Option<SnapshotMeta>> {
+        // IDOR closure (issue #22 / specs/21 I3): the metadata read is scoped to
+        // the caller's tenant — a foreign tenant's snapshot resolves to None.
+        let sql = "SELECT campaign_id, CAST(as_of_ts AS VARCHAR), count(*) FROM \
+                   dro.audience_snapshot WHERE snapshot_id = CAST(? AS UUID) AND tenant_id = ? \
+                   GROUP BY campaign_id, as_of_ts";
         let qr = self
-            .timed_read(SQL, vec![Value::Text(snap_uuid.to_string())])
+            .timed_read(
+                sql,
+                vec![
+                    Value::Text(snap_uuid.to_string()),
+                    Value::Text(tenant.to_string()),
+                ],
+            )
             .await?;
         let row = match qr.rows.into_iter().next() {
             Some(r) => r,
@@ -823,7 +855,10 @@ mod tests {
         }))
         .expect("parse");
 
-        let snap = engine.materialize(&q, "c1").await.expect("materialize");
+        let snap = engine
+            .materialize(&q, "c1", "default")
+            .await
+            .expect("materialize");
         assert!(
             snap.starts_with("snap_"),
             "snapshot id must be snap_-prefixed: {snap}"
@@ -831,7 +866,7 @@ mod tests {
 
         let bare = snap.strip_prefix("snap_").expect("snap_ prefix");
         let meta = engine
-            .snapshot_meta(bare)
+            .snapshot_meta(bare, "default")
             .await
             .expect("snapshot_meta")
             .expect("snapshot exists");
@@ -921,7 +956,7 @@ mod tests {
             ]
         }))
         .expect("parse");
-        let res = engine.run_sync(&q).await.expect("run");
+        let res = engine.run_sync(&q, "default").await.expect("run");
         assert_eq!(
             res.freshness.worst_source, "batch",
             "the stale batch source must be reported as worst (graded freshness, D5)"
@@ -1035,7 +1070,7 @@ mod tests {
     #[tokio::test]
     async fn test_should_allow_catalogued_column() {
         let (_tmp, ingestion, engine) = setup_engine(GuardrailConfig::default()).await;
-        let res = engine.run_sync(&filter_on("sku")).await;
+        let res = engine.run_sync(&filter_on("sku"), "default").await;
         assert!(
             res.is_ok(),
             "catalogued column must pass enforcement: {res:?}"
@@ -1047,7 +1082,7 @@ mod tests {
     async fn test_should_reject_uncatalogued_column() {
         let (_tmp, ingestion, engine) = setup_engine(GuardrailConfig::default()).await;
         let err = engine
-            .run_sync(&filter_on("qty"))
+            .run_sync(&filter_on("qty"), "default")
             .await
             .expect_err("uncatalogued column must be rejected");
         assert!(
@@ -1148,7 +1183,7 @@ mod tests {
             "ops": [{"kind":"filter","predicate":{"column":"sku","op":"eq","value":"A"}}]
         }))
         .expect("parse");
-        let res = engine.run_sync(&q).await.expect("query runs");
+        let res = engine.run_sync(&q, "default").await.expect("query runs");
         assert!(
             !res.rows.is_empty(),
             "stale catalogue must not block the query (warn, not reject)"
@@ -1171,7 +1206,7 @@ mod tests {
             .with_max_level(tracing::Level::INFO)
             .finish();
         let _guard2 = tracing::subscriber::set_default(sub2);
-        let _ = engine.run_sync(&q).await.expect("query runs");
+        let _ = engine.run_sync(&q, "default").await.expect("query runs");
         drop(_guard2);
         let out2 = String::from_utf8(buf2.lock().expect("buf").clone()).expect("utf8");
         assert!(
@@ -1190,7 +1225,7 @@ mod tests {
             ..GuardrailConfig::default()
         })
         .await;
-        let res = engine.run_sync(&filter_on("qty")).await;
+        let res = engine.run_sync(&filter_on("qty"), "default").await;
         assert!(res.is_ok(), "enforcement off must not reject: {res:?}");
         ingestion.shutdown();
     }
@@ -1206,7 +1241,7 @@ mod tests {
             "ops": [{"kind":"feature","name":"cadence.regularity","op":"gt","value":0.7}]
         }))
         .expect("parse");
-        let res = engine.run_sync(&ok).await;
+        let res = engine.run_sync(&ok, "default").await;
         assert!(res.is_ok(), "registered feature must pass: {res:?}");
 
         let bad = crate::parse::parse(serde_json::json!({
@@ -1216,7 +1251,7 @@ mod tests {
         }))
         .expect("parse");
         let err = engine
-            .run_sync(&bad)
+            .run_sync(&bad, "default")
             .await
             .expect_err("unregistered feature must be rejected");
         assert!(
@@ -1308,7 +1343,7 @@ mod tests {
             ]
         }))
         .expect("parse");
-        let res = engine.run_sync(&q).await.expect("run");
+        let res = engine.run_sync(&q, "default").await.expect("run");
         // One row: [name, value]; the single survivor u1's amounts 10+20 = 30
         // (the survivor LIMIT may be 1 for a tiny table, so keep one survivor
         // to make the assertion deterministic).
@@ -1400,7 +1435,7 @@ mod tests {
         }))
         .expect("parse");
         let err = engine
-            .run_sync(&q2)
+            .run_sync(&q2, "default")
             .await
             .expect_err("derive over 2 survivors with cap=1 must be rejected");
         assert!(
@@ -1504,7 +1539,7 @@ mod tests {
             ]
         }))
         .expect("parse");
-        let res = engine.run_sync(&q).await.expect("run");
+        let res = engine.run_sync(&q, "default").await.expect("run");
         assert_eq!(res.columns, vec!["profile"]);
         let p = &res.rows[0][0];
         // Segment = {u1}; baseline = {u1, u2}.
