@@ -63,9 +63,15 @@ impl IntentRag {
         // The read is bounded with a defensive row cap (AGENTS.md § Resource
         // Limits: bound every collection). M3 catalogues are far smaller than
         // this, so top-k over the full catalogue is unaffected.
+        // Only the NEWEST catalogue row per (system, table, column) is
+        // retrievable (issue #18 / spec 13 I5): a re-onboard appends a versioned
+        // delta, and the newest `source_epoch` wins — stale descriptions never
+        // rank against the fresh ones.
         let query = format!(
             "SELECT system, table_name, column_name, semantic_type, description, embedding FROM \
-             {READ_ONLY_CATALOG_ALIAS}.semantic_catalog LIMIT {MAX_CATALOG_SCAN}"
+             {READ_ONLY_CATALOG_ALIAS}.semantic_catalog QUALIFY row_number() OVER (PARTITION BY \
+             system, table_name, column_name ORDER BY source_epoch DESC) = 1 LIMIT \
+             {MAX_CATALOG_SCAN}"
         );
         let qr = self.reader.query_with_params(&query, Vec::new()).await?;
 
@@ -196,6 +202,7 @@ mod tests {
                     .embed("The user identifier of the orders table")
                     .await
                     .expect("embed"),
+                source_epoch: 0,
             },
             CatalogRow {
                 entity_type: "column".into(),
@@ -211,6 +218,7 @@ mod tests {
                     .embed("The monetary amount spent on an order")
                     .await
                     .expect("embed"),
+                source_epoch: 0,
             },
         ];
         writer.write_catalog_rows(&rows).expect("write catalog");

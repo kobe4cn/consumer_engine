@@ -223,9 +223,10 @@ async fn onboard(
         .ingest_raw(&req.system, &req.entity, req.columns, req.rows)
         .await?;
     let source_type = parse_source_type(&req.source_type)?;
+    let ingest_epoch = now_epoch();
     state
         .freshness
-        .set(&req.system, &req.entity, source_type, now_epoch())?;
+        .set(&req.system, &req.entity, source_type, ingest_epoch)?;
 
     // Profile with a wall-clock budget (spec 21 I5); a timeout/failure degrades
     // to `profiled=false` rather than failing the whole onboard (the rows are
@@ -236,7 +237,14 @@ async fn onboard(
     )
     .await
     {
-        Ok(Ok(rows)) => {
+        Ok(Ok(mut rows)) => {
+            // Stamp every catalogue row with the source state it was built
+            // from (spec 13 I5 / issue #18) so the query path can warn when a
+            // referenced column's entry is older than the source's latest
+            // ingest, and re-onboards append versioned deltas.
+            for r in &mut rows {
+                r.source_epoch = ingest_epoch;
+            }
             let cols: Vec<String> = rows.iter().filter_map(|r| r.column_name.clone()).collect();
             match state.ingestion.write_catalog(rows).await {
                 Ok(_) => (true, cols),
@@ -255,6 +263,16 @@ async fn onboard(
             (false, Vec::new())
         }
     };
+    // Catalogue freshness (spec 13 I5 / issue #18): rows ingested but not
+    // re-profiled leaves the catalogue stamped with an older source state —
+    // subsequent queries warn that the referenced columns are stale.
+    if !profiled && n > 0 {
+        tracing::warn!(
+            system = %req.system,
+            entity = %req.entity,
+            "source ingested but not re-profiled; semantic catalogue may be stale (spec 13 I5)"
+        );
+    }
     Ok(Json(OnboardResponse {
         rows_inserted: n,
         profiled,

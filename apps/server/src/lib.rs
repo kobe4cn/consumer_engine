@@ -54,12 +54,16 @@ impl Engine {
         // when it advances — the hot path is attach-free, and readers never
         // serve stale data after a commit.
         let write_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let writer = Writer::attach_with_gen(
+        let mut writer = Writer::attach_with_gen(
             &config.catalog_path,
             &config.data_path,
             &config.compaction,
             Some(Arc::clone(&write_gen)),
         )?;
+        // Tenant stamping (issue #14): the single writer stamps every committed
+        // row with the engine's configured tenant; per-caller isolation from
+        // auth claims lands with #22.
+        writer.set_tenant(config.tenant_id.clone());
         // Initialise the materialise schema up front so read-only `snapshot_meta`
         // queries never hit a missing `audience_snapshot` table before the first
         // materialise (the writer creates it lazily too, but a startup init keeps
@@ -162,6 +166,7 @@ impl Engine {
         let compaction = tokio::spawn(supervise_compaction(
             ingestion.clone(),
             config.compaction_interval_secs,
+            config.compaction.snapshot_retention_days,
         ));
 
         let jobs = Arc::new(JobRegistry::new());
@@ -216,19 +221,27 @@ impl Drop for Engine {
 /// AGENTS.md § Async ("always handle task panics"). The loop is infinite, so
 /// the supervisor only observes a result on panic; `Engine::drop` aborts the
 /// supervisor, whose drop aborts the inner task.
-async fn supervise_compaction(ingestion: IngestionHandle, interval_secs: u64) {
+async fn supervise_compaction(ingestion: IngestionHandle, interval_secs: u64, retention_days: u64) {
     let mut set = tokio::task::JoinSet::new();
-    set.spawn(compaction_loop(ingestion.clone(), interval_secs));
+    set.spawn(compaction_loop(
+        ingestion.clone(),
+        interval_secs,
+        retention_days,
+    ));
     while let Some(res) = set.join_next().await {
         if let Err(e) = res {
             tracing::error!(error = %e, "compaction task panicked; respawning");
-            set.spawn(compaction_loop(ingestion.clone(), interval_secs));
+            set.spawn(compaction_loop(
+                ingestion.clone(),
+                interval_secs,
+                retention_days,
+            ));
         }
     }
 }
 
 /// Periodic best-effort compaction sweep over all ingested tables.
-async fn compaction_loop(ingestion: IngestionHandle, interval_secs: u64) {
+async fn compaction_loop(ingestion: IngestionHandle, interval_secs: u64, retention_days: u64) {
     if interval_secs == 0 {
         return;
     }
@@ -238,7 +251,7 @@ async fn compaction_loop(ingestion: IngestionHandle, interval_secs: u64) {
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        if let Err(e) = ingestion.compact_all().await {
+        if let Err(e) = ingestion.compact_all(retention_days).await {
             warn!(error = %e, "compaction sweep failed");
         }
     }

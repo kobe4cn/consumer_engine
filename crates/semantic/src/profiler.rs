@@ -5,7 +5,10 @@
 //! values are redacted **before** any LLM description or embedding is generated
 //! (I4): only the description is embedded, never PII values.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use consumer_engine_core::{
     CatalogRow, READ_ONLY_CATALOG_ALIAS, Result, SemanticType, validate_ident,
@@ -64,8 +67,11 @@ impl Profiler {
     }
 
     /// Profile `system`.`table`: bounded sample, classify, redact PII, describe,
-    /// embed, and return one `CatalogRow` per column. The caller writes them
-    /// via the single ingestion writer (spec 13 §2 — onboarding-only writes).
+    /// embed, and return the catalogue delta — one **table-level row** plus one
+    /// row per column (issue #19: `entity_type = "table"` row with
+    /// `column_name = None` for table-granular ranking; column rows feed the
+    /// agent's composable DSL predicates). The caller writes them via the
+    /// single ingestion writer (spec 13 §2 — onboarding-only writes).
     ///
     /// Raw tables store every column as `VARCHAR` (see `storage::ingest_raw`),
     /// so `data_type` is reported as `"VARCHAR"`; all sampled values are strings.
@@ -77,16 +83,53 @@ impl Profiler {
         validate_ident(system)?;
         validate_ident(table)?;
         let sql = format!(
-            "SELECT * FROM {READ_ONLY_CATALOG_ALIAS}.raw_{system}_{table} LIMIT {}",
+            "SELECT * EXCLUDE (tenant_id) FROM {READ_ONLY_CATALOG_ALIAS}.raw_{system}_{table} \
+             LIMIT {}",
             self.sample_rows
         );
         let qr = self.reader.query_with_params(&sql, Vec::new()).await?;
         let columns = qr.columns;
+        // Catalogue entries are stamped with the source state they were built
+        // from (spec 13 I5 / issue #18): the query path warns when an entry is
+        // older than the source's latest ingest, and a re-onboard appends a
+        // newer row (versioned delta) instead of overwriting.
+        let source_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
 
         // Per-column sample values: distinct non-null strings, bounded.
         let per_column_samples = sample_columns(&qr.rows, &columns, self.sample_value_bytes);
 
-        let mut rows = Vec::with_capacity(columns.len());
+        let mut rows = Vec::with_capacity(columns.len() + 1);
+        // Table-level row (issue #19): a summary of the whole relation for
+        // table-granular ranking. Description is deterministic (no PII — it
+        // only names the relation); LLM-generated table blurbs are a future
+        // refinement.
+        let table_description = format!(
+            "Table '{table}' of {system}.{table} ({n} columns)",
+            n = columns.len()
+        );
+        let table_embedding = match self.embed.embed(&table_description).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "table embedding failed; using zero vector");
+                vec![0.0; self.embed.dim()]
+            }
+        };
+        rows.push(CatalogRow {
+            entity_type: "table".into(),
+            system: system.into(),
+            table_name: table.into(),
+            column_name: None,
+            semantic_type: SemanticType::Table,
+            data_type: "TABLE".into(),
+            description: table_description,
+            pii_flag: false,
+            sample_values: Value::Array(Vec::new()),
+            embedding: table_embedding,
+            source_epoch,
+        });
         for (idx, column) in columns.iter().enumerate() {
             let semantic_type = classify(column);
             let pii_flag = semantic_type == SemanticType::Pii;
@@ -145,6 +188,7 @@ impl Profiler {
                     stored_samples.into_iter().map(Value::String).collect(),
                 ),
                 embedding,
+                source_epoch,
             });
         }
         Ok(rows)
@@ -310,6 +354,35 @@ mod tests {
                 "sample value must be byte-bounded: {v}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_should_emit_table_level_row() {
+        // Issue #19: the profiler emits one `entity_type = "table"` row with
+        // `column_name = None` and `SemanticType::Table`, ahead of the column
+        // rows, so table-granular retrieval can rank whole relations.
+        let (_tmp, reader) = tmp_reader();
+        let profiler = Profiler::new(reader, Arc::new(StubLlm), Arc::new(StubEmbed::default()));
+        let rows = profiler.onboard("erp", "orders").await.expect("onboard");
+        let table_row = rows
+            .iter()
+            .find(|r| r.entity_type == "table")
+            .expect("a table-level row must be emitted");
+        assert_eq!(table_row.column_name, None, "table row has no column");
+        assert_eq!(table_row.semantic_type, SemanticType::Table);
+        assert_eq!(table_row.system, "erp");
+        assert_eq!(table_row.table_name, "orders");
+        assert!(
+            table_row.description.contains("orders"),
+            "table description must name the relation: {}",
+            table_row.description
+        );
+        // The column rows are still emitted alongside.
+        assert!(
+            rows.iter()
+                .any(|r| r.column_name.as_deref() == Some("user_id")),
+            "column rows must survive the table row"
+        );
     }
 
     #[tokio::test]

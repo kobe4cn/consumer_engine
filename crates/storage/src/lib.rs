@@ -14,6 +14,7 @@
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
 use std::{
+    cell::Cell,
     path::Path,
     sync::{
         Arc,
@@ -59,6 +60,14 @@ pub struct Writer {
     /// changes — the single writer (D3) is the reliable commit signal the
     /// spike found no reader-side proxy for.
     write_gen: Option<Arc<AtomicU64>>,
+    /// Whether the DuckLake build can bind the timestamp-parameterized
+    /// maintenance procedures (`ducklake_expire_snapshots` / orphan cleanup).
+    /// Probed once at attach: duckdb 1.10505.0 has a TIMESTAMPTZ binder defect
+    /// that rejects them entirely (issue #17 — see specs/93 GC-MAINT-BINDER).
+    maintenance_available: Cell<bool>,
+    /// The engine's tenant, stamped on every committed row (issue #14 / AC6
+    /// foundation). Set from config at attach; single-tenant today.
+    tenant: String,
 }
 
 impl std::fmt::Debug for Writer {
@@ -140,7 +149,16 @@ impl Writer {
             conn,
             _lock: lock_file,
             write_gen: None,
+            maintenance_available: Cell::new(false),
+            tenant: "default".to_string(),
         })
+    }
+
+    /// Set the tenant stamped on every committed row (issue #14). The single
+    /// writer owns the engine's tenant; per-caller tenant from auth claims
+    /// lands with the isolation ticket (#22).
+    pub fn set_tenant(&mut self, tenant: String) {
+        self.tenant = tenant;
     }
 
     /// Like [`Self::attach_with_compaction`] but wired to a shared write
@@ -178,11 +196,20 @@ impl Writer {
     pub fn ensure_feature_store_table(&self) -> Result<()> {
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.feature_store (user_id VARCHAR, \
-             feature_name VARCHAR, num_value DOUBLE, as_of_ts TIMESTAMPTZ, producer_id VARCHAR)"
+             feature_name VARCHAR, num_value DOUBLE, as_of_ts TIMESTAMPTZ, producer_id VARCHAR, \
+             tenant_id VARCHAR)"
         );
         self.conn
             .execute_batch(&sql)
-            .map_err(|e| Error::Storage(BoxError::from(e)))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        // Migration for pre-#14 catalogs: add the tenant column if absent.
+        self.conn
+            .execute_batch(&format!(
+                "ALTER TABLE {WRITE_CATALOG_ALIAS}.feature_store ADD COLUMN IF NOT EXISTS \
+                 tenant_id VARCHAR"
+            ))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        Ok(())
     }
 
     /// Create the `semantic_catalog` table if absent. M3 uses a variable-length
@@ -194,11 +221,19 @@ impl Writer {
             "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.semantic_catalog (entity_type \
              VARCHAR, system VARCHAR, table_name VARCHAR, column_name VARCHAR, semantic_type \
              VARCHAR, data_type VARCHAR, description VARCHAR, pii_flag BOOLEAN, sample_values \
-             JSON, embedding FLOAT[])"
+             JSON, embedding FLOAT[], source_epoch BIGINT, tenant_id VARCHAR)"
         );
         self.conn
             .execute_batch(&sql)
-            .map_err(|e| Error::Storage(BoxError::from(e)))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        // Migration for pre-#14 catalogs: add the tenant column if absent.
+        self.conn
+            .execute_batch(&format!(
+                "ALTER TABLE {WRITE_CATALOG_ALIAS}.semantic_catalog ADD COLUMN IF NOT EXISTS \
+                 tenant_id VARCHAR"
+            ))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        Ok(())
     }
 
     /// Create the `suppression` table if absent. No PRIMARY KEY — DuckLake
@@ -208,11 +243,19 @@ impl Writer {
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.suppression (suppression_id UUID, \
              campaign_id VARCHAR, user_id VARCHAR, channel VARCHAR, action VARCHAR, occurred_ts \
-             TIMESTAMPTZ, received_ts TIMESTAMPTZ)"
+             TIMESTAMPTZ, received_ts TIMESTAMPTZ, tenant_id VARCHAR)"
         );
         self.conn
             .execute_batch(&sql)
-            .map_err(|e| Error::Storage(BoxError::from(e)))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        // Migration for pre-#14 catalogs: add the tenant column if absent.
+        self.conn
+            .execute_batch(&format!(
+                "ALTER TABLE {WRITE_CATALOG_ALIAS}.suppression ADD COLUMN IF NOT EXISTS tenant_id \
+                 VARCHAR"
+            ))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        Ok(())
     }
 
     /// Append suppression rows **idempotently**: a row whose `suppression_id`
@@ -229,14 +272,15 @@ impl Writer {
         self.ensure_suppression_table()?;
         let insert = format!(
             "INSERT INTO {WRITE_CATALOG_ALIAS}.suppression (suppression_id, campaign_id, user_id, \
-             channel, action, occurred_ts, received_ts) SELECT CAST(? AS UUID), ?, ?, ?, ?, \
-             CAST(? AS TIMESTAMPTZ), CAST(? AS TIMESTAMPTZ) WHERE NOT EXISTS (SELECT 1 FROM \
-             {WRITE_CATALOG_ALIAS}.suppression WHERE suppression_id = CAST(? AS UUID))"
+             channel, action, occurred_ts, received_ts, tenant_id) SELECT CAST(? AS UUID), ?, ?, \
+             ?, ?, CAST(? AS TIMESTAMPTZ), CAST(? AS TIMESTAMPTZ), ? WHERE NOT EXISTS (SELECT 1 \
+             FROM {WRITE_CATALOG_ALIAS}.suppression WHERE suppression_id = CAST(? AS UUID))"
         );
         let mut stmt = self
             .conn
             .prepare(&insert)
             .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let tenant = self.tenant.clone();
         let mut written = 0usize;
         for r in rows {
             written += stmt
@@ -248,6 +292,7 @@ impl Writer {
                     r.action.as_str(),
                     r.occurred_ts,
                     r.received_ts,
+                    tenant.as_str(),
                     r.suppression_id,
                 ])
                 .map_err(|e| Error::Storage(BoxError::from(e)))?;
@@ -274,10 +319,14 @@ impl Writer {
                 .map_err(|e| Error::InvalidInput(format!("producer_id: {e}")))?;
         }
         self.ensure_feature_store_table()?;
+        let tenant = self.tenant.clone();
         let n = insert_chunked(
             &self.conn,
-            &format!("INSERT INTO {WRITE_CATALOG_ALIAS}.feature_store VALUES "),
-            5,
+            &format!(
+                "INSERT INTO {WRITE_CATALOG_ALIAS}.feature_store (user_id, feature_name, \
+                 num_value, as_of_ts, producer_id, tenant_id) VALUES "
+            ),
+            6,
             rows,
             |r| {
                 vec![
@@ -286,6 +335,7 @@ impl Writer {
                     Value::Double(r.num_value),
                     Value::Text(r.as_of_ts.clone()),
                     Value::Text(r.producer_id.clone()),
+                    Value::Text(tenant.clone()),
                 ]
             },
         )?;
@@ -324,7 +374,7 @@ impl Writer {
         };
         let insert = format!(
             "INSERT INTO {WRITE_CATALOG_ALIAS}.semantic_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?, \
-             CAST(? AS JSON), {emb_expr})"
+             CAST(? AS JSON), {emb_expr}, ?, ?)"
         );
         let mut stmt = self
             .conn
@@ -351,6 +401,11 @@ impl Writer {
             for f in &r.embedding {
                 params.push(Value::Float(*f));
             }
+            // The trailing `?`s in the INSERT (after `{emb_expr}`) are
+            // `source_epoch` then `tenant_id` — bind after the embedding floats
+            // so columns align.
+            params.push(Value::BigInt(r.source_epoch));
+            params.push(Value::Text(self.tenant.clone()));
             written += stmt
                 .execute(duckdb::params_from_iter(params.iter()))
                 .map_err(|e| Error::Storage(BoxError::from(e)))?;
@@ -515,32 +570,47 @@ impl Writer {
         }
         let table = raw_table_name(system, entity)?;
         let cols_names = columns.join(", ");
-        let cols_typed = columns
+        let mut cols_typed = columns
             .iter()
             .map(|c| format!("{c} VARCHAR"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let create =
-            format!("CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.{table} ({cols_typed})");
+            .collect::<Vec<_>>();
+        // Tenant stamping (issue #14): every raw table carries a `tenant_id`
+        // column, filled from the writer's configured tenant.
+        cols_typed.push("tenant_id VARCHAR".to_string());
+        let create = format!(
+            "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.{table} ({})",
+            cols_typed.join(", ")
+        );
         self.conn
             .execute_batch(&create)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        // Migration for tables created before #14: add the column if absent.
+        self.conn
+            .execute_batch(&format!(
+                "ALTER TABLE {WRITE_CATALOG_ALIAS}.{table} ADD COLUMN IF NOT EXISTS tenant_id \
+                 VARCHAR"
+            ))
             .map_err(|e| Error::Storage(BoxError::from(e)))?;
 
         if rows.is_empty() {
             return Ok(0);
         }
+        let tenant = self.tenant.clone();
         let n = insert_chunked(
             &self.conn,
-            &format!("INSERT INTO {WRITE_CATALOG_ALIAS}.{table} ({cols_names}) VALUES "),
-            columns.len(),
+            &format!("INSERT INTO {WRITE_CATALOG_ALIAS}.{table} ({cols_names}, tenant_id) VALUES "),
+            columns.len() + 1,
             rows,
             |row| {
-                row.iter()
+                let mut values: Vec<Value> = row
+                    .iter()
                     .map(|v| match v {
                         Some(s) => Value::Text(s.clone()),
                         None => Value::Null,
                     })
-                    .collect()
+                    .collect();
+                values.push(Value::Text(tenant.clone()));
+                values
             },
         )?;
         self.bump_write();
@@ -577,15 +647,23 @@ impl Writer {
             .position(|c| c == key)
             .ok_or_else(|| Error::InvalidInput(format!("merge key {key:?} must be a column")))?;
         let table = raw_table_name(system, entity)?;
-        let cols_typed = columns
+        let mut cols_typed = columns
             .iter()
             .map(|c| format!("{c} VARCHAR"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let create =
-            format!("CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.{table} ({cols_typed})");
+            .collect::<Vec<_>>();
+        cols_typed.push("tenant_id VARCHAR".to_string());
+        let create = format!(
+            "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.{table} ({})",
+            cols_typed.join(", ")
+        );
         self.conn
             .execute_batch(&create)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        self.conn
+            .execute_batch(&format!(
+                "ALTER TABLE {WRITE_CATALOG_ALIAS}.{table} ADD COLUMN IF NOT EXISTS tenant_id \
+                 VARCHAR"
+            ))
             .map_err(|e| Error::Storage(BoxError::from(e)))?;
         if rows.is_empty() {
             return Ok(0);
@@ -609,20 +687,23 @@ impl Writer {
         // autocommit would create one snapshot per MERGE; per-row MERGE would
         // create one snapshot per row — the issue #12 defect class).
         const MERGE_CHUNK_ROWS: usize = 500;
-        let cols_names = columns.join(", ");
-        let set_clause = columns
+        let tenant = self.tenant.clone();
+        let mut cols_all: Vec<String> = columns.to_vec();
+        cols_all.push("tenant_id".to_string());
+        let cols_names = cols_all.join(", ");
+        let set_clause = cols_all
             .iter()
             .map(|c| format!("{c} = s.{c}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let insert_vals = columns
+        let insert_vals = cols_all
             .iter()
             .map(|c| format!("s.{c}"))
             .collect::<Vec<_>>()
             .join(", ");
         let mut affected = 0usize;
         for chunk in deduped.chunks(MERGE_CHUNK_ROWS) {
-            let row_sql = format!("({})", vec!["?"; columns.len()].join(", "));
+            let row_sql = format!("({})", vec!["?"; cols_all.len()].join(", "));
             let multi = vec![row_sql.as_str(); chunk.len()].join(", ");
             let merge = format!(
                 "MERGE INTO {WRITE_CATALOG_ALIAS}.{table} AS t USING (VALUES {multi}) AS \
@@ -635,7 +716,11 @@ impl Writer {
                 .map_err(|e| Error::Storage(BoxError::from(e)))?;
             let params: Vec<Option<&str>> = chunk
                 .iter()
-                .flat_map(|row| row.iter().map(|v| v.as_deref()))
+                .flat_map(|row| {
+                    row.iter()
+                        .map(|v| v.as_deref())
+                        .chain(std::iter::once(Some(tenant.as_str())))
+                })
                 .collect();
             affected += stmt
                 .execute(duckdb::params_from_iter(params))
@@ -712,6 +797,104 @@ impl Writer {
         Ok(())
     }
 
+    /// Expire snapshots older than `retention_days` (specs/71 §4, issue #17):
+    /// `ducklake_expire_snapshots` drops old time-travel versions, bounding the
+    /// catalog size that drives the read-attach cost (issue #12). The latest
+    /// snapshot is never older than `now`, so current data always survives.
+    ///
+    /// # Errors
+    /// [`Error::Storage`] on expiry failure.
+    /// Probe once (at first maintenance use) whether the DuckLake build can
+    /// bind the timestamp-parameterized maintenance procedures. A no-op dry-run
+    /// CALL with a far-future timestamp expires nothing and deletes nothing;
+    /// on duckdb 1.10505.0 the TIMESTAMPTZ binder defect makes it fail, so
+    /// expiry/cleanup degrade to a documented no-op (issue #17, specs/93
+    /// GC-MAINT-BINDER) rather than failing the whole maintenance sweep.
+    /// Probe once (at first maintenance use) whether the DuckLake build can
+    /// bind the timestamp-parameterized maintenance procedures. The probe is a
+    /// **dry-run** CALL with a **far-past** `older_than` (1970) so it expires
+    /// nothing and deletes nothing even on a build where binding works — a
+    /// far-future timestamp would be a data-destroying time bomb the moment the
+    /// binder defect is fixed (it would expire every snapshot). On duckdb
+    /// 1.10505.0 the TIMESTAMPTZ binder defect rejects the call entirely, so
+    /// expiry/cleanup degrade to a documented no-op (issue #17, specs/93
+    /// GC-MAINT-BINDER) rather than failing the whole maintenance sweep.
+    fn probe_maintenance(&self) {
+        if self.maintenance_available.get() {
+            return;
+        }
+        let probe = format!(
+            "CALL ducklake_expire_snapshots('{WRITE_CATALOG_ALIAS}', CAST(? AS TIMESTAMPTZ), \
+             CAST([] AS UBIGINT[]), true)"
+        );
+        let ok = self
+            .conn
+            .prepare(&probe)
+            .and_then(|mut stmt| stmt.execute(duckdb::params!["1970-01-01T00:00:00Z"]))
+            .is_ok();
+        self.maintenance_available.set(ok);
+        if !ok {
+            tracing::warn!(
+                "DuckLake build cannot bind timestamp maintenance procedures; snapshot expiry and \
+                 orphan cleanup are disabled until a DuckLake upgrade (issue #17)"
+            );
+        }
+    }
+
+    /// Expire snapshots older than `retention_days` (specs/71 §4, issue #17):
+    /// `ducklake_expire_snapshots` drops old time-travel versions, bounding the
+    /// catalog size that drives the read-attach cost (issue #12). The latest
+    /// snapshot is never older than `now`, so current data always survives.
+    /// Degrades to a no-op on builds that cannot bind the procedure
+    /// (see [`Self::probe_maintenance`]).
+    ///
+    /// # Errors
+    /// [`Error::Storage`] on expiry failure (when the procedure is callable).
+    pub fn expire_snapshots(&self, retention_days: u64) -> Result<()> {
+        self.probe_maintenance();
+        if !self.maintenance_available.get() {
+            return Ok(());
+        }
+        let sql = format!(
+            "CALL ducklake_expire_snapshots('{WRITE_CATALOG_ALIAS}', CAST(CAST(now() AS \
+             TIMESTAMP) - INTERVAL '{retention_days}' DAY AS TIMESTAMPTZ), CAST([] AS UBIGINT[]), \
+             false)"
+        );
+        self.conn
+            .execute_batch(&sql)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        self.bump_write();
+        Ok(())
+    }
+
+    /// Reclaim orphaned files (specs/71 §4, issue #17): `ducklake_delete_orphaned_files`
+    /// removes catalog-unreferenced data files, so a long-lived catalog does not
+    /// leak space.
+    ///
+    /// # Errors
+    /// [`Error::Storage`] on cleanup failure.
+    /// Reclaim orphaned files (specs/71 §4, issue #17):
+    /// `ducklake_delete_orphaned_files` removes catalog-unreferenced data files.
+    /// Degrades to a no-op on builds that cannot bind the procedure
+    /// (see [`Self::probe_maintenance`]).
+    ///
+    /// # Errors
+    /// [`Error::Storage`] on cleanup failure (when the procedure is callable).
+    pub fn delete_orphaned_files(&self, retention_days: u64) -> Result<()> {
+        self.probe_maintenance();
+        if !self.maintenance_available.get() {
+            return Ok(());
+        }
+        let sql = format!(
+            "CALL ducklake_delete_orphaned_files('{WRITE_CATALOG_ALIAS}', CAST(CAST(now() AS \
+             TIMESTAMP) - INTERVAL '{retention_days}' DAY AS TIMESTAMPTZ), true, false)"
+        );
+        self.conn
+            .execute_batch(&sql)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        self.bump_write();
+        Ok(())
+    }
     /// Create the `audience_snapshot` table if absent. No PRIMARY KEY/UNIQUE —
     /// DuckLake rejects them (`specs/10`, `specs/20 §4`). Called at materialise
     /// time (defensive) and at engine startup so reads never hit a missing
@@ -720,11 +903,19 @@ impl Writer {
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.audience_snapshot (snapshot_id \
              UUID, campaign_id VARCHAR, as_of_ts TIMESTAMPTZ, user_id VARCHAR, features JSON, \
-             hit_reason JSON)"
+             hit_reason JSON, tenant_id VARCHAR)"
         );
         self.conn
             .execute_batch(&sql)
-            .map_err(|e| Error::Storage(BoxError::from(e)))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        // Migration for pre-#14 catalogs: add the tenant column if absent.
+        self.conn
+            .execute_batch(&format!(
+                "ALTER TABLE {WRITE_CATALOG_ALIAS}.audience_snapshot ADD COLUMN IF NOT EXISTS \
+                 tenant_id VARCHAR"
+            ))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        Ok(())
     }
 
     /// Atomically materialise a DSL segment's distinct keys into
@@ -750,14 +941,15 @@ impl Writer {
         self.ensure_audience_snapshot_table()?;
         let sql = format!(
             "INSERT INTO {WRITE_CATALOG_ALIAS}.audience_snapshot (snapshot_id, campaign_id, \
-             as_of_ts, user_id, features, hit_reason) SELECT CAST(? AS UUID), ?, CAST(? AS \
-             TIMESTAMPTZ), sub.{key_column}, sub.features, sub.hit_reason FROM ({subquery_sql}) \
-             sub"
+             as_of_ts, user_id, features, hit_reason, tenant_id) SELECT CAST(? AS UUID), ?, \
+             CAST(? AS TIMESTAMPTZ), sub.{key_column}, sub.features, sub.hit_reason, ? FROM \
+             ({subquery_sql}) sub"
         );
         let mut params: Vec<Value> = vec![
             Value::Text(spec.snapshot_id.clone()),
             Value::Text(spec.campaign_id.clone()),
             Value::Text(spec.as_of_ts.clone()),
+            Value::Text(self.tenant.clone()),
         ];
         params.extend_from_slice(subquery_params);
         let n = self
@@ -1031,6 +1223,69 @@ mod tests {
     }
 
     #[test]
+    fn test_should_maintenance_pass_keep_rows_and_expire_when_supported() {
+        // Issue #17 (specs/71 §4): the maintenance pass runs without failing
+        // the sweep, current data always survives, and — on builds where the
+        // timestamp-parameterized DuckLake procedures bind (duckdb 1.10505.0
+        // does NOT — specs/93 GC-MAINT-BINDER) — old snapshots are actually
+        // expired. The assertion adapts to the build capability so a future
+        // DuckLake upgrade turns the graceful no-op into a real expiry.
+        let (_tmp, w) = tmp_writer();
+        // Several batches = several snapshots (one commit per batch).
+        for b in 0..20 {
+            let rows: Vec<Vec<Option<String>>> =
+                (0..10).map(|i| vec![Some(format!("b{b}_r{i}"))]).collect();
+            w.ingest_raw("erp", "evt", &["id".into()], &rows)
+                .expect("ingest");
+        }
+        let snaps_before: i64 = w
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM ducklake_snapshots('{WRITE_CATALOG_ALIAS}')"),
+                [],
+                |r| r.get(0),
+            )
+            .expect("snapshots");
+        assert!(
+            snaps_before > 5,
+            "seeded batches must produce multiple snapshots: {snaps_before}"
+        );
+
+        // Expire everything older than now (retention 0) + orphan cleanup must
+        // not fail the sweep regardless of build capability.
+        w.expire_snapshots(0).expect("expire");
+        w.delete_orphaned_files(0).expect("orphans");
+
+        let snaps_after: i64 = w
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM ducklake_snapshots('{WRITE_CATALOG_ALIAS}')"),
+                [],
+                |r| r.get(0),
+            )
+            .expect("snapshots");
+        if w.maintenance_available.get() {
+            assert!(
+                snaps_after < snaps_before,
+                "expiry must shrink the snapshot count: before={snaps_before} after={snaps_after}"
+            );
+        } else {
+            // Build blocker: the procedures cannot bind; the sweep degrades
+            // gracefully (documented in specs/93 GC-MAINT-BINDER).
+            assert_eq!(
+                snaps_after, snaps_before,
+                "degraded maintenance must be a no-op on builds without TSTZ binding"
+            );
+        }
+        // Current data survives the retention window either way.
+        let rows: i64 = w
+            .conn
+            .query_row("SELECT count(*) FROM dl.raw_erp_evt", [], |r| r.get(0))
+            .expect("rows");
+        assert_eq!(rows, 200, "all 20*10 rows must survive maintenance");
+    }
+
+    #[test]
     fn test_should_logical_delete_by_key() {
         // Logical delete (specs/20 §4): MERGE ... THEN DELETE writes a catalog
         // delete-file — the row vanishes from reads while the Parquet data
@@ -1265,6 +1520,102 @@ mod tests {
     }
 
     #[test]
+    fn test_should_stamp_tenant_on_every_engine_table() {
+        use consumer_engine_core::{SemanticType, SuppressionAction, SuppressionChannel};
+        // Issue #14: the writer stamps its configured tenant on every committed
+        // row — raw, feature, suppression, snapshot and catalogue alike.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut w =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        w.set_tenant("tenant_a".to_string());
+        // raw
+        w.ingest_raw(
+            "erp",
+            "orders",
+            &["user_id".into(), "sku".into()],
+            &[vec![Some("u1".into()), Some("A".into())]],
+        )
+        .expect("ingest");
+        // feature
+        w.write_feature_rows(&[FeatureRow {
+            user_id: "u1".into(),
+            feature_name: "cadence.regularity".into(),
+            num_value: 1.0,
+            as_of_ts: "2025-01-01T00:00:00Z".into(),
+            producer_id: "cadence_sql".into(),
+        }])
+        .expect("features");
+        // suppression
+        w.write_suppression_idempotent(&[SuppressionRow {
+            suppression_id: "11111111-2222-3333-4444-555555555555".into(),
+            campaign_id: "c1".into(),
+            user_id: "u1".into(),
+            channel: SuppressionChannel::Email,
+            action: SuppressionAction::Delivered,
+            occurred_ts: "2025-01-01T00:00:00Z".into(),
+            received_ts: "2025-01-01T00:00:01Z".into(),
+        }])
+        .expect("suppression");
+        // catalogue
+        w.write_catalog_rows(&[CatalogRow {
+            entity_type: "column".into(),
+            system: "erp".into(),
+            table_name: "orders".into(),
+            column_name: Some("user_id".into()),
+            semantic_type: SemanticType::Identifier,
+            data_type: "VARCHAR".into(),
+            description: "user id".into(),
+            pii_flag: false,
+            sample_values: serde_json::json!([]),
+            embedding: vec![0.0; 4],
+            source_epoch: 1,
+        }])
+        .expect("catalog");
+        // snapshot
+        w.materialize_snapshot(
+            "SELECT DISTINCT base.user_id, CAST('{}' AS JSON) AS features, CAST('{}' AS JSON) AS \
+             hit_reason FROM dl.raw_erp_orders base",
+            &[],
+            "user_id",
+            &SnapshotSpec {
+                snapshot_id: "22222222-3333-4444-5555-666666666666".into(),
+                campaign_id: "c1".into(),
+                as_of_ts: "2025-01-01T00:00:00Z".into(),
+            },
+        )
+        .expect("snapshot");
+
+        for (table, sql) in [
+            (
+                "raw",
+                "SELECT count(*) FROM dl.raw_erp_orders WHERE tenant_id = 'tenant_a'",
+            ),
+            (
+                "feature_store",
+                "SELECT count(*) FROM dl.feature_store WHERE tenant_id = 'tenant_a'",
+            ),
+            (
+                "suppression",
+                "SELECT count(*) FROM dl.suppression WHERE tenant_id = 'tenant_a'",
+            ),
+            (
+                "semantic_catalog",
+                "SELECT count(*) FROM dl.semantic_catalog WHERE tenant_id = 'tenant_a'",
+            ),
+            (
+                "audience_snapshot",
+                "SELECT count(*) FROM dl.audience_snapshot WHERE tenant_id = 'tenant_a'",
+            ),
+        ] {
+            let n: i64 = w.conn.query_row(sql, [], |r| r.get(0)).expect("count");
+            assert_eq!(
+                n, 1,
+                "{table} must carry exactly one tenant_a-stamped row (sql: {sql})"
+            );
+        }
+    }
+
+    #[test]
     fn test_should_write_suppression_idempotently() {
         use consumer_engine_core::{SuppressionAction, SuppressionChannel};
         let (_tmp, w) = tmp_writer();
@@ -1372,6 +1723,50 @@ mod tests {
     }
 
     #[test]
+    fn test_should_append_versioned_catalog_rows() {
+        // Issue #18 (spec 13 I5): a re-onboard APPENDS a newer catalogue row
+        // (versioned delta) rather than overwriting — both entries stay, the
+        // newest (by source_epoch) wins for staleness checks.
+        let (_tmp, w) = tmp_writer();
+        let mk = |epoch: i64| CatalogRow {
+            entity_type: "column".into(),
+            system: "erp".into(),
+            table_name: "orders".into(),
+            column_name: Some("sku".into()),
+            semantic_type: consumer_engine_core::SemanticType::Dimension,
+            data_type: "VARCHAR".into(),
+            description: format!("sku v{epoch}"),
+            pii_flag: false,
+            sample_values: serde_json::json!([]),
+            embedding: vec![0.0; 4],
+            source_epoch: epoch,
+        };
+        w.write_catalog_rows(&[mk(1)]).expect("first onboard");
+        w.write_catalog_rows(&[mk(2)]).expect("re-onboard");
+        let count: i64 = w
+            .conn
+            .query_row(
+                "SELECT count(*) FROM dl.semantic_catalog WHERE column_name = 'sku'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            count, 2,
+            "re-onboard must append a versioned delta, not overwrite"
+        );
+        let max_epoch: i64 = w
+            .conn
+            .query_row(
+                "SELECT max(source_epoch) FROM dl.semantic_catalog WHERE column_name = 'sku'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("max epoch");
+        assert_eq!(max_epoch, 2, "newest entry must carry the newer stamp");
+    }
+
+    #[test]
     fn test_should_write_catalog_rows() {
         let (_tmp, w) = tmp_writer();
         let row = consumer_engine_core::CatalogRow {
@@ -1385,6 +1780,7 @@ mod tests {
             pii_flag: false,
             sample_values: serde_json::json!(["u1", "u2"]),
             embedding: vec![0.1, 0.2, 0.3],
+            source_epoch: 0,
         };
         let n = w.write_catalog_rows(&[row]).expect("write catalog");
         assert_eq!(n, 1);

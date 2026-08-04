@@ -994,6 +994,51 @@ async fn test_should_profile_new_table_on_onboard() {
             "hit must have a description: {h}"
         );
     }
+
+    // Re-onboard (issue #18, spec 13 I5): a second profile of the same table
+    // appends a versioned catalogue delta and must not break retrieval or
+    // queries — the source keeps working with newer catalogue entries.
+    let resp = client
+        .post(format!("{base}/sources/onboard"))
+        .json(&serde_json::json!({
+            "system": "erp",
+            "entity": "orders",
+            "columns": ["user_id", "sku", "ts"],
+            "rows": [["u2", "B", "2025-01-02T00:00:00Z"]]
+        }))
+        .send()
+        .await
+        .expect("re-onboard");
+    assert!(
+        resp.status().is_success(),
+        "re-onboard must succeed: {}",
+        resp.status()
+    );
+    let resp = client
+        .get(format!("{base}/catalog?q=orders&k=20"))
+        .send()
+        .await
+        .expect("catalog after re-onboard");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let hits: Value = resp.json().await.expect("json");
+    assert!(
+        !hits.as_array().is_none_or(|a| a.is_empty()),
+        "retrieval must still return candidates after re-onboard: {hits}"
+    );
+    let resp = client
+        .post(format!("{base}/query"))
+        .json(&serde_json::json!({
+            "dsl": {"source":{"system":"erp","entity":"orders"},"key":"user_id",
+                    "ops":[{"kind":"filter","predicate":{"column":"sku","op":"eq","value":"A"}}]}
+        }))
+        .send()
+        .await
+        .expect("query after re-onboard");
+    assert!(
+        resp.status().is_success(),
+        "query must still work after re-onboard: {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]

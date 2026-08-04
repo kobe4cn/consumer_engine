@@ -79,6 +79,7 @@ fn main() {
             pii_flag: false,
             sample_values: serde_json::json!([]),
             embedding: vec![0.0; 4],
+            source_epoch: 0,
         })
         .collect();
     writer.write_catalog_rows(&catalog).expect("catalog");

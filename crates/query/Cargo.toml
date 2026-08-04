@@ -26,6 +26,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 consumer_engine-storage.workspace = true
 consumer_engine-execution.workspace = true
 consumer_engine-core.workspace = true

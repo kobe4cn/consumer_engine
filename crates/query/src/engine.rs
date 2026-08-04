@@ -241,6 +241,39 @@ impl QueryEngine {
                     )));
                 }
             }
+            // Catalogue freshness (spec 13 I5 / issue #18): warn when the
+            // newest catalogue entry for this table predates the source's
+            // latest ingest — the agent may be building on stale semantics.
+            // (Membership is unaffected; this is a warning, not a rejection.)
+            if let Some(meta) = self.freshness.get(&system, &entity) {
+                let qr = self
+                    .timed_read(
+                        &format!(
+                            "SELECT max(source_epoch) FROM \
+                             {READ_ONLY_CATALOG_ALIAS}.semantic_catalog WHERE system = ? AND \
+                             table_name = ?"
+                        ),
+                        vec![Value::Text(system.clone()), Value::Text(entity.clone())],
+                    )
+                    .await?;
+                let catalogue_epoch = qr
+                    .rows
+                    .first()
+                    .and_then(|r| r.first())
+                    .and_then(serde_json::Value::as_i64);
+                if let Some(cat_epoch) = catalogue_epoch
+                    && cat_epoch < meta.last_epoch_secs
+                {
+                    tracing::warn!(
+                        system = %system,
+                        entity = %entity,
+                        catalogue_epoch = cat_epoch,
+                        source_epoch = meta.last_epoch_secs,
+                        "semantic catalogue older than the source's latest ingest; re-onboard to \
+                         refresh descriptions (spec 13 I5)"
+                    );
+                }
+            }
         }
         for name in crate::ast::referenced_features(q) {
             let qr = self
@@ -960,6 +993,7 @@ mod tests {
                 pii_flag: false,
                 sample_values: serde_json::json!([]),
                 embedding: vec![0.0; 4],
+                source_epoch: 0,
             });
         }
         writer.write_catalog_rows(&catalog).expect("write catalog");
@@ -1019,6 +1053,130 @@ mod tests {
         assert!(
             matches!(err, QueryError::InvalidDsl(_)),
             "expected InvalidDsl, got {err:?}"
+        );
+        ingestion.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_warn_when_catalogue_stale() {
+        // Spec 13 I5 / issue #18: a query referencing a column whose newest
+        // catalogue entry predates the source's latest ingest must warn (not
+        // reject — membership still passes). Capture the tracing output.
+        use consumer_engine_core::{CatalogRow, SourceType};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = consumer_engine_storage::Writer::attach(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("attach");
+        writer
+            .ingest_raw(
+                "erp",
+                "orders",
+                &["user_id".into(), "sku".into()],
+                &[vec![Some("u1".into()), Some("A".into())]],
+            )
+            .expect("ingest");
+        // Catalogue built at epoch 1 …
+        let mut catalog = Vec::new();
+        for col in ["user_id", "sku"] {
+            catalog.push(CatalogRow {
+                entity_type: "column".into(),
+                system: "erp".into(),
+                table_name: "orders".into(),
+                column_name: Some(col.into()),
+                semantic_type: consumer_engine_core::SemanticType::Identifier,
+                data_type: "VARCHAR".into(),
+                description: format!("column {col}"),
+                pii_flag: false,
+                sample_values: serde_json::json!([]),
+                embedding: vec![0.0; 4],
+                source_epoch: 1,
+            });
+        }
+        writer.write_catalog_rows(&catalog).expect("catalog");
+
+        let ingestion = consumer_engine_ingestion::IngestionHandle::start(
+            writer,
+            Arc::new(consumer_engine_ingestion::ProducerRegistry::new()),
+        )
+        .expect("start");
+        let read_conn = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let attach_sql = consumer_engine_storage::read_only_attach_sql(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        );
+        let reader = Reader::start(read_conn, attach_sql, ReaderLimits::default()).expect("reader");
+        // … while the source has since been ingested again (epoch 2).
+        let freshness = Arc::new(FreshnessRegistry::new());
+        freshness
+            .set("erp", "orders", SourceType::Batch, 2)
+            .expect("set");
+        let engine = QueryEngine::new(
+            reader,
+            ingestion.clone(),
+            GuardrailConfig::default(),
+            Arc::clone(&freshness),
+            SuppressionRules::default(),
+        );
+
+        struct VecWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for VecWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let wbuf = std::sync::Arc::clone(&buf);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || VecWriter(std::sync::Arc::clone(&wbuf)))
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let q = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"},
+            "key": "user_id",
+            "ops": [{"kind":"filter","predicate":{"column":"sku","op":"eq","value":"A"}}]
+        }))
+        .expect("parse");
+        let res = engine.run_sync(&q).await.expect("query runs");
+        assert!(
+            !res.rows.is_empty(),
+            "stale catalogue must not block the query (warn, not reject)"
+        );
+        drop(_guard);
+        let out = String::from_utf8(buf.lock().expect("buf").clone()).expect("utf8");
+        assert!(
+            out.contains("semantic catalogue older"),
+            "stale catalogue must warn: {out}"
+        );
+
+        // Negative case: a FRESH catalogue (epochs equal) must NOT warn.
+        freshness
+            .set("erp", "orders", SourceType::Batch, 1)
+            .expect("set fresh");
+        let buf2 = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let wbuf2 = std::sync::Arc::clone(&buf2);
+        let sub2 = tracing_subscriber::fmt()
+            .with_writer(move || VecWriter(std::sync::Arc::clone(&wbuf2)))
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard2 = tracing::subscriber::set_default(sub2);
+        let _ = engine.run_sync(&q).await.expect("query runs");
+        drop(_guard2);
+        let out2 = String::from_utf8(buf2.lock().expect("buf").clone()).expect("utf8");
+        assert!(
+            !out2.contains("semantic catalogue older"),
+            "fresh catalogue must not warn: {out2}"
         );
         ingestion.shutdown();
     }
@@ -1108,6 +1266,7 @@ mod tests {
                 pii_flag: false,
                 sample_values: serde_json::json!([]),
                 embedding: vec![0.0; 4],
+                source_epoch: 0,
             });
         }
         writer.write_catalog_rows(&catalog).expect("write catalog");
@@ -1200,6 +1359,7 @@ mod tests {
                 pii_flag: false,
                 sample_values: serde_json::json!([]),
                 embedding: vec![0.0; 4],
+                source_epoch: 0,
             });
         }
         writer.write_catalog_rows(&catalog).expect("write catalog");
@@ -1304,6 +1464,7 @@ mod tests {
                 pii_flag: false,
                 sample_values: serde_json::json!([]),
                 embedding: vec![0.0; 4],
+                source_epoch: 0,
             });
         }
         writer.write_catalog_rows(&catalog).expect("write catalog");

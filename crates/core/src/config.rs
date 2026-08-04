@@ -38,6 +38,12 @@ pub struct EngineConfig {
     /// the writer's generation bump, this bounds the no-write case).
     #[serde(default = "default_read_refresh_interval")]
     pub read_refresh_interval_secs: u64,
+    /// The engine's tenant id (issue #14 / AC6 foundation): stamped on every
+    /// engine row the single writer commits. The engine is single-tenant today;
+    /// per-caller tenant from auth claims lands with the isolation ticket
+    /// (#22).
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: String,
     /// Bind address for the REST ingress.
     #[serde(default = "default_bind")]
     pub bind: String,
@@ -82,6 +88,10 @@ const fn default_micro_batch_flush_age() -> u64 {
 
 const fn default_read_refresh_interval() -> u64 {
     5
+}
+
+fn default_tenant_id() -> String {
+    "default".to_string()
 }
 
 fn default_bind() -> String {
@@ -221,6 +231,10 @@ pub struct CompactionConfig {
     /// e.g. `"1MB"`).
     #[serde(default = "default_target_file_size")]
     pub target_file_size: String,
+    /// Time-travel window: snapshots older than this are expired by the
+    /// maintenance pass (specs/71 §4, issue #17).
+    #[serde(default = "default_snapshot_retention_days")]
+    pub snapshot_retention_days: u64,
 }
 
 const fn default_inlining_row_limit() -> u64 {
@@ -231,11 +245,16 @@ fn default_target_file_size() -> String {
     "1MB".to_string()
 }
 
+const fn default_snapshot_retention_days() -> u64 {
+    730
+}
+
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             inlining_row_limit: default_inlining_row_limit(),
             target_file_size: default_target_file_size(),
+            snapshot_retention_days: default_snapshot_retention_days(),
         }
     }
 }
@@ -249,6 +268,7 @@ impl Default for EngineConfig {
             micro_batch_flush_rows: default_micro_batch_rows(),
             micro_batch_flush_age_secs: default_micro_batch_flush_age(),
             read_refresh_interval_secs: default_read_refresh_interval(),
+            tenant_id: default_tenant_id(),
             bind: default_bind(),
             guardrails: GuardrailConfig::default(),
             suppression: SuppressionRules::default(),

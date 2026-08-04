@@ -363,3 +363,21 @@ Append-only.
   lives at the writer boundary — defense-in-depth, and the only seam today.
 - **Fix shape (#24)**: the CDC adapter dedups earlier (or relies on
   `upsert_raw`'s contract); re-verify at the adapter seam.
+
+### GC-MAINT-BINDER — DuckLake maintenance procedures unbindable (blocked, issue #17)
+
+- **Citation**: `crates/storage/src/lib.rs` (`Writer::probe_maintenance`);
+  probe evidence: every timestamp-parameterized CALL
+  (`ducklake_expire_snapshots`, `ducklake_delete_orphaned_files`,
+  `ducklake_cleanup_old_files`) — literal, named-arg, and prepared-`?` forms —
+  fails binder with "No function matches" even when the argument type renders
+  identically to the declared `TIMESTAMP WITH TIME ZONE` parameter (duckdb
+  crate 1.10505.0).
+- **Finding**: the same TIMESTAMPTZ binder defect family as the documented
+  `-(TIMESTAMPTZ, INTERVAL)` issue (T4-RECENCY-NOW). Maintenance procedures
+  with a TSTZ parameter cannot be called on this build, so snapshot expiry and
+  orphan cleanup cannot run; the maintenance pass degrades to merge-only with a
+  one-time `warn!` (probed at first use).
+- **Fix shape (upstream)**: re-enable `Writer::expire_snapshots` /
+  `delete_orphaned_files` after a DuckLake upgrade that binds TSTZ procedure
+  parameters; the capability probe flips automatically (issue #17 stays OPEN).

@@ -45,8 +45,12 @@ enum Cmd {
         /// Reply channel carrying the inserted row count.
         reply: flume::Sender<Result<usize>>,
     },
-    /// Compact every table this actor has ingested.
+    /// Compact every table this actor has ingested, then run the catalog
+    /// maintenance pass — expire snapshots older than `retention_days` and
+    /// delete orphaned files (specs/71 §4, issue #17).
     CompactAll {
+        /// Time-travel retention window for snapshot expiry (days).
+        retention_days: u64,
         /// Reply channel.
         reply: flume::Sender<Result<()>>,
     },
@@ -254,14 +258,19 @@ impl IngestionHandle {
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?
     }
 
-    /// Compact every table ingested so far (best-effort; last error wins).
+    /// Compact every table ingested so far, expire old snapshots, and clean
+    /// orphaned files (best-effort; last error wins). `retention_days` is the
+    /// time-travel window for snapshot expiry (specs/71 §4, issue #17).
     ///
     /// # Errors
     /// Propagates the first storage error encountered.
-    pub async fn compact_all(&self) -> Result<()> {
+    pub async fn compact_all(&self, retention_days: u64) -> Result<()> {
         let (rtx, rrx) = flume::bounded(1);
         self.tx
-            .send(Cmd::CompactAll { reply: rtx })
+            .send(Cmd::CompactAll {
+                retention_days,
+                reply: rtx,
+            })
             .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
         rrx.recv_async()
             .await
@@ -528,15 +537,25 @@ fn writer_loop(writer: Writer, rx: flume::Receiver<Cmd>, micro: MicroBatchConfig
                 };
                 let _ = reply.send(res);
             }
-            Cmd::CompactAll { reply } => {
+            Cmd::CompactAll {
+                retention_days,
+                reply,
+            } => {
                 // Buffered rows are part of the table's latest state; compact
-                // only after they land.
+                // only after they land, then expire old snapshots and reclaim
+                // orphaned files (issue #17).
                 flush_pending(&writer, &mut pending, &mut known);
                 let mut last: Result<()> = Ok(());
                 for (s, e) in &known {
                     if let Err(err) = writer.compact(s, e) {
                         last = Err(err);
                     }
+                }
+                if let Err(err) = writer.expire_snapshots(retention_days) {
+                    last = Err(err);
+                }
+                if let Err(err) = writer.delete_orphaned_files(retention_days) {
+                    last = Err(err);
                 }
                 let _ = reply.send(last);
             }

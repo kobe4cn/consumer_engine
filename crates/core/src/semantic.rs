@@ -24,6 +24,8 @@ pub enum SemanticType {
     Pii,
     /// A foreign key referencing another table's identifier.
     Fk,
+    /// A table-level catalogue row (no column; the whole relation — issue #19).
+    Table,
 }
 
 impl SemanticType {
@@ -37,6 +39,7 @@ impl SemanticType {
             Self::EventTs => "eventTs",
             Self::Pii => "pii",
             Self::Fk => "fk",
+            Self::Table => "table",
         }
     }
 
@@ -53,6 +56,7 @@ impl SemanticType {
             "eventTs" => Some(Self::EventTs),
             "pii" => Some(Self::Pii),
             "fk" => Some(Self::Fk),
+            "table" => Some(Self::Table),
             _ => None,
         }
     }
@@ -82,6 +86,11 @@ pub struct CatalogRow {
     pub sample_values: serde_json::Value,
     /// Embedding of the description (NOT of PII values; I4).
     pub embedding: Vec<f32>,
+    /// Epoch (secs) of the source state this catalogue entry was built from
+    /// (spec 13 I5 / issue #18): the query path warns when a referenced
+    /// column's entry is older than the source's latest ingest; a re-onboard
+    /// appends a newer row (versioned delta) instead of overwriting.
+    pub source_epoch: i64,
 }
 
 /// One retrieval hit from the L1 IntentRag: a candidate table/column with a
@@ -101,4 +110,28 @@ pub struct CatalogHit {
     pub description: String,
     /// Cosine-similarity score in `[0,1]` (higher = more relevant).
     pub score: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_round_trip_table_semantic_type_on_wire() {
+        // Issue #19: `Table` must serialise to camelCase "table" and parse
+        // back — the catalogue is read across a trust boundary, so an unknown
+        // label is rejected, not coerced.
+        let t = SemanticType::Table;
+        let wire = serde_json::to_string(&t).expect("serialize");
+        assert_eq!(wire, "\"table\"", "Table must serialize as camelCase table");
+        let parsed: SemanticType = serde_json::from_str(&wire).expect("parse");
+        assert_eq!(parsed, SemanticType::Table);
+        assert_eq!(SemanticType::parse("table"), Some(SemanticType::Table));
+        assert_eq!(
+            SemanticType::parse("bogus"),
+            None,
+            "unknown labels rejected"
+        );
+        assert_eq!(SemanticType::Table.as_str(), "table");
+    }
 }
