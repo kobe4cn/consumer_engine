@@ -67,6 +67,9 @@ pub struct EngineConfig {
     /// are isolated per tenant by construction (specs/21 I2).
     #[serde(default)]
     pub tenants: Vec<TenantCredentials>,
+    /// Kafka/Debezium CDC sources (issue #24). `None` disables CDC ingestion.
+    #[serde(default)]
+    pub cdc: Option<CdcConfig>,
     /// Token that authorises the raw-SQL escape hatch (specs/21 §4 E2):
     /// `POST /query { sql, approvalToken }` runs only with a matching token,
     /// under the same guardrails, always audit-logged. `None` disables the
@@ -280,6 +283,7 @@ impl Default for EngineConfig {
             compaction: CompactionConfig::default(),
             auth_token: None,
             tenants: Vec::new(),
+            cdc: None,
             sql_approval_token: None,
             llm: None,
         }
@@ -343,6 +347,37 @@ data_path: /tmp/data
         let res = EngineConfig::from_yaml_str(yaml);
         assert!(res.is_err(), "deny_unknown_fields must reject bogus");
     }
+}
+
+/// One CDC topic mapped to an engine raw table (specs/20 §2, issue #24).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CdcTopicConfig {
+    /// The Kafka topic (Debezium change envelope JSON).
+    pub topic: String,
+    /// Source system identifier.
+    pub system: String,
+    /// Source entity (table) identifier.
+    pub entity: String,
+    /// The raw table's column names.
+    pub columns: Vec<String>,
+    /// The merge key column (must be one of `columns`).
+    pub key: String,
+}
+
+/// Kafka/Debezium CDC source configuration (specs/20 §2, issue #24). Only
+/// effective with the `ingestion-cdc` feature; without it the server warns and
+/// ignores this section.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CdcConfig {
+    /// Kafka bootstrap brokers (comma-separated).
+    pub brokers: String,
+    /// Consumer group id (offsets are NOT auto-committed — the engine's
+    /// catalog transaction owns offset durability, specs/20 I2).
+    pub group_id: String,
+    /// The topics to consume, mapped to raw tables.
+    pub topics: Vec<CdcTopicConfig>,
 }
 
 /// A tenant's credentials: the bearer token that resolves to `id` (issue #22).

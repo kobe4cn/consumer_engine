@@ -22,6 +22,15 @@ flume.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+serde.workspace = true
+rdkafka = { version = "0.37", features = ["dynamic-linking"], optional = true }
+
+[features]
+default = []
+# Kafka/Debezium CDC transport (rdkafka dynamic-linking against system
+# librdkafka). The SourceAdapter machinery itself is always available.
+ingestion-cdc = ["dep:rdkafka"]
 
 [dev-dependencies]
 tempfile = "3"

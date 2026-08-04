@@ -13,6 +13,7 @@ homepage.workspace = true
 default = []
 # Forward the semantic-llm feature: real HTTP LLM/embedding clients (spec 13 §4).
 semantic-llm = ["consumer_engine-semantic/semantic-llm"]
+ingestion-cdc = ["consumer_engine-ingestion/ingestion-cdc"]
 
 [dependencies]
 consumer_engine-core.workspace = true

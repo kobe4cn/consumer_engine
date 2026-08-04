@@ -12,6 +12,8 @@ use std::{sync::Arc, time::Duration};
 use axum::Router;
 use consumer_engine_core::{BoxError, Dataset, EngineConfig, Error, FreshnessRegistry, Result};
 use consumer_engine_execution::{Reader, ReaderLimits};
+#[cfg(feature = "ingestion-cdc")]
+use consumer_engine_ingestion::SourceAdapter;
 use consumer_engine_ingestion::{
     CadenceRegularityProducer, IngestionHandle, MicroBatchConfig, ProducerRegistry,
 };
@@ -211,6 +213,83 @@ impl Engine {
             sql_approval_hash,
         };
         let router = router(state);
+        // CDC pumps (issue #24): one SUPERVISOR task per configured topic that
+        // owns the adapter and recreates it on ANY pump exit — the pump retries
+        // transient errors internally with backoff, so the supervisor only acts
+        // on a hard panic or a clean exit. The Kafka transport is behind
+        // `ingestion-cdc`; without the feature the config is ignored with a
+        // warning.
+        if let Some(cdc) = &config.cdc {
+            #[cfg(feature = "ingestion-cdc")]
+            {
+                for topic in &cdc.topics {
+                    let handle = ingestion.clone();
+                    let freshness = Arc::clone(&freshness);
+                    let tenant = config.tenant_id.clone();
+                    let brokers = cdc.brokers.clone();
+                    let group = cdc.group_id.clone();
+                    let topic_cfg = topic.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let adapter = match consumer_engine_ingestion::KafkaCdcAdapter::new(
+                                &brokers,
+                                &group,
+                                &topic_cfg.topic,
+                                &topic_cfg.system,
+                                &topic_cfg.entity,
+                                topic_cfg.columns.clone(),
+                                &topic_cfg.key,
+                            ) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    tracing::error!(error = %e, "CDC adapter init failed; retrying");
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                    continue;
+                                }
+                            };
+                            let handle = handle.clone();
+                            let freshness = Arc::clone(&freshness);
+                            let tenant = tenant.clone();
+                            let poll = Duration::from_secs(1);
+                            // Run the pump in its own task so a PANIC inside it
+                            // does not kill the supervisor loop — the pump task
+                            // ends and the supervisor recreates the adapter.
+                            let source = adapter.source_id().to_string();
+                            let pump = tokio::spawn({
+                                let mut adapter_ref = adapter;
+                                async move {
+                                    let _ = consumer_engine_ingestion::run_cdc_pump(
+                                        &mut adapter_ref,
+                                        &handle,
+                                        &freshness,
+                                        &tenant,
+                                        poll,
+                                    )
+                                    .await;
+                                }
+                            });
+                            if pump.await.is_err() {
+                                tracing::error!(
+                                    source = %source,
+                                    "CDC pump panicked; recreating adapter"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    source = %source,
+                                    "CDC pump exited; recreating adapter"
+                                );
+                            }
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    });
+                }
+            }
+            #[cfg(not(feature = "ingestion-cdc"))]
+            {
+                let _ = cdc;
+                tracing::warn!("cdc configured but the `ingestion-cdc` feature is off; ignoring");
+            }
+        }
         let engine = Engine {
             ingestion,
             reader,

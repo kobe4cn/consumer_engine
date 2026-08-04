@@ -669,12 +669,26 @@ impl Writer {
         if rows.is_empty() {
             return Ok(0);
         }
-        // Adapter-boundary dedup: last row per key wins (specs/20 §4 — DuckLake
-        // accumulates duplicates; the writer must not).
+        // Adapter-boundary dedup: last row per key wins; NULL-key rows skipped
+        // (specs/20 §4 — DuckLake accumulates duplicates; the writer must not).
+        let deduped = Self::dedup_by_key(rows, key_idx);
+        let affected = self.merge_upserts(&table, columns, key, &deduped)?;
+        self.bump_write();
+        Ok(affected)
+    }
+
+    /// Dedup rows by `key_idx`, LAST row wins (specs/20 §4 — DuckLake
+    /// accumulates duplicates; the writer must not). Rows with a NULL/missing
+    /// key are **skipped** (they cannot be merged and collapsing them would
+    /// lose distinct rows) and logged.
+    fn dedup_by_key(rows: &[Vec<Option<String>>], key_idx: usize) -> Vec<&Vec<Option<String>>> {
         let mut deduped: Vec<&Vec<Option<String>>> = Vec::new();
         let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for row in rows {
-            let k = row.get(key_idx).and_then(|v| v.as_deref()).unwrap_or("");
+            let Some(k) = row.get(key_idx).and_then(|v| v.as_deref()) else {
+                tracing::warn!("row with a NULL merge key skipped (cannot merge)");
+                continue;
+            };
             match seen.get(k) {
                 Some(&i) => deduped[i] = row,
                 None => {
@@ -683,10 +697,22 @@ impl Writer {
                 }
             }
         }
-        // One MERGE per chunk with a multi-row `VALUES` USING source — a single
-        // statement per chunk, so one DuckLake commit per chunk (per-statement
-        // autocommit would create one snapshot per MERGE; per-row MERGE would
-        // create one snapshot per row — the issue #12 defect class).
+        deduped
+    }
+
+    /// Chunked upsert MERGE for `deduped` rows (assumes an open catalog
+    /// transaction — callers own BEGIN/COMMIT so data and other writes commit
+    /// atomically, e.g. the CDC offset in [`Self::apply_cdc_batch`]). One
+    /// multi-row `VALUES` MERGE per chunk (a single statement per chunk ⇒ one
+    /// commit; per-row MERGE would create one snapshot per row — the issue #12
+    /// defect class).
+    fn merge_upserts(
+        &self,
+        table: &str,
+        columns: &[String],
+        key: &str,
+        deduped: &[&Vec<Option<String>>],
+    ) -> Result<usize> {
         const MERGE_CHUNK_ROWS: usize = 500;
         let tenant = self.tenant.clone();
         let mut cols_all: Vec<String> = columns.to_vec();
@@ -727,7 +753,6 @@ impl Writer {
                 .execute(duckdb::params_from_iter(params))
                 .map_err(|e| Error::Storage(BoxError::from(e)))?;
         }
-        self.bump_write();
         Ok(affected)
     }
 
@@ -751,28 +776,194 @@ impl Writer {
         if keys.is_empty() {
             return Ok(0);
         }
-        // One MERGE per chunk with a multi-row `VALUES` USING source — one
-        // statement per chunk, one DuckLake commit per chunk (see `upsert_raw`
-        // for the snapshot-count rationale).
+        let affected = self.merge_deletes(&table, key, keys)?;
+        self.bump_write();
+        Ok(affected)
+    }
+
+    /// Chunked logical-delete MERGE for `keys` (assumes an open catalog
+    /// transaction; tenant-scoped so a delete never touches another tenant's
+    /// rows). See [`Self::merge_upserts`] for the one-commit-per-chunk note.
+    fn merge_deletes(&self, table: &str, key: &str, keys: &[String]) -> Result<usize> {
         const MERGE_CHUNK_KEYS: usize = 500;
+        let tenant = self.tenant.clone();
         let mut affected = 0usize;
         for chunk in keys.chunks(MERGE_CHUNK_KEYS) {
             let multi = vec!["(?)"; chunk.len()].join(", ");
             let merge = format!(
                 "MERGE INTO {WRITE_CATALOG_ALIAS}.{table} AS t USING (VALUES {multi}) AS s({key}) \
-                 ON t.{key} = s.{key} WHEN MATCHED THEN DELETE"
+                 ON t.{key} = s.{key} AND t.tenant_id = ? WHEN MATCHED THEN DELETE"
             );
             let mut stmt = self
                 .conn
                 .prepare(&merge)
                 .map_err(|e| Error::Storage(BoxError::from(e)))?;
-            let params: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            let mut params: Vec<&str> = chunk.iter().map(String::as_str).collect();
+            params.push(&tenant);
             affected += stmt
                 .execute(duckdb::params_from_iter(params))
                 .map_err(|e| Error::Storage(BoxError::from(e)))?;
         }
-        self.bump_write();
         Ok(affected)
+    }
+
+    /// Apply one CDC batch atomically (issue #24 / specs/20 I2): the data
+    /// writes (upserts + logical deletes) and the source's **offset commit**
+    /// land in ONE catalog transaction — a crash or failure leaves neither
+    /// data nor a half-advanced offset, so restart resumes exactly from the
+    /// last committed position. `columns`/`key` are validated; upserts are
+    /// deduped by key (at-least-once source → effectively-once catalog);
+    /// deletes are logical. Rows are stamped with the writer's tenant.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidInput`] on a bad identifier or a `key` absent from `columns`.
+    /// - [`Error::Storage`] on DDL/MERGE failure (the whole batch rolls back).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors ingestion::SourceBatch's fields; storage must not depend on ingestion"
+    )]
+    pub fn apply_cdc_batch(
+        &self,
+        system: &str,
+        entity: &str,
+        columns: &[String],
+        key: &str,
+        upserts: &[Vec<Option<String>>],
+        deletes: &[String],
+        offsets: &[(i32, i64)],
+    ) -> Result<usize> {
+        if columns.is_empty() {
+            return Err(Error::InvalidInput("columns must not be empty".into()));
+        }
+        for c in columns {
+            validate_ident(c)?;
+        }
+        validate_ident(key)?;
+        if !columns.iter().any(|c| c == key) {
+            return Err(Error::InvalidInput(format!(
+                "merge key {key:?} must be a column"
+            )));
+        }
+        let table = raw_table_name(system, entity)?;
+        let source = format!("{system}.{entity}");
+        // EVERYTHING — schema DDL included — happens inside the transaction so
+        // a failed batch rolls back the table creation too (issue #24 / I2:
+        // the whole batch is atomic, not just data+offset).
+        self.conn
+            .execute_batch("BEGIN TRANSACTION")
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let outcome = (|| -> Result<usize> {
+            let mut cols_typed = columns
+                .iter()
+                .map(|c| format!("{c} VARCHAR"))
+                .collect::<Vec<_>>();
+            cols_typed.push("tenant_id VARCHAR".to_string());
+            self.conn
+                .execute_batch(&format!(
+                    "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.{table} ({})",
+                    cols_typed.join(", ")
+                ))
+                .map_err(|e| Error::Storage(BoxError::from(e)))?;
+            self.conn
+                .execute_batch(&format!(
+                    "ALTER TABLE {WRITE_CATALOG_ALIAS}.{table} ADD COLUMN IF NOT EXISTS tenant_id \
+                     VARCHAR"
+                ))
+                .map_err(|e| Error::Storage(BoxError::from(e)))?;
+            self.conn
+                .execute_batch(&format!(
+                    "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.cdc_offsets (source \
+                     VARCHAR, partition BIGINT, cdc_offset BIGINT, updated_at TIMESTAMPTZ)"
+                ))
+                .map_err(|e| Error::Storage(BoxError::from(e)))?;
+            let key_idx = columns.iter().position(|c| c == key).ok_or_else(|| {
+                Error::InvalidInput(format!("merge key {key:?} must be a column"))
+            })?;
+            let deduped = Self::dedup_by_key(upserts, key_idx);
+            let written = self.merge_upserts(&table, columns, key, &deduped)?;
+            self.merge_deletes(&table, key, deletes)?;
+            // Offset commit, same transaction as the data (I2) — one row per
+            // (source, partition) so a multi-partition topic resumes exactly.
+            for (partition, offset) in offsets {
+                self.upsert_cdc_offset(
+                    &source,
+                    *partition,
+                    *offset,
+                    &chrono::Utc::now().to_rfc3339(),
+                )?;
+            }
+            Ok(written)
+        })();
+        match outcome {
+            Ok(n) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| Error::Storage(BoxError::from(e)))?;
+                self.bump_write();
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Upsert a source+partition's committed CDC offset (assumes an open
+    /// transaction; one row per partition so a multi-partition topic resumes
+    /// exactly, issue #24).
+    fn upsert_cdc_offset(
+        &self,
+        source: &str,
+        partition: i32,
+        cdc_offset: i64,
+        updated_at: &str,
+    ) -> Result<()> {
+        let merge = format!(
+            "MERGE INTO {WRITE_CATALOG_ALIAS}.cdc_offsets AS t USING (VALUES (?, ?, ?, ?)) AS \
+             s(source, partition, cdc_offset, updated_at) ON t.source = s.source AND t.partition \
+             = s.partition WHEN MATCHED THEN UPDATE SET cdc_offset = s.cdc_offset, updated_at = \
+             s.updated_at WHEN NOT MATCHED THEN INSERT (source, partition, cdc_offset, \
+             updated_at) VALUES (s.source, s.partition, s.cdc_offset, s.updated_at)"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&merge)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        stmt.execute(duckdb::params![source, partition, cdc_offset, updated_at])
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        Ok(())
+    }
+
+    /// Read a source's committed CDC offsets per partition (restart recovery,
+    /// I2). `None` when the source has never committed.
+    ///
+    /// # Errors
+    /// [`Error::Storage`] on read failure.
+    pub fn read_cdc_offsets(&self, source: &str) -> Result<Vec<(i32, i64)>> {
+        self.conn
+            .execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS {WRITE_CATALOG_ALIAS}.cdc_offsets (source VARCHAR, \
+                 partition BIGINT, cdc_offset BIGINT, updated_at TIMESTAMPTZ)"
+            ))
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let sql = format!(
+            "SELECT partition, cdc_offset FROM {WRITE_CATALOG_ALIAS}.cdc_offsets WHERE source = ?"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let rows = stmt
+            .query_map([source], |r| {
+                Ok((r.get::<_, i64>(0)? as i32, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| Error::Storage(BoxError::from(e)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| Error::Storage(BoxError::from(e)))?);
+        }
+        Ok(out)
     }
 
     /// Run DuckLake compaction on a table. Uses `ducklake_merge_adjacent_files`

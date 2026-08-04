@@ -24,11 +24,18 @@ use consumer_engine_core::{
 use consumer_engine_storage::Writer;
 use duckdb::types::Value;
 
+mod cdc;
 mod producer;
 mod producers;
 
+pub use cdc::{SourceAdapter, SourceBatch, run_cdc_pump, source_key};
+#[cfg(feature = "ingestion-cdc")]
+pub use cdc_kafka::KafkaCdcAdapter;
 pub use producer::{FeatureProducer, ProducerOutput, ProducerRegistry};
 pub use producers::CadenceRegularityProducer;
+
+#[cfg(feature = "ingestion-cdc")]
+mod cdc_kafka;
 
 /// Commands sent to the writer thread.
 enum Cmd {
@@ -143,6 +150,23 @@ enum Cmd {
         tenant: String,
         /// Reply channel carrying the inserted row count.
         reply: flume::Sender<Result<usize>>,
+    },
+    /// Apply one CDC batch atomically — data + offset in one catalog
+    /// transaction (issue #24 / specs/20 I2).
+    ApplyCdcBatch {
+        /// The batch to apply.
+        batch: SourceBatch,
+        /// The caller's tenant, stamped on the rows (issue #22).
+        tenant: String,
+        /// Reply channel carrying the rows upserted.
+        reply: flume::Sender<Result<usize>>,
+    },
+    /// Read a source's committed CDC offsets per partition (restart recovery).
+    ReadCdcOffset {
+        /// The source key (`system.entity`).
+        source: String,
+        /// Reply channel carrying `(partition, offset)` pairs.
+        reply: flume::Sender<Result<Vec<(i32, i64)>>>,
     },
     /// Stop the writer thread (graceful drain; the ack fires after the flush).
     Shutdown {
@@ -483,6 +507,43 @@ impl IngestionHandle {
         self.write_features(output.rows, tenant).await
     }
 
+    /// Apply one CDC batch atomically (issue #24 / specs/20 I2): the data
+    /// writes and the source's offset commit land in one catalog transaction.
+    ///
+    /// # Errors
+    /// Propagates validation/storage errors (the batch rolls back).
+    pub async fn apply_cdc_batch(&self, batch: SourceBatch, tenant: &str) -> Result<usize> {
+        let (rtx, rrx) = flume::bounded(1);
+        self.tx
+            .send(Cmd::ApplyCdcBatch {
+                batch,
+                tenant: tenant.to_string(),
+                reply: rtx,
+            })
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
+        rrx.recv_async()
+            .await
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?
+    }
+
+    /// Read a source's committed CDC offsets per partition (empty = never
+    /// committed).
+    ///
+    /// # Errors
+    /// Propagates storage errors.
+    pub async fn read_cdc_offsets(&self, source: &str) -> Result<Vec<(i32, i64)>> {
+        let (rtx, rrx) = flume::bounded(1);
+        self.tx
+            .send(Cmd::ReadCdcOffset {
+                source: source.to_string(),
+                reply: rtx,
+            })
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?;
+        rrx.recv_async()
+            .await
+            .map_err(|e| Error::Ingestion(BoxError::from(e)))?
+    }
+
     /// Ask the writer thread to stop after a graceful drain (specs/11 I3).
     /// **Non-blocking**: safe to call from `Drop` on an async runtime thread
     /// (the writer drains its buffered micro-batches before exiting, in the
@@ -690,6 +751,30 @@ fn writer_loop(mut writer: Writer, rx: flume::Receiver<Cmd>, micro: MicroBatchCo
             } => {
                 writer.set_tenant(tenant);
                 let res = writer.write_suppression_idempotent(&rows);
+                let _ = reply.send(res);
+            }
+            Cmd::ApplyCdcBatch {
+                batch,
+                tenant,
+                reply,
+            } => {
+                writer.set_tenant(tenant);
+                let res = writer.apply_cdc_batch(
+                    &batch.system,
+                    &batch.entity,
+                    &batch.columns,
+                    &batch.key,
+                    &batch.upserts,
+                    &batch.deletes,
+                    &batch.offsets,
+                );
+                if res.is_ok() {
+                    known.insert((batch.system, batch.entity));
+                }
+                let _ = reply.send(res);
+            }
+            Cmd::ReadCdcOffset { source, reply } => {
+                let res = writer.read_cdc_offsets(&source);
                 let _ = reply.send(res);
             }
             Cmd::Shutdown { ack } => {
@@ -1218,5 +1303,272 @@ mod tests {
         assert_eq!(row.1, Some(5.0), "volume (batch 2) must be present");
 
         handle.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod cdc_tests {
+    use async_trait::async_trait;
+    use consumer_engine_core::{FreshnessRegistry, SourceType};
+
+    use super::*;
+    use crate::cdc::{SourceAdapter, SourceBatch, run_cdc_pump, source_key};
+
+    /// A deterministic mock adapter: yields the queued batches once, then
+    /// reports nothing (so the pump polls) — the tests drive exactly N batches.
+    /// The offsets the pump resumed from, shared with the test (the adapter is
+    /// moved into the pump task).
+    type ResumedOffsets = Arc<std::sync::Mutex<Option<Vec<(i32, i64)>>>>;
+
+    struct MockAdapter {
+        source: String,
+        batches: std::collections::VecDeque<SourceBatch>,
+        resumed: ResumedOffsets,
+    }
+
+    #[async_trait]
+    impl SourceAdapter for MockAdapter {
+        fn source_id(&self) -> &str {
+            &self.source
+        }
+        async fn next_batch(&mut self) -> Result<Option<SourceBatch>> {
+            Ok(self.batches.pop_front())
+        }
+        async fn resume(&mut self, offsets: &[(i32, i64)]) -> Result<()> {
+            *self.resumed.lock().expect("lock") = Some(offsets.to_vec());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_should_pump_apply_batches_mark_cdc_freshness_and_resume() {
+        // run_cdc_pump end-to-end: resumes from the committed offset, applies
+        // a batch, marks the source CDC (D5 / 71 §2), and reports the new
+        // offset so a restart resumes there.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        let handle = IngestionHandle::start(writer, Arc::new(ProducerRegistry::new()))
+            .expect("start handle");
+        // Pre-commit an offset (simulate a previous run) so the pump must
+        // resume from it.
+        handle
+            .apply_cdc_batch(batch("erp", "orders", 5), "default")
+            .await
+            .expect("seed offset");
+        let resumed: ResumedOffsets = Arc::new(std::sync::Mutex::new(None));
+        let mut adapter = MockAdapter {
+            source: source_key("erp", "orders"),
+            batches: std::collections::VecDeque::from([batch("erp", "orders", 9)]),
+            resumed: Arc::clone(&resumed),
+        };
+        let freshness = Arc::new(FreshnessRegistry::new());
+        let handle_c = handle.clone();
+        let freshness_c = Arc::clone(&freshness);
+        let pump = tokio::spawn(async move {
+            let _ = run_cdc_pump(
+                &mut adapter,
+                &handle_c,
+                &freshness_c,
+                "default",
+                std::time::Duration::from_millis(10),
+            )
+            .await;
+        });
+        // Wait until the freshness registry marks the source CDC.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(meta) = freshness.get("erp", "orders")
+                && meta.source_type == SourceType::Cdc
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let meta = freshness.get("erp", "orders").expect("cdc freshness set");
+        assert_eq!(
+            meta.source_type,
+            SourceType::Cdc,
+            "71 §2: CDC sources report CDC"
+        );
+        assert!(meta.last_epoch_secs > 0, "epoch recorded from the pump");
+        // 71 §2: the CDC freshness SLA is ≤ 5 min end-to-end — the pump marks
+        // the source fresh within seconds of applying the batch.
+        let lag = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64
+            - meta.last_epoch_secs;
+        assert!(
+            lag < 300,
+            "71 §2 CDC freshness ≤ 5 min, measured lag {lag}s"
+        );
+        // The pump resumed from the stored offset (5) before consuming.
+        pump.abort();
+        let resumed = resumed
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("resume was called");
+        assert_eq!(
+            resumed,
+            vec![(0, 5)],
+            "pump must resume from the committed offset"
+        );
+        // And the new offset (9) is committed atomically with the batch.
+        let stored = handle
+            .read_cdc_offsets(&source_key("erp", "orders"))
+            .await
+            .expect("offset");
+        assert_eq!(stored, vec![(0, 9)], "new offset committed");
+        handle.shutdown_and_wait();
+    }
+
+    fn batch(system: &str, entity: &str, offset: i64) -> SourceBatch {
+        SourceBatch {
+            system: system.into(),
+            entity: entity.into(),
+            columns: vec!["user_id".into(), "sku".into()],
+            key: "user_id".into(),
+            upserts: vec![
+                vec![Some("u1".into()), Some("A".into())],
+                vec![Some("u2".into()), Some("B".into())],
+            ],
+            deletes: Vec::new(),
+            offsets: vec![(0, offset)],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_should_apply_cdc_batch_atomically_with_offset() {
+        // Issue #24 / specs/20 I2: data + offset commit in one transaction.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        let handle = IngestionHandle::start(writer, Arc::new(ProducerRegistry::new()))
+            .expect("start handle");
+        let n = handle
+            .apply_cdc_batch(batch("erp", "orders", 42), "default")
+            .await
+            .expect("apply");
+        assert_eq!(n, 2, "both upserts written");
+        // Data visible.
+        let r = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let count: i64 = r
+            .query_row("SELECT count(*) FROM dro.raw_erp_orders", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, 2);
+        // Offset committed with the data (restart resumes here).
+        let stored = handle
+            .read_cdc_offsets(&source_key("erp", "orders"))
+            .await
+            .expect("offset");
+        assert_eq!(stored, vec![(0, 42)], "offset must be committed");
+        handle.shutdown_and_wait();
+    }
+
+    #[tokio::test]
+    async fn test_should_rollback_cdc_batch_on_failure() {
+        // I2 atomicity: a failed batch leaves NEITHER data NOR a half-advanced
+        // offset.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        let handle = IngestionHandle::start(writer, Arc::new(ProducerRegistry::new()))
+            .expect("start handle");
+        let mut bad = batch("erp", "orders", 99);
+        bad.key = "not_a_column".into(); // invalid merge key → storage error
+        assert!(handle.apply_cdc_batch(bad, "default").await.is_err());
+        // Nothing committed: no table rows, no offset.
+        let stored = handle
+            .read_cdc_offsets(&source_key("erp", "orders"))
+            .await
+            .expect("offset read");
+        assert!(stored.is_empty(), "no offset after a failed batch");
+        let r = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        // The rollback undid even the CREATE TABLE: the raw table must not
+        // exist at all — a stronger atomicity proof than zero rows.
+        let missing = r
+            .query_row("SELECT count(*) FROM dro.raw_erp_orders", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .is_err();
+        assert!(
+            missing,
+            "failed batch must roll back the table creation too"
+        );
+        handle.shutdown_and_wait();
+    }
+
+    #[tokio::test]
+    async fn test_should_dedup_replayed_cdc_batch() {
+        // At-least-once source: replaying the same batch must not duplicate
+        // rows (the writer MERGEs by key — effectively-once catalog).
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        let handle = IngestionHandle::start(writer, Arc::new(ProducerRegistry::new()))
+            .expect("start handle");
+        handle
+            .apply_cdc_batch(batch("erp", "orders", 10), "default")
+            .await
+            .expect("first");
+        handle
+            .apply_cdc_batch(batch("erp", "orders", 10), "default")
+            .await
+            .expect("replay");
+        let r = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let count: i64 = r
+            .query_row("SELECT count(*) FROM dro.raw_erp_orders", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, 2, "replayed upserts dedup by key, no duplicates");
+        handle.shutdown_and_wait();
+    }
+
+    #[tokio::test]
+    async fn test_should_resume_from_committed_offset() {
+        // Restart recovery: the pump reads the stored offset and the adapter
+        // seeks there — the contract is that the offset persists across a
+        // writer restart.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        let handle = IngestionHandle::start(writer, Arc::new(ProducerRegistry::new()))
+            .expect("start handle");
+        handle
+            .apply_cdc_batch(batch("erp", "orders", 77), "default")
+            .await
+            .expect("apply");
+        handle.shutdown_and_wait();
+        // Let the writer thread exit and release the catalog lock before the
+        // fresh engine re-attaches (restart).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // A NEW engine instance (restart) reads the same committed offset.
+        let writer2 = Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data"))
+            .expect("re-attach");
+        let handle2 = IngestionHandle::start(writer2, Arc::new(ProducerRegistry::new()))
+            .expect("start handle 2");
+        let stored = handle2
+            .read_cdc_offsets(&source_key("erp", "orders"))
+            .await
+            .expect("offset");
+        assert_eq!(stored, vec![(0, 77)], "offset survives restart");
+        handle2.shutdown_and_wait();
     }
 }
