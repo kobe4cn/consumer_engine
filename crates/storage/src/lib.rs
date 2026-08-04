@@ -58,13 +58,33 @@ impl std::fmt::Debug for Writer {
 
 impl Writer {
     /// Attach a writable DuckLake catalog at `catalog_path` with Parquet data
-    /// under `data_path`. Acquires an exclusive lock; a second attach to the
-    /// same catalog fails with [`Error::WriterAlreadyHeld`].
+    /// under `data_path`, with the default compaction tuning. Acquires an
+    /// exclusive lock; a second attach to the same catalog fails with
+    /// [`Error::WriterAlreadyHeld`].
     ///
     /// # Errors
     /// - [`Error::WriterAlreadyHeld`] if the catalog is already locked.
     /// - [`Error::Storage`] if DuckDB/DuckLake attach fails.
     pub fn attach(catalog_path: &Path, data_path: &Path) -> Result<Self> {
+        Self::attach_with_compaction(
+            catalog_path,
+            data_path,
+            &consumer_engine_core::CompactionConfig::default(),
+        )
+    }
+
+    /// Like [`Self::attach`] but with explicit DuckLake compaction tuning
+    /// (runtime-tunable config — AGENTS.md: tunable data lives in the config
+    /// file, not in SQL literals).
+    ///
+    /// # Errors
+    /// - [`Error::WriterAlreadyHeld`] if the catalog is already locked.
+    /// - [`Error::Storage`] if DuckDB/DuckLake attach or the compaction SET fails.
+    pub fn attach_with_compaction(
+        catalog_path: &Path,
+        data_path: &Path,
+        compaction: &consumer_engine_core::CompactionConfig,
+    ) -> Result<Self> {
         // Single-writer enforcement (D3): exclusive lock on a sibling file.
         let lock_path = catalog_path.with_extension("db.writelock");
         // Advisory file locking (fs2::FileExt) is only impl'd for std::fs::File,
@@ -92,14 +112,18 @@ impl Writer {
         );
         conn.execute_batch(&sql)
             .map_err(|e| Error::Storage(BoxError::from(e)))?;
-        // Compaction tuning (D6 / specs/71 §4): write every batch as a data file
-        // (no inlining into the catalog) so micro-batches accumulate small files
-        // that compaction can merge, and merge up to a 1 MB target. Without this
-        // DuckLake inlines small writes and `ducklake_list_files` stays empty.
-        conn.execute_batch(
-            "SET ducklake_default_data_inlining_row_limit = 0; SET ducklake_target_file_size = \
-             '1MB';",
-        )
+        // Compaction tuning (specs/71 §4, spike-microbatch-compaction.md):
+        // write every batch as a data file (no inlining into the catalog) so
+        // micro-batches accumulate small files that compaction can merge, and
+        // merge up to the configured target size. Without this DuckLake inlines
+        // small writes and `ducklake_list_files` stays empty. Values are
+        // runtime-tunable config, not SQL literals (AGENTS.md).
+        let target = escape_for_sql_literal(&compaction.target_file_size);
+        conn.execute_batch(&format!(
+            "SET ducklake_default_data_inlining_row_limit = {}; SET ducklake_target_file_size = \
+             '{target}';",
+            compaction.inlining_row_limit,
+        ))
         .map_err(|e| Error::Storage(BoxError::from(e)))?;
         Ok(Self {
             conn,
@@ -476,7 +500,10 @@ impl Writer {
         Ok(bound)
     }
 
-    /// Run DuckLake compaction (`ducklake_rewrite_data_files`) on a table.
+    /// Run DuckLake compaction on a table. Uses `ducklake_merge_adjacent_files`
+    /// — the procedure that actually merges in this DuckLake build
+    /// (`ducklake_rewrite_data_files` is threshold-gated and returns 0
+    /// processed; see docs/research/perf-calibration.md).
     ///
     /// # Errors
     /// - [`Error::InvalidInput`] on a bad identifier.

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ApiError, AppState, presign};
 
 /// `GET /audience/:id` response body.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudienceResponse {
     snapshot_id: String,
@@ -28,6 +28,20 @@ pub struct AudienceResponse {
     as_of_ts: String,
     row_count: u64,
     download_url: String,
+}
+
+/// Redacting `Debug` (specs/70 I5): `download_url` embeds the presigned export
+/// token, so it is never printed — only a `[REDACTED]` marker.
+impl std::fmt::Debug for AudienceResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudienceResponse")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("campaign_id", &self.campaign_id)
+            .field("as_of_ts", &self.as_of_ts)
+            .field("row_count", &self.row_count)
+            .field("download_url", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// `GET /audience/:id/export` query string.
@@ -134,4 +148,31 @@ pub async fn get_export(
         axum::body::Body::from(bytes),
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_redact_download_url_in_debug() {
+        // The presigned download URL carries the export token; Debug must never
+        // print it (specs/70 I5: no secrets in logs).
+        let resp = AudienceResponse {
+            snapshot_id: "snap_abc".into(),
+            campaign_id: "c1".into(),
+            as_of_ts: "2025-01-01T00:00:00Z".into(),
+            row_count: 3,
+            download_url: "/audience/snap_abc/export?format=parquet&token=SECRET_TOKEN".into(),
+        };
+        let debug = format!("{resp:?}");
+        assert!(
+            !debug.contains("SECRET_TOKEN"),
+            "presigned token must not appear in Debug: {debug}"
+        );
+        assert!(
+            debug.contains("[REDACTED]"),
+            "marker must be present: {debug}"
+        );
+    }
 }

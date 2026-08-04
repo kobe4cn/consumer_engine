@@ -30,4 +30,4 @@ tracing.workspace = true
 uuid = { workspace = true }
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber.workspace = true

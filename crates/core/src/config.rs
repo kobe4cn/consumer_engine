@@ -34,6 +34,9 @@ pub struct EngineConfig {
     /// Suppression rules consumed by the `Exclude` capability (specs/20 §5).
     #[serde(default)]
     pub suppression: SuppressionRules,
+    /// DuckLake compaction tuning (specs/71 §4, spike-microbatch-compaction).
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 const fn default_compaction_interval() -> u64 {
@@ -182,6 +185,40 @@ impl Default for SuppressionRules {
     }
 }
 
+/// DuckLake compaction tuning (specs/71 §4; spike-microbatch-compaction.md).
+/// Runtime-tunable YAML: `inlining_row_limit = 0` makes every micro-batch a
+/// data file (so compaction has small files to merge); `target_file_size` is
+/// the merge target. Calibrate on target storage (spike R1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompactionConfig {
+    /// Rows below which a write is inlined into the catalog instead of a data
+    /// file; `0` disables inlining entirely.
+    #[serde(default = "default_inlining_row_limit")]
+    pub inlining_row_limit: u64,
+    /// The target merged file size (DuckLake setting `ducklake_target_file_size`,
+    /// e.g. `"1MB"`).
+    #[serde(default = "default_target_file_size")]
+    pub target_file_size: String,
+}
+
+const fn default_inlining_row_limit() -> u64 {
+    0
+}
+
+fn default_target_file_size() -> String {
+    "1MB".to_string()
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            inlining_row_limit: default_inlining_row_limit(),
+            target_file_size: default_target_file_size(),
+        }
+    }
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -192,6 +229,7 @@ impl Default for EngineConfig {
             bind: default_bind(),
             guardrails: GuardrailConfig::default(),
             suppression: SuppressionRules::default(),
+            compaction: CompactionConfig::default(),
         }
     }
 }

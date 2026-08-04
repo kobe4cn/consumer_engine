@@ -47,7 +47,11 @@ impl Engine {
     /// # Errors
     /// Propagates storage/execution/ingestion setup errors.
     pub fn build(config: &EngineConfig) -> Result<(Router, Engine)> {
-        let writer = Writer::attach(&config.catalog_path, &config.data_path)?;
+        let writer = Writer::attach_with_compaction(
+            &config.catalog_path,
+            &config.data_path,
+            &config.compaction,
+        )?;
         // Initialise the materialise schema up front so read-only `snapshot_meta`
         // queries never hit a missing `audience_snapshot` table before the first
         // materialise (the writer creates it lazily too, but a startup init keeps

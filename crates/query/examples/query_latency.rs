@@ -34,7 +34,10 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(50_000);
-    println!("seeding corpus of {scale} rows...");
+    // Distinct-user divisor; guard tiny scales so the bench never divides by
+    // zero (and always has at least one distinct user).
+    let users = (scale / 10).max(1);
+    println!("seeding corpus of {scale} rows ({users} users)...");
 
     let tmp = tempfile::tempdir().expect("tmp");
     let writer = Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data"))
@@ -44,7 +47,7 @@ fn main() {
     // (numeric as VARCHAR — raw tables are VARCHAR), `category`.
     let mut rows: Vec<Vec<Option<String>>> = Vec::with_capacity(scale);
     for i in 0..scale {
-        let user = format!("u{}", i % (scale / 10));
+        let user = format!("u{}", i % users);
         let ts = format!("2025-01-{:02}T00:00:00Z", (i % 28) + 1);
         let amount = (i % 1000).to_string();
         let cat = ["A", "B", "C"][i % 3].to_string();
@@ -84,7 +87,7 @@ fn main() {
 
     // A feature + wide view for F queries.
     writer.ensure_feature_store_table().expect("feature store");
-    let features: Vec<FeatureRow> = (0..scale / 10)
+    let features: Vec<FeatureRow> = (0..users)
         .map(|u| FeatureRow {
             user_id: format!("u{u}"),
             feature_name: "cadence.regularity".into(),
