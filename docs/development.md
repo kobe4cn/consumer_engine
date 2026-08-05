@@ -83,4 +83,4 @@ cargo doc --workspace --no-deps --all-features
 
 ## 性能门禁（issue #25）
 
-`make bench-queries` 是**性能退出标准门禁**：`crates/query/examples/query_latency.rs` 播种合成语料（`CE_SCALE_ROWS`，默认 50k），经真实引擎（读池 + 写代数，issue #20）跑 B/F/J/P，断言锁定预算 **P50 ≤ 1 s / P99 ≤ 5 s**（specs/71 §3），未达标 **exit non-zero**。阈值可覆盖以便自测：`CE_MAX_P50_MS` / `CE_MAX_P99_MS`。实测数字与 M1 证据表见 [docs/research/perf-calibration.md](research/perf-calibration.md) —— 50k 行 P50 11–64 ms，远低于预算。
+`make bench-queries` 是**性能退出标准门禁**：`crates/query/examples/query_latency.rs` 播种合成语料（`CE_SCALE_ROWS`，默认 50k），经真实引擎（读池 + 写代数，issue #20）跑 B/F/J/P，断言锁定预算 **P50 < 1 s / P99 < 5 s**（specs/71 §3），未达标 **exit non-zero**。阈值可覆盖以便自测：`CE_MAX_P50_MS` / `CE_MAX_P99_MS`。实测数字与 M1 证据表见 [docs/research/perf-calibration.md](research/perf-calibration.md) —— 最近一次门禁运行 50k 行 P50 13–65 ms，远低于预算。仓库无 CI workflow，门禁即本地自动化面（CI runner 可直接调用 `make bench-queries`）。

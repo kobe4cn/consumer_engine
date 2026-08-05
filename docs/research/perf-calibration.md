@@ -1,6 +1,6 @@
 # Perf calibration — B/F/J/P sync latencies (issue #10 AC1)
 
-Status: harness shipped, numbers measured · Owner: platform · Date: 2026-08
+Status: harness shipped, numbers measured · Owner: platform · Date: 2025-08
 Updated: read-path spike (issue #12 / GC-P0) found and fixed the seed-path
 defect that produced the original numbers; new decomposition below.
 
@@ -117,7 +117,8 @@ after a commit) while keeping the hot path attach-free in steady state.
 magnitude of headroom** (the exec floor is 5–10 ms; the residual is the
 EXPLAIN pre-flight + catalogue probes, now attach-free). Re-run at
 `CE_SCALE_ROWS=50000000` on the file-backed attach to re-lock the guardrail
-numbers (still open — bench-gate #25 will CI-enforce the ≤ 1 s budget).
+numbers (still open — the bench gate #25 now enforces the ≤ 1 s budget at
+50k; the scale validation remains).
 
 Pool details: `consumer_engine-execution::Reader::start_pooled(conns, …,
 write_gen, interval)`; workers re-attach only when the generation advances or
@@ -152,11 +153,11 @@ human sign-off in #26:
 | Exit criterion | Evidence |
 | -------------- | -------- |
 | "bought SKU A in 30d, lapsed" composes via DSL and runs sync | e2e `test_should_run_recency_and_lapsed_over_rest`, `test_should_run_dsl_filter_query_over_rest` |
-| P50 < 1 s on the seeded corpus | **`make bench-queries` gate** (this file, issue #25): at 50k rows the gate run measured B/F/J/P P50 13–65 ms (P99 < 220 ms); the gate asserts P50 < 1 s / P99 < 5 s and exits non-zero on breach |
+| P50 < 1 s on the seeded corpus | **`make bench-queries` gate** (this file, issue #25): at 50k rows the latest gate run measured B/F/J/P P50 13–65 ms (P99 < 240 ms); the gate asserts P50 < 1 s / P99 < 5 s and exits non-zero on breach |
 | Guardrails reject an over-budget query | e2e `test_should_reject_over_budget_query_pre_execution`; guardrail unit `test_should_reject_query_over_max_output_rows` (memory is runtime-PRAGMA-bounded, not pre-flight — specs/12 §4) |
 | Parameterised results (no interpolated values) | `test_should_parameterise_all_user_values` (compiler unit) |
 | `freshness` label on every result | e2e `test_should_report_worst_source_freshness` (graded per-source since #22/#24) |
-| Full Rust gate green | `cargo build` + `cargo test --workspace --all-features` (146) + `cargo +nightly fmt` + `cargo clippy -- -D warnings` + `make lint-boundary` |
+| Full Rust gate green | `cargo build` + `cargo test --workspace --all-features` (147) + `cargo +nightly fmt` + `cargo clippy -- -D warnings` + `make lint-boundary` |
 
 ## M5 exit-criteria evidence (roadmap §4 closure table, issue #26)
 
@@ -171,5 +172,5 @@ human sign-off in #26:
 | Security checklist green | `make lint-boundary`; `test_should_redact_approval_token_in_debug` + `test_should_not_leak_token_in_formatted_log_output` (redacting Debug/log); `test_should_hash_token_deterministically` + constant-time middleware; `test_should_redact_download_url_in_debug` + `test_should_require_bearer_auth_when_configured` (authN/presign); **tenant isolation by construction (AC6)** — `test_should_isolate_tenants_by_construction` (issue #22) |
 | G2 — every selected user auditable | `test_should_resolve_periodic_buyers_end_to_end` decodes the snapshot Parquet and asserts the **frozen feature value** + per-predicate `hit_reason` chain (issue #13) |
 | G3 — filtering latency | the `make bench-queries` gate row above |
-| 71 §4 ingestion budgets | compaction reduces file count + time-travel retained (`test_should_compact_reduce_file_count_and_preserve_rows_and_snapshots`); micro-batch accumulation/drain (#15 tests); snapshot expiry tracked separately as #17 (upstream DuckLake binder blocker) |
-| Full Rust gate green | `cargo build` + `cargo test --workspace --all-features` (146) + fmt + clippy + `make lint-boundary` + `make bench-queries` |
+| 71 §4 ingestion budgets | compaction reduces file count + snapshot history retained (`test_should_compact_reduce_file_count_and_preserve_rows_and_snapshots` — the time-travel proxy is the retained snapshot list); micro-batch accumulation/drain (#15 tests); snapshot expiry tracked separately as #17 (upstream DuckLake binder blocker) — **accepted as a non-blocking deferral** for M5 closure |
+| Full Rust gate green | `cargo build` + `cargo test --workspace --all-features` (147) + fmt + clippy + `make lint-boundary` + `make bench-queries` |

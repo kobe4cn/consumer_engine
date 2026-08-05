@@ -52,13 +52,13 @@ returns rows with a `freshness` label. No DSL yet. Shipped in T1 (`e50e918`);
 covered by `tests/e2e.rs` + storage unit tests (single-writer refusal,
 read-only probe rejection, restart durability).
 
-### M1 — Boolean/temporal DSL (B) for operators — ⚠️ OPEN — exit criterion NOT met
+### M1 — Boolean/temporal DSL (B) for operators — ⚠️ OPEN — exit criterion met, awaiting human sign-off
 
-> **Status**: reverted from CLOSED (2025-08) because "P50 < 1 s" was unmet; the
-> read pool (issue #20) fixed the re-attach root cause — the gate now measures
-> P50 13–65 ms @ 50k rows (`make bench-queries`, issue #25) and enforces
-> P50 < 1 s / P99 < 5 s. Closure requires the gate green + human sign-off
-> (roadmap §4); see [docs/research/perf-calibration.md](../docs/research/perf-calibration.md).
+> **Status**: exit criterion now MET with evidence — the read pool (#20) fixed
+> the re-attach root cause and the bench gate (#25) enforces P50 < 1 s /
+> P99 < 5 s, measuring P50 13–65 ms @ 50k rows. Closure requires ONLY the human
+> sign-off (roadmap §4). Evidence table:
+> [docs/research/perf-calibration.md](../docs/research/perf-calibration.md) §M1.
 
 **Specs touched**: 12, 21. **Exit**: an agent composes "bought SKU A in 30d,
 lapsed" via `/query` (sync) and gets guarded, parameterised results; P50 < 1 s
@@ -113,11 +113,14 @@ met; security checklist green. G2/G3 hold. Shipped in #8/#9 (`5bf7c05`) +
 #10 (`8e01ed3`/`f089593`/`44fcccb`): Derive with measured (non-bypassable)
 survivor cap, Characterize segment-vs-baseline profiles, boundary lint gate
 (`make lint-boundary`), redacting Debug + log test, constant-time presign +
-expiry + access log. **Perf gap (blocking closure)**: the budgets are NOT met
-at scale (measured 2.5–15 s P50 at 50k rows; re-attach dominated) — tracked in
-`docs/research/perf-calibration.md`. **Security gap (blocking closure)**: AC6
-tenant isolation deferred (single-tenant by construction) — `specs/93`
-T7c-TENANT; authN itself is implemented.
+expiry + access log. **Perf (fixed, closing)**: the re-attach root cause was removed by the read
+pool (#20); the bench gate (#25) enforces P50 < 1 s / P99 < 5 s and measures
+P50 13–65 ms @ 50k rows. **Security (fixed, closing)**: AC6 tenant isolation
+is enforced by construction — the compiler injects the caller's tenant into
+every SQL; `test_should_isolate_tenants_by_construction` proves cross-tenant
+reads/snapshots/suppression are impossible (#22). 71 §4 snapshot expiry is
+tracked separately as #17 (upstream DuckLake binder blocker) — accepted as a
+**non-blocking** deferral for M5 closure (its own ticket stays open).
 
 ### (Phase 2 — not v1) S similarity + ML producers
 

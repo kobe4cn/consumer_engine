@@ -690,7 +690,13 @@ impl Writer {
                 continue;
             };
             match seen.get(k) {
-                Some(&i) => deduped[i] = row,
+                Some(&i) => {
+                    // `i` was pushed as `deduped.len()`, so it is always in
+                    // bounds; get_mut keeps the boundary lint set clean.
+                    if let Some(slot) = deduped.get_mut(i) {
+                        *slot = row;
+                    }
+                }
                 None => {
                     seen.insert(k.to_string(), deduped.len());
                     deduped.push(row);

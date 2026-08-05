@@ -193,7 +193,11 @@ impl Reader {
     ) -> Result<QueryResult> {
         let (rtx, rrx) = flume::bounded(1);
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        self.workers[idx]
+        let worker = self
+            .workers
+            .get(idx)
+            .ok_or_else(|| Error::Execution(BoxError::from("read pool worker vanished")))?;
+        worker
             .send_async(Cmd::Query {
                 sql: sql.to_string(),
                 params,

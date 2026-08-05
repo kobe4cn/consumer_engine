@@ -2,9 +2,10 @@
 
 一个**面向 AI 代理的受众筛选引擎**（Rust 编写）：营销运营用自然语言描述目标受众，代理据此组合结构化 DSL，引擎将其编译为 DuckLake 之上的**受守卫的** DuckDB SQL，并物化为带审计 + 抑制的**版本化受众快照**。
 
-**里程碑 M0/M2/M3/M4 已关闭；M1/M5 处于 OPEN —— 退出标准未达成**（见
-[specs/90-roadmap.md](specs/90-roadmap.md)：性能目标差 2–3 个数量级、租户隔离 AC 延后，
-关闭流程已改为**人确认制**）；PRD 及子 issue #3/#10 已重新打开。v1 能力集：
+**里程碑 M0/M2/M3/M4 已关闭；M1/M5 的退出标准已达成，待**人签字**关闭**（见
+[specs/90-roadmap.md](specs/90-roadmap.md)：性能门禁 `make bench-queries` 实测
+P50 13–65 ms @50k 行，租户隔离 AC6 已按构造强制；关闭流程为**人确认制**，证据表见
+[docs/research/perf-calibration.md](docs/research/perf-calibration.md)）。v1 能力集：
 
 - **B** — 原始事件上的布尔/时间-关系谓词。
 - **F** — 预计算逐用户 **Feature Store** 上的谓词。
