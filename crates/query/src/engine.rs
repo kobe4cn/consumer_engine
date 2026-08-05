@@ -650,6 +650,11 @@ impl QueryEngine {
         snap_uuid: &str,
         tenant: &str,
     ) -> Result<Option<SnapshotMeta>> {
+        // Column indices of the snapshot-meta SELECT (the order is the
+        // contract — named so a reorder is visible).
+        const COL_CAMPAIGN: usize = 0;
+        const COL_AS_OF: usize = 1;
+        const COL_ROW_COUNT: usize = 2;
         // IDOR closure (issue #22 / specs/21 I3): the metadata read is scoped to
         // the caller's tenant — a foreign tenant's snapshot resolves to None.
         let sql = "SELECT campaign_id, CAST(as_of_ts AS VARCHAR), count(*) FROM \
@@ -669,16 +674,19 @@ impl QueryEngine {
             None => return Ok(None),
         };
         let campaign_id = row
-            .first()
+            .get(COL_CAMPAIGN)
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .unwrap_or_default();
         let as_of_ts = row
-            .get(1)
+            .get(COL_AS_OF)
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
             .unwrap_or_default();
-        let row_count = row.get(2).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let row_count = row
+            .get(COL_ROW_COUNT)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
         Ok(Some(SnapshotMeta {
             snapshot_id: snap_uuid.to_string(),
             campaign_id,
@@ -724,6 +732,20 @@ fn assemble_profile(
     recency: &QueryResult,
     categories: &QueryResult,
 ) -> serde_json::Value {
+    // Column indices of the three profile SELECTs (the order is the contract).
+    const M_SEG_USERS: usize = 0;
+    const M_BASE_USERS: usize = 1;
+    const M_SEG_AOV: usize = 2;
+    const M_BASE_AOV: usize = 3;
+    const M_SEG_FREQ: usize = 4;
+    const M_BASE_FREQ: usize = 5;
+    const M_SEG_ORDERS: usize = 6;
+    const M_BASE_ORDERS: usize = 7;
+    const R_SEG_RECENCY: usize = 0;
+    const R_BASE_RECENCY: usize = 1;
+    const C_CATEGORY: usize = 0;
+    const C_SEG_N: usize = 1;
+    const C_BASE_N: usize = 2;
     use serde_json::json;
 
     let cell = |row: &RowCells, i: usize| -> f64 {
@@ -733,30 +755,30 @@ fn assemble_profile(
     };
     let m = metrics.rows.first().cloned().unwrap_or_default();
     let r = recency.rows.first().cloned().unwrap_or_default();
-    let seg_users = cell(&m, 0) as u64;
-    let base_users = cell(&m, 1) as u64;
-    let seg_aov = cell(&m, 2);
-    let base_aov = cell(&m, 3);
-    let seg_freq = cell(&m, 4);
-    let base_freq = cell(&m, 5);
+    let seg_users = cell(&m, M_SEG_USERS) as u64;
+    let base_users = cell(&m, M_BASE_USERS) as u64;
+    let seg_aov = cell(&m, M_SEG_AOV);
+    let base_aov = cell(&m, M_BASE_AOV);
+    let seg_freq = cell(&m, M_SEG_FREQ);
+    let base_freq = cell(&m, M_BASE_FREQ);
     // Total order counts (all categories) for correct shares even when the
     // category query is limited to the top-3.
-    let seg_orders = cell(&m, 6);
-    let base_orders = cell(&m, 7);
-    let seg_recency = cell(&r, 0);
-    let base_recency = cell(&r, 1);
+    let seg_orders = cell(&m, M_SEG_ORDERS);
+    let base_orders = cell(&m, M_BASE_ORDERS);
+    let seg_recency = cell(&r, R_SEG_RECENCY);
+    let base_recency = cell(&r, R_BASE_RECENCY);
 
     // Category mix: shares of the top categories (by segment count).
     let mut seg_mix: Vec<serde_json::Value> = Vec::new();
     let mut base_mix: Vec<serde_json::Value> = Vec::new();
     for row in &categories.rows {
         let category = row
-            .first()
+            .get(C_CATEGORY)
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string();
-        let seg_n = cell(row, 1);
-        let base_n = cell(row, 2);
+        let seg_n = cell(row, C_SEG_N);
+        let base_n = cell(row, C_BASE_N);
         seg_mix.push(json!({ "category": category, "orders": seg_n }));
         base_mix.push(json!({ "category": category, "orders": base_n }));
     }

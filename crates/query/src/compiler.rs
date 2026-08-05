@@ -309,43 +309,34 @@ fn tenant_eq(rel: &str, params: &mut Vec<Value>, tenant: &str) -> String {
 /// into `params`.
 fn compile_predicate(rel: &str, p: &Predicate, params: &mut Vec<Value>) -> Result<String> {
     let col = format!("{rel}.{}", p.column);
-    let sql = match p.op {
-        Cmp::Eq => {
-            params.push(to_value(&p.value)?);
-            format!("{col} = ?")
-        }
-        Cmp::Ne => {
-            params.push(to_value(&p.value)?);
-            format!("{col} <> ?")
-        }
-        Cmp::Lt => {
-            params.push(to_value(&p.value)?);
-            format!("{col} < ?")
-        }
-        Cmp::Le => {
-            params.push(to_value(&p.value)?);
-            format!("{col} <= ?")
-        }
-        Cmp::Gt => {
-            params.push(to_value(&p.value)?);
-            format!("{col} > ?")
-        }
-        Cmp::Ge => {
-            params.push(to_value(&p.value)?);
-            format!("{col} >= ?")
-        }
-        Cmp::Like => {
-            params.push(to_value(&p.value)?);
-            format!("{col} LIKE ?")
-        }
-        Cmp::NotLike => {
-            params.push(to_value(&p.value)?);
-            format!("{col} NOT LIKE ?")
-        }
-        Cmp::In => compile_in(&col, &p.value, params, false)?,
-        Cmp::NotIn => compile_in(&col, &p.value, params, true)?,
-    };
-    Ok(sql)
+    // Binary comparison ops share one shape: push the bound value, render the
+    // SQL symbol (a table, not a repeated arm cascade). `IN`/`NOT IN` are
+    // list-valued and handled separately.
+    if let Some(sym) = binary_cmp_symbol(p.op) {
+        params.push(to_value(&p.value)?);
+        return Ok(format!("{col} {sym} ?"));
+    }
+    match p.op {
+        Cmp::In => compile_in(&col, &p.value, params, false),
+        Cmp::NotIn => compile_in(&col, &p.value, params, true),
+        _ => Err(QueryError::InvalidDsl("unsupported predicate op".into())),
+    }
+}
+
+/// The SQL symbol for the eight binary comparison ops; `None` for the
+/// list-valued `IN`/`NOT IN`.
+const fn binary_cmp_symbol(op: Cmp) -> Option<&'static str> {
+    match op {
+        Cmp::Eq => Some("="),
+        Cmp::Ne => Some("<>"),
+        Cmp::Lt => Some("<"),
+        Cmp::Le => Some("<="),
+        Cmp::Gt => Some(">"),
+        Cmp::Ge => Some(">="),
+        Cmp::Like => Some("LIKE"),
+        Cmp::NotLike => Some("NOT LIKE"),
+        Cmp::In | Cmp::NotIn => None,
+    }
 }
 
 /// Render an `IN`/`NOT IN` list, pushing each value into `params`.

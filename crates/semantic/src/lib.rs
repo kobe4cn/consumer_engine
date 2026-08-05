@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
+pub mod cells;
 pub mod intent_rag;
 pub mod llm;
 pub mod profiler;

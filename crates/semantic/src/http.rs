@@ -18,6 +18,10 @@ use crate::llm::{EmbeddingModel, LlmClient};
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Retries after a transient failure.
 const RETRIES: usize = 1;
+/// Hard cap on the outbound response body (AGENTS.md § Resource Limits: a
+/// hostile/runaway LLM service must not balloon memory; the endpoint is
+/// config-pinned but the body is still external input).
+const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
 /// An OpenAI-compatible chat-completions LLM client (description generation).
 pub struct HttpLlm {
@@ -76,10 +80,15 @@ impl HttpLlm {
         if !resp.status().is_success() {
             return Err(Error::CatalogueUnavailable);
         }
-        let v: serde_json::Value = resp
-            .json()
+        let bytes = resp
+            .bytes()
             .await
             .map_err(|e| Error::Execution(Box::from(e)))?;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(Error::CatalogueUnavailable);
+        }
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| Error::Execution(Box::from(e)))?;
         v["choices"][0]["message"]["content"]
             .as_str()
             .map(str::to_string)
@@ -147,10 +156,15 @@ impl HttpEmbedding {
         if !resp.status().is_success() {
             return Err(Error::CatalogueUnavailable);
         }
-        let v: serde_json::Value = resp
-            .json()
+        let bytes = resp
+            .bytes()
             .await
             .map_err(|e| Error::Execution(Box::from(e)))?;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(Error::CatalogueUnavailable);
+        }
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| Error::Execution(Box::from(e)))?;
         let arr = v["data"][0]["embedding"]
             .as_array()
             .ok_or(Error::CatalogueUnavailable)?;

@@ -46,18 +46,14 @@ struct DebeziumEnvelope {
 pub struct KafkaCdcAdapter {
     consumer: StreamConsumer,
     source: String,
-    system: String,
-    entity: String,
-    columns: Vec<String>,
-    key: String,
+    mapper: DebeziumMapper,
 }
 
 impl std::fmt::Debug for KafkaCdcAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KafkaCdcAdapter")
             .field("source", &self.source)
-            .field("columns", &self.columns)
-            .field("key", &self.key)
+            .field("mapper", &self.mapper)
             .finish_non_exhaustive()
     }
 }
@@ -93,73 +89,86 @@ impl KafkaCdcAdapter {
         Ok(Self {
             consumer,
             source: source_key(system, entity),
+            mapper: DebeziumMapper::new(system, entity, columns, key),
+        })
+    }
+}
+
+/// Maps Debezium change envelopes to [`SourceBatch`]es for one source
+/// (system/entity/columns/key). Bundles the mapping context so the adapter and
+/// tests share one shape without a live Kafka consumer.
+#[derive(Debug, Clone)]
+pub struct DebeziumMapper {
+    system: String,
+    entity: String,
+    columns: Vec<String>,
+    key: String,
+}
+
+impl DebeziumMapper {
+    /// A mapper for one raw table.
+    #[must_use]
+    pub fn new(system: &str, entity: &str, columns: Vec<String>, key: &str) -> Self {
+        Self {
             system: system.into(),
             entity: entity.into(),
             columns,
             key: key.into(),
-        })
+        }
     }
-}
 
-/// Map a Debezium envelope + Kafka offset to a [`SourceBatch`]. Rows are
-/// strings; a missing column in a change object maps to `None` (NULL).
-fn envelope_to_batch(
-    env: &DebeziumEnvelope,
-    partition: i32,
-    offset: i64,
-    system: &str,
-    entity: &str,
-    columns: &[String],
-    key: &str,
-) -> SourceBatch {
-    let env = env.payload.as_deref().unwrap_or(env);
-    let mut upserts = Vec::new();
-    let mut deletes = Vec::new();
-    match env.op.as_deref() {
-        // `r` = Debezium snapshot record — same shape as a create/update.
-        Some("c") | Some("u") | Some("r") | None => {
-            if let Some(after) = &env.after {
-                upserts.push(row_from_json(columns, after));
+    /// Map a Debezium envelope + Kafka offset to a [`SourceBatch`] for this
+    /// mapping. Rows are strings; missing columns map to `None`.
+    fn map(&self, env: &DebeziumEnvelope, partition: i32, offset: i64) -> SourceBatch {
+        let env = env.payload.as_deref().unwrap_or(env);
+        let mut upserts = Vec::new();
+        let mut deletes = Vec::new();
+        match env.op.as_deref() {
+            // `r` = Debezium snapshot record — same shape as a create/update.
+            Some("c") | Some("u") | Some("r") | None => {
+                if let Some(after) = &env.after {
+                    upserts.push(self.row_from_json(after));
+                }
+            }
+            Some("d") => {
+                if let Some(before) = &env.before
+                    && let Some(k) = before.get(&self.key).map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                {
+                    deletes.push(k);
+                }
+            }
+            Some(other) => {
+                tracing::warn!(op = other, source = %source_key(&self.system, &self.entity), "unknown Debezium op; skipped");
             }
         }
-        Some("d") => {
-            if let Some(before) = &env.before
-                && let Some(k) = before.get(key).map(|v| match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
+        SourceBatch {
+            system: self.system.clone(),
+            entity: self.entity.clone(),
+            columns: self.columns.clone(),
+            key: self.key.clone(),
+            upserts,
+            deletes,
+            offsets: vec![(partition, offset)],
+        }
+    }
+
+    /// Extract one row (aligned with `columns`) from a Debezium `after`/`before`
+    /// JSON object; missing/null values map to `None`.
+    fn row_from_json(&self, obj: &serde_json::Value) -> Vec<Option<String>> {
+        self.columns
+            .iter()
+            .map(|c| {
+                obj.get(c).and_then(|v| match v {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    other => Some(other.to_string()),
                 })
-            {
-                deletes.push(k);
-            }
-        }
-        Some(other) => {
-            tracing::warn!(op = other, source = %source_key(system, entity), "unknown Debezium op; skipped");
-        }
-    }
-    SourceBatch {
-        system: system.to_string(),
-        entity: entity.to_string(),
-        columns: columns.to_vec(),
-        key: key.to_string(),
-        upserts,
-        deletes,
-        offsets: vec![(partition, offset)],
-    }
-}
-
-/// Extract one row (aligned with `columns`) from a Debezium `after`/`before`
-/// JSON object; missing/null values map to `None`.
-fn row_from_json(columns: &[String], obj: &serde_json::Value) -> Vec<Option<String>> {
-    columns
-        .iter()
-        .map(|c| {
-            obj.get(c).and_then(|v| match v {
-                serde_json::Value::Null => None,
-                serde_json::Value::String(s) => Some(s.clone()),
-                other => Some(other.to_string()),
             })
-        })
-        .collect()
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -245,15 +254,7 @@ impl SourceAdapter for KafkaCdcAdapter {
                             continue;
                         }
                     };
-                    let batch = envelope_to_batch(
-                        &env,
-                        partition,
-                        offset,
-                        &self.system,
-                        &self.entity,
-                        &self.columns,
-                        &self.key,
-                    );
+                    let batch = self.mapper.map(&env, partition, offset);
                     upserts.extend(batch.upserts);
                     deletes.extend(batch.deletes);
                 }
@@ -265,10 +266,10 @@ impl SourceAdapter for KafkaCdcAdapter {
             return Ok(None);
         }
         Ok(Some(SourceBatch {
-            system: self.system.clone(),
-            entity: self.entity.clone(),
-            columns: self.columns.clone(),
-            key: self.key.clone(),
+            system: self.mapper.system.clone(),
+            entity: self.mapper.entity.clone(),
+            columns: self.mapper.columns.clone(),
+            key: self.mapper.key.clone(),
             upserts,
             deletes,
             offsets: offsets.into_iter().collect(),
@@ -334,12 +335,17 @@ mod tests {
     #[test]
     fn test_should_map_debezium_envelopes_to_batches() {
         // Pure mapping (no broker): the envelope → batch logic.
-        let columns = vec!["user_id".into(), "sku".into()];
+        let mapper = DebeziumMapper::new(
+            "erp",
+            "orders",
+            vec!["user_id".into(), "sku".into()],
+            "user_id",
+        );
         let env: DebeziumEnvelope = serde_json::from_str(
             r#"{"payload": {"op": "c", "after": {"user_id": "u1", "sku": "A"}}}"#,
         )
         .expect("parse");
-        let batch = envelope_to_batch(&env, 0, 42, "erp", "orders", &columns, "user_id");
+        let batch = mapper.map(&env, 0, 42);
         assert_eq!(
             batch.upserts,
             vec![vec![Some("u1".into()), Some("A".into())]]
@@ -350,7 +356,7 @@ mod tests {
         let env: DebeziumEnvelope =
             serde_json::from_str(r#"{"op": "d", "before": {"user_id": "u9", "sku": "Z"}}"#)
                 .expect("parse");
-        let batch = envelope_to_batch(&env, 0, 43, "erp", "orders", &columns, "user_id");
+        let batch = mapper.map(&env, 0, 43);
         assert!(batch.upserts.is_empty());
         assert_eq!(batch.deletes, vec!["u9".to_string()]);
     }

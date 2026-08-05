@@ -34,6 +34,21 @@ impl std::fmt::Debug for IntentRag {
 }
 
 impl IntentRag {
+    /// Column indices of the `catalogue_entry` SELECT (the order is the
+    /// contract; a reorder here corrupts rows — named so the contract is
+    /// visible).
+    const ENTRY_COL: usize = 0;
+    const ENTRY_SYSTEM: usize = 1;
+    const ENTRY_TABLE: usize = 2;
+    const ENTRY_COLUMN: usize = 3;
+    const ENTRY_SEMANTIC_TYPE: usize = 4;
+    const ENTRY_DATA_TYPE: usize = 5;
+    const ENTRY_DESCRIPTION: usize = 6;
+    const ENTRY_PII: usize = 7;
+    const ENTRY_SAMPLES: usize = 8;
+    const ENTRY_EMBEDDING: usize = 9;
+    const ENTRY_EPOCH: usize = 10;
+
     /// Fetch the NEWEST catalogue entry for one column (issue #23: description
     /// editing preserves the original row's semantics and re-stamps only the
     /// description + embedding + version).
@@ -69,28 +84,34 @@ impl IntentRag {
             Some(r) => r,
             None => return Ok(None),
         };
-        // The stored semantic_type is engine-written (validated); an unparseable
-        // value is catalogue corruption — surface it rather than silently
-        // rewriting the row's type on an edit (issue #23).
-        let semantic_type = row
-            .get(4)
-            .and_then(Value::as_str)
-            .and_then(SemanticType::parse)
-            .ok_or_else(|| {
-                Error::InvalidInput("catalogue row has an unknown semantic_type".into())
-            })?;
         Ok(Some(consumer_engine_core::CatalogRow {
-            entity_type: cell_opt_string(row.first()).unwrap_or_else(|| "column".to_string()),
-            system: cell_string(row.get(1)),
-            table_name: cell_string(row.get(2)),
-            column_name: cell_opt_string(row.get(3)),
-            semantic_type,
-            data_type: cell_string(row.get(5)),
-            description: cell_string(row.get(6)),
-            pii_flag: row.get(7).and_then(Value::as_bool).unwrap_or(false),
-            sample_values: row.get(8).cloned().unwrap_or(Value::Array(Vec::new())),
-            embedding: row.get(9).map(embedding_to_vec).unwrap_or_default(),
-            source_epoch: row.get(10).and_then(Value::as_i64).unwrap_or(0),
+            entity_type: crate::cells::cell_opt_string(row.get(Self::ENTRY_COL))
+                .unwrap_or_else(|| "column".to_string()),
+            system: crate::cells::cell_string(row.get(Self::ENTRY_SYSTEM)),
+            table_name: crate::cells::cell_string(row.get(Self::ENTRY_TABLE)),
+            column_name: crate::cells::cell_opt_string(row.get(Self::ENTRY_COLUMN)),
+            semantic_type: crate::cells::parse_semantic_type(row.get(Self::ENTRY_SEMANTIC_TYPE))
+                .ok_or_else(|| {
+                    Error::InvalidInput("catalogue row has an unknown semantic_type".into())
+                })?,
+            data_type: crate::cells::cell_string(row.get(Self::ENTRY_DATA_TYPE)),
+            description: crate::cells::cell_string(row.get(Self::ENTRY_DESCRIPTION)),
+            pii_flag: row
+                .get(Self::ENTRY_PII)
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            sample_values: row
+                .get(Self::ENTRY_SAMPLES)
+                .cloned()
+                .unwrap_or(Value::Array(Vec::new())),
+            embedding: row
+                .get(Self::ENTRY_EMBEDDING)
+                .map(crate::cells::embedding_to_vec)
+                .unwrap_or_default(),
+            source_epoch: row
+                .get(Self::ENTRY_EPOCH)
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
         }))
     }
 
@@ -154,17 +175,20 @@ impl IntentRag {
             .map_err(|_| Error::CatalogueUnavailable)?;
         let mut scored: Vec<(f64, CatalogHit)> = Vec::new();
         for row in &qr.rows {
-            let system = cell_string(row.first());
-            let table_name = cell_string(row.get(1));
-            let column_name = cell_opt_string(row.get(2));
+            let system = crate::cells::cell_string(row.first());
+            let table_name = crate::cells::cell_string(row.get(1));
+            let column_name = crate::cells::cell_opt_string(row.get(2));
             let semantic_type = row
                 .get(3)
                 .and_then(Value::as_str)
                 .and_then(SemanticType::parse)
                 .unwrap_or(SemanticType::Dimension);
-            let description = cell_string(row.get(4));
-            let row_emb = row.get(5).map(embedding_to_vec).unwrap_or_default();
-            let score = cosine(&utterance_emb, &row_emb);
+            let description = crate::cells::cell_string(row.get(4));
+            let row_emb = row
+                .get(5)
+                .map(crate::cells::embedding_to_vec)
+                .unwrap_or_default();
+            let score = crate::cells::cosine(&utterance_emb, &row_emb);
             scored.push((
                 score,
                 CatalogHit {
@@ -188,57 +212,6 @@ impl IntentRag {
         });
         // I3: bound the candidate set.
         Ok(scored.into_iter().take(k).map(|(_, hit)| hit).collect())
-    }
-}
-
-/// Extract a string from a `JSON` cell, defaulting to empty for null/non-string.
-fn cell_string(v: Option<&Value>) -> String {
-    v.and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_default()
-}
-
-/// Extract an optional string (column names may be absent for table-level rows).
-fn cell_opt_string(v: Option<&Value>) -> Option<String> {
-    v.and_then(Value::as_str).map(str::to_string)
-}
-
-/// Convert a `FLOAT[]` `JSON` cell into a `Vec<f32>`.
-fn embedding_to_vec(v: &Value) -> Vec<f32> {
-    v.as_array()
-        .map(|arr| arr.iter().filter_map(num_to_f32).collect())
-        .unwrap_or_default()
-}
-
-/// Map a `JSON` number to `f32`.
-fn num_to_f32(v: &Value) -> Option<f32> {
-    v.as_f64().map(|f| f as f32)
-}
-
-/// Cosine similarity; 0.0 if either vector has zero norm.
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    let dot: f64 = a
-        .iter()
-        .zip(b.iter())
-        .map(|(x, y)| f64::from(*x) * f64::from(*y))
-        .sum();
-    let na: f64 = a
-        .iter()
-        .map(|x| f64::from(*x) * f64::from(*x))
-        .sum::<f64>()
-        .sqrt();
-    let nb: f64 = b
-        .iter()
-        .map(|x| f64::from(*x) * f64::from(*x))
-        .sum::<f64>()
-        .sqrt();
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na * nb)
     }
 }
 
