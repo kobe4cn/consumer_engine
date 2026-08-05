@@ -381,6 +381,19 @@ Append-only.
 - **Fix shape (upstream)**: re-enable `Writer::expire_snapshots` /
   `delete_orphaned_files` after a DuckLake upgrade that binds TSTZ procedure
   parameters; the capability probe flips automatically (issue #17 stays OPEN).
+- **Definitive probe matrix (2025-08, duckdb crate 1.10505.0 / DuckDB v1.5.5)**: 11+
+  invocation forms all fail binder with "No function matches" despite the
+  argument types rendering identically to the declared signature —
+  `TIMESTAMPTZ '<iso>'` literal, `CAST(now() AS TIMESTAMP/TIMESTAMPTZ)`, bare
+  `now()`, `current_timestamp`, `CAST(? AS TIMESTAMPTZ)` prepared, duckdb-rs
+  typed `Value::Timestamp`, `versions` as `CAST([] AS UBIGINT[])` /
+  `list_value()` / `NULL::UBIGINT[]` / `ARRAY[1::UBIGINT]::UBIGINT[]`, and
+  named-argument forms (`older_than :=`, `catalog :=`, `col0 :=`). No
+  retention knob exists (`ducklake_options` exposes only
+  created_by/data_path/encrypted/version). The maintenance pass therefore
+  degrades to merge-only (which DOES bound the file-count axis, asserted), and
+  snapshot expiry + orphan cleanup are unavailable until an upstream DuckDB
+  fixes TSTZ procedure-parameter binding.
 
 ### GC-FRESHNESS-TENANT — freshness registry is tenant-agnostic (by design, #22 scope)
 

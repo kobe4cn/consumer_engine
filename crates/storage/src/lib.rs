@@ -1449,11 +1449,22 @@ mod tests {
             "seeded batches must produce multiple snapshots: {snaps_before}"
         );
 
-        // Expire everything older than now (retention 0) + orphan cleanup must
-        // not fail the sweep regardless of build capability.
+        // The maintenance pass: merge first (the file axis), then expire +
+        // orphan cleanup (which degrade gracefully when the build cannot bind
+        // the timestamp procedures).
+        w.compact("erp", "evt").expect("compact");
+        // Snapshot count AFTER the merge (the merge itself adds a snapshot) —
+        // the expiry/no-op comparison is against this, not the pre-pass count.
+        let snaps_after_merge: i64 = w
+            .conn
+            .query_row(
+                &format!("SELECT count(*) FROM ducklake_snapshots('{WRITE_CATALOG_ALIAS}')"),
+                [],
+                |r| r.get(0),
+            )
+            .expect("snapshots");
         w.expire_snapshots(0).expect("expire");
         w.delete_orphaned_files(0).expect("orphans");
-
         let snaps_after: i64 = w
             .conn
             .query_row(
@@ -1464,14 +1475,15 @@ mod tests {
             .expect("snapshots");
         if w.maintenance_available.get() {
             assert!(
-                snaps_after < snaps_before,
-                "expiry must shrink the snapshot count: before={snaps_before} after={snaps_after}"
+                snaps_after < snaps_after_merge,
+                "expiry must shrink the snapshot count: before={snaps_after_merge} \
+                 after={snaps_after}"
             );
         } else {
             // Build blocker: the procedures cannot bind; the sweep degrades
             // gracefully (documented in specs/93 GC-MAINT-BINDER).
             assert_eq!(
-                snaps_after, snaps_before,
+                snaps_after, snaps_after_merge,
                 "degraded maintenance must be a no-op on builds without TSTZ binding"
             );
         }
@@ -1481,6 +1493,24 @@ mod tests {
             .query_row("SELECT count(*) FROM dl.raw_erp_evt", [], |r| r.get(0))
             .expect("rows");
         assert_eq!(rows, 200, "all 20*10 rows must survive maintenance");
+        // The OTHER growth axis — Parquet file count — IS bounded by the
+        // maintenance pass even on builds where snapshot expiry cannot bind:
+        // the merge collapses the 20 seeded files to ≤ 5.
+        let files_after: i64 = w
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM ducklake_list_files('{WRITE_CATALOG_ALIAS}', \
+                     'raw_erp_evt')"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .expect("files");
+        assert!(
+            files_after <= 5,
+            "maintenance must bound the file count even without expiry: {files_after}"
+        );
     }
 
     #[test]
