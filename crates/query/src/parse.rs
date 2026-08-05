@@ -41,6 +41,16 @@ pub fn validate(q: &SegmentQuery) -> Result<()> {
     validate_ident_field(&q.source.system, "source.system")?;
     validate_ident_field(&q.source.entity, "source.entity")?;
     validate_ident_field(&q.key, "key")?;
+    // The optional point-in-time cut-off must be a parseable timestamp (the
+    // engine bounds feature reads by it; a junk value would be a silent no-op
+    // or an injection-adjacent string — reject at the boundary, issue #21).
+    if let Some(as_of) = &q.as_of
+        && chrono::DateTime::parse_from_rfc3339(as_of).is_err()
+    {
+        return Err(crate::error::QueryError::InvalidDsl(format!(
+            "asOf must be an ISO-8601 timestamp, got {as_of:?}"
+        )));
+    }
     if q.ops.len() > MAX_OPS {
         return Err(invalid(format!("ops exceed cap of {MAX_OPS}")));
     }
@@ -250,6 +260,7 @@ mod tests {
                 entity: "orders".into(),
             },
             key: "user_id".into(),
+            as_of: None,
             ops,
         }
     }

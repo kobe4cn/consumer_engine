@@ -13,6 +13,7 @@ homepage.workspace = true
 
 [dependencies]
 consumer_engine-core.workspace = true
+chrono.workspace = true
 duckdb.workspace = true
 flume.workspace = true
 serde.workspace = true

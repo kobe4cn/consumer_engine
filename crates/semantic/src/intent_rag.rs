@@ -34,6 +34,66 @@ impl std::fmt::Debug for IntentRag {
 }
 
 impl IntentRag {
+    /// Fetch the NEWEST catalogue entry for one column (issue #23: description
+    /// editing preserves the original row's semantics and re-stamps only the
+    /// description + embedding + version).
+    ///
+    /// # Errors
+    /// `consumer_engine_core::Error::Execution` on a reader failure.
+    pub async fn catalogue_entry(
+        &self,
+        system: &str,
+        entity: &str,
+        column: &str,
+        tenant: &str,
+    ) -> Result<Option<consumer_engine_core::CatalogRow>> {
+        let sql = format!(
+            "SELECT entity_type, system, table_name, column_name, semantic_type, data_type, \
+             description, pii_flag, sample_values, embedding, source_epoch FROM \
+             {READ_ONLY_CATALOG_ALIAS}.semantic_catalog WHERE system = ? AND table_name = ? AND \
+             column_name = ? AND tenant_id = ? ORDER BY source_epoch DESC LIMIT 1"
+        );
+        let qr = self
+            .reader
+            .query_with_params(
+                &sql,
+                vec![
+                    duckdb::types::Value::Text(system.to_string()),
+                    duckdb::types::Value::Text(entity.to_string()),
+                    duckdb::types::Value::Text(column.to_string()),
+                    duckdb::types::Value::Text(tenant.to_string()),
+                ],
+            )
+            .await?;
+        let row = match qr.rows.first() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        // The stored semantic_type is engine-written (validated); an unparseable
+        // value is catalogue corruption — surface it rather than silently
+        // rewriting the row's type on an edit (issue #23).
+        let semantic_type = row
+            .get(4)
+            .and_then(Value::as_str)
+            .and_then(SemanticType::parse)
+            .ok_or_else(|| {
+                Error::InvalidInput("catalogue row has an unknown semantic_type".into())
+            })?;
+        Ok(Some(consumer_engine_core::CatalogRow {
+            entity_type: cell_opt_string(row.first()).unwrap_or_else(|| "column".to_string()),
+            system: cell_string(row.get(1)),
+            table_name: cell_string(row.get(2)),
+            column_name: cell_opt_string(row.get(3)),
+            semantic_type,
+            data_type: cell_string(row.get(5)),
+            description: cell_string(row.get(6)),
+            pii_flag: row.get(7).and_then(Value::as_bool).unwrap_or(false),
+            sample_values: row.get(8).cloned().unwrap_or(Value::Array(Vec::new())),
+            embedding: row.get(9).map(embedding_to_vec).unwrap_or_default(),
+            source_epoch: row.get(10).and_then(Value::as_i64).unwrap_or(0),
+        }))
+    }
+
     /// Build a retriever over `reader` with the M3 stub embedding model.
     #[must_use]
     pub fn new(reader: Reader, embed: Arc<dyn EmbeddingModel>) -> Self {
@@ -305,5 +365,59 @@ mod tests {
             .await
             .expect("retrieve");
         assert!(hits.is_empty(), "empty catalogue must yield no candidates");
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use consumer_engine_core::{CatalogRow, SemanticType};
+    use consumer_engine_storage::{Writer, open_reader, read_only_attach_sql};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_should_retrieve_newest_catalogue_version() {
+        // Issue #23: an edited description (newer source_epoch) supersedes the
+        // original in retrieval — QUALIFY must pick the newest row per column.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer =
+            Writer::attach(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("attach");
+        let mk = |epoch: i64, desc: &str| CatalogRow {
+            entity_type: "column".into(),
+            system: "erp".into(),
+            table_name: "orders".into(),
+            column_name: Some("user_id".into()),
+            semantic_type: SemanticType::Identifier,
+            data_type: "VARCHAR".into(),
+            description: desc.into(),
+            pii_flag: false,
+            sample_values: serde_json::json!([]),
+            embedding: vec![0.0; 4],
+            source_epoch: epoch,
+        };
+        writer
+            .write_catalog_rows(&[mk(1, "original description")])
+            .expect("v1");
+        writer
+            .write_catalog_rows(&[mk(2, "edited marker zebra")])
+            .expect("v2");
+        let conn = open_reader(&tmp.path().join("cat.db"), &tmp.path().join("data")).expect("read");
+        let attach = read_only_attach_sql(&tmp.path().join("cat.db"), &tmp.path().join("data"));
+        let reader = Reader::start(
+            conn,
+            attach,
+            consumer_engine_execution::ReaderLimits::default(),
+        )
+        .expect("reader");
+        let rag = IntentRag::new(reader, Arc::new(crate::llm::StubEmbed::default()));
+        let hits = rag.retrieve("zebra", 5, "default").await.expect("retrieve");
+        let user = hits
+            .iter()
+            .find(|h| h.column_name.as_deref() == Some("user_id"))
+            .expect("user_id hit");
+        assert_eq!(
+            user.description, "edited marker zebra",
+            "retrieval must pick the NEWEST catalogue version: {hits:?}"
+        );
     }
 }

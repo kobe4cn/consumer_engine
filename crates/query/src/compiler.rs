@@ -200,6 +200,7 @@ fn compile_at(q: &SegmentQuery, depth: u8, opts: &CompileOptions<'_>) -> Result<
                     &mut params,
                     alias,
                     opts.tenant,
+                    q.as_of.as_deref(),
                 )?);
             }
             Op::SetOp { op, other } => {
@@ -637,6 +638,7 @@ fn strip_last_op(q: &SegmentQuery) -> SegmentQuery {
     SegmentQuery {
         source: q.source.clone(),
         key: q.key.clone(),
+        as_of: q.as_of.clone(),
         ops: q
             .ops
             .iter()
@@ -689,6 +691,7 @@ fn compile_exclude(
     Ok(clauses.join(" AND "))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_feature(
     name: &str,
     op: Cmp,
@@ -697,17 +700,36 @@ fn compile_feature(
     params: &mut Vec<Value>,
     alias: &str,
     tenant: &str,
+    as_of: Option<&str>,
 ) -> Result<String> {
     let (family, short) =
         split_feature_name(name).map_err(|e| QueryError::InvalidDsl(e.to_string()))?;
     let cmp = cmp_symbol(op)?;
-    // Placeholder order: `f.tenant_id = ?` precedes `f.{short} {cmp} ?`.
     let tenant = tenant_eq("f", params, tenant);
-    params.push(Value::Double(value));
-    Ok(format!(
-        "EXISTS (SELECT 1 FROM {alias}.feature_wide_{family} f WHERE f.user_id = base.{base_key} \
-         AND {tenant} AND f.{short} {cmp} ?)"
-    ))
+    match as_of {
+        // Point-in-time (issue #21 / spec 10 I4): read the EAV bounded by
+        // `as_of_ts <= ?` and take the value at the newest as_of within the
+        // window — the wide view is latest-wins and would leak post-as_of data.
+        Some(as_of) => {
+            params.push(Value::Text(name.to_string()));
+            params.push(Value::Text(as_of.to_string()));
+            params.push(Value::Double(value));
+            Ok(format!(
+                "EXISTS (SELECT 1 FROM {alias}.feature_store f WHERE f.user_id = base.{base_key} \
+                 AND {tenant} AND f.feature_name = ? AND f.as_of_ts <= CAST(? AS TIMESTAMPTZ) \
+                 GROUP BY f.user_id, f.feature_name HAVING arg_max(f.num_value, f.as_of_ts) {cmp} \
+                 ?)"
+            ))
+        }
+        // Latest-wins wide view (the fast path).
+        None => {
+            params.push(Value::Double(value));
+            Ok(format!(
+                "EXISTS (SELECT 1 FROM {alias}.feature_wide_{family} f WHERE f.user_id = \
+                 base.{base_key} AND {tenant} AND f.{short} {cmp} ?)"
+            ))
+        }
+    }
 }
 
 /// Map a numeric comparison operator to its SQL symbol.
@@ -776,6 +798,7 @@ mod tests {
                 entity: "orders".into(),
             },
             key: "user_id".into(),
+            as_of: None,
             ops,
         }
     }
@@ -848,7 +871,15 @@ mod tests {
         let q = orders(vec![
             Op::SetOp {
                 op: SetOpKind::Intersect,
-                other: Box::new(orders(vec![])),
+                other: Box::new(SegmentQuery {
+                    source: Dataset {
+                        system: "erp".into(),
+                        entity: "orders".into(),
+                    },
+                    key: "user_id".into(),
+                    as_of: None,
+                    ops: vec![],
+                }),
             },
             Op::Filter {
                 predicate: Predicate {
@@ -1117,6 +1148,7 @@ mod tests {
                     entity: "orders".into(),
                 },
                 key: "user_id".into(),
+                as_of: None,
                 ops: vec![Op::SetOp {
                     op: SetOpKind::Intersect,
                     other: Box::new(inner),

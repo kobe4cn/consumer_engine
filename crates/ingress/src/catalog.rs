@@ -6,8 +6,9 @@
 use axum::{
     Json,
     extract::{Extension, Query, State},
+    http::StatusCode,
 };
-use consumer_engine_core::{CatalogHit, Error};
+use consumer_engine_core::{CatalogHit, Error, validate_ident};
 use serde::Deserialize;
 
 use crate::{ApiError, AppState, Tenant};
@@ -48,4 +49,71 @@ pub async fn get_catalog(
     let k = q.k.unwrap_or(DEFAULT_K).clamp(1, MAX_K);
     let hits = st.intent_rag.retrieve(&utterance, k, &tenant).await?;
     Ok(Json(hits))
+}
+
+/// `PUT /catalog` request body — edit a column's description (spec 13 §4
+/// editability, issue #23). Write-protected: only this endpoint (or
+/// re-onboarding) can change a description; the agent's DSL path cannot.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EditCatalogRequest {
+    /// Source system identifier.
+    system: String,
+    /// Source table (entity) identifier.
+    table_name: String,
+    /// The column whose description is edited.
+    column_name: String,
+    /// The new human-editable description (byte-capped at the boundary).
+    description: String,
+}
+
+/// Maximum description bytes (AGENTS.md § Input Validation).
+const MAX_DESCRIPTION_BYTES: usize = 2048;
+
+/// `PUT /catalog` — replace a column's description, re-embed it, and append a
+/// VERSIONED row (newer `source_epoch`) so retrieval picks the edit (the
+/// original row is preserved — append-only versioning, spec 13 §4). The row's
+/// semantics (type, PII flag, samples) are carried over untouched.
+pub async fn put_catalog(
+    State(st): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
+    Json(req): Json<EditCatalogRequest>,
+) -> Result<StatusCode, ApiError> {
+    validate_ident(&req.system)?;
+    validate_ident(&req.table_name)?;
+    validate_ident(&req.column_name)?;
+    if req.description.is_empty() || req.description.len() > MAX_DESCRIPTION_BYTES {
+        return Err(Error::InvalidInput(format!(
+            "description must be 1..={MAX_DESCRIPTION_BYTES} bytes"
+        ))
+        .into());
+    }
+    let mut row = st
+        .intent_rag
+        .catalogue_entry(&req.system, &req.table_name, &req.column_name, &tenant)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    // Re-embed the description (I4: descriptions only — never PII values).
+    let embedding = st
+        .embed
+        .embed(&req.description)
+        .await
+        .map_err(|e| ApiError::Core(Error::Execution(Box::from(format!("embed: {e}")))))?;
+    row.description = req.description;
+    row.embedding = embedding;
+    // Versioned delta: STRICTLY newer than the original row's stamp, so
+    // retrieval's QUALIFY (ORDER BY source_epoch DESC) deterministically picks
+    // the edit even when the onboard and the edit land in the same wall-clock
+    // second.
+    row.source_epoch = now_epoch().max(row.source_epoch + 1);
+    st.ingestion.write_catalog(vec![row], &tenant).await?;
+    Ok(StatusCode::OK)
+}
+
+/// Current epoch seconds.
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

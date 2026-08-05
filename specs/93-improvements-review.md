@@ -392,3 +392,17 @@ Append-only.
   data leak; the compiler's tenant filter is the isolation boundary).
 - **Fix shape (later)**: key the registry by `(tenant, system, entity)` and
   thread the tenant into the freshness label + staleness check.
+
+### GC-I3-RAW — raw-row side of I3 unbounded (by design, issue #21 scope)
+
+- **Citation**: `crates/query/src/engine.rs` (`materialize`: `as_of_ts` = min
+  source freshness bounds the FROZEN FEATURES via the PIT pivot); raw `raw_*`
+  tables carry no ingest-time column.
+- **Finding**: spec 10 I3 says the snapshot's `as_of_ts` bounds "every
+  feature/raw row it contains". Feature rows have `as_of_ts` and are bounded;
+  raw rows do not (no ingest column), so a row ingested after the cut-off but
+  before materialisation could be read. The I3 leak test asserts the feature
+  side only.
+- **Fix shape (later)**: add a hidden `_ingested_at` column to `raw_*` (stamped
+  at ingest) and bound the materialise read by `_ingested_at <= as_of`; then
+  extend the leak test to the raw side.

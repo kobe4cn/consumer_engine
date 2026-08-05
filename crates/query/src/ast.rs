@@ -21,6 +21,11 @@ pub struct SegmentQuery {
     pub key: String,
     /// Composed operations.
     pub ops: Vec<Op>,
+    /// Optional point-in-time cut-off (ISO-8601): when set, `Feature` reads
+    /// are bounded to values with `as_of_ts <= as_of` (issue #21 / spec 10 I4)
+    /// instead of the latest-wins wide view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
 }
 
 /// A single DSL operation. Tagged by `kind` on the wire.
@@ -365,6 +370,7 @@ mod tests {
                 entity: "orders".into(),
             },
             key: "user_id".into(),
+            as_of: None,
             ops,
         }
     }
@@ -423,6 +429,7 @@ mod tests {
                     entity: "events".into(),
                 },
                 key: "user_id".into(),
+                as_of: None,
                 ops: vec![Op::Feature {
                     name: "cadence.regularity".into(),
                     op: Cmp::Gt,

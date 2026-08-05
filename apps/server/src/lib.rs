@@ -204,6 +204,7 @@ impl Engine {
             freshness: Arc::clone(&freshness),
             profiler,
             intent_rag,
+            embed,
             jobs: Arc::clone(&jobs),
             materialise_slots,
             signing_key: Arc::new(signing_key),

@@ -519,6 +519,7 @@ dependencies = [
 name = "consumer_engine-execution"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "consumer_engine-core",
  "consumer_engine-storage",
  "duckdb",

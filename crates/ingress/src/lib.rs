@@ -25,7 +25,7 @@ use consumer_engine_core::{Error, Freshness, FreshnessRegistry, SourceType, vali
 use consumer_engine_execution::RowCells;
 use consumer_engine_ingestion::IngestionHandle;
 use consumer_engine_query::{QueryEngine, QueryError};
-use consumer_engine_semantic::{IntentRag, Profiler};
+use consumer_engine_semantic::{EmbeddingModel, IntentRag, Profiler};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -53,8 +53,9 @@ const BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// Wall-clock budget for the onboarding profile step (spec 21 I5: bounded).
 const PROFILE_TIMEOUT_SECS: u64 = 5;
 
-/// Shared state injected into handlers.
-#[derive(Clone, Debug)]
+/// Shared state injected into handlers. `Debug` is manual (the embedding
+/// model behind `dyn` is not `Debug`; the redacted form is what matters).
+#[derive(Clone)]
 pub struct AppState {
     /// The single ingestion writer handle.
     pub ingestion: IngestionHandle,
@@ -66,6 +67,9 @@ pub struct AppState {
     pub profiler: Arc<Profiler>,
     /// The L1 Intent RAG retriever (spec 13).
     pub intent_rag: Arc<IntentRag>,
+    /// The embedding model, for re-embedding edited catalogue descriptions
+    /// (spec 13 §4 editability, issue #23).
+    pub embed: Arc<dyn EmbeddingModel>,
     /// Async-job registry for `POST /jobs` / `GET /jobs/:id`.
     pub jobs: Arc<JobRegistry>,
     /// Concurrency cap for materialisation jobs (bound in-flight work).
@@ -84,6 +88,15 @@ pub struct AppState {
     /// SHA-256 hash of the raw-SQL escape-hatch approval token (`None` =
     /// hatch disabled).
     pub sql_approval_hash: Option<Arc<[u8; 32]>>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("jobs", &self.jobs)
+            .field("default_tenant", &self.default_tenant)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AppState {
@@ -189,7 +202,10 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/sources/onboard", post(onboard))
         .route("/query", post(query))
-        .route("/catalog", get(catalog::get_catalog))
+        .route(
+            "/catalog",
+            get(catalog::get_catalog).put(catalog::put_catalog),
+        )
         .route("/producers/run", post(producers::run_producer))
         .route("/suppression", post(suppression::post_suppression))
         .route("/jobs", post(jobs::post_jobs))

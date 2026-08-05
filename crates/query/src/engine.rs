@@ -457,12 +457,12 @@ impl QueryEngine {
     /// segment fails fast with a clear error (`specs/20 I4`).
     ///
     /// The snapshot is written as one atomic `INSERT … SELECT` where each row
-    /// carries its **frozen feature values** (left-joined from every
-    /// `feature_wide_*` family and projected as JSON — decision D11, issue
-    /// #13) and its **predicate chain** (`hit_reason` = the validated op list
+    /// carries its **frozen feature values** (a point-in-time pivot per family
+    /// bounded by the snapshot's `as_of_ts` — decision D11 + I3, issues #13/
+    /// #21) and its **predicate chain** (`hit_reason` = the validated op list
     /// that composed the segment; in an AND-composed segment every op matched,
-    /// so the chain is the selecting predicates). `as_of_ts` is materialisation
-    /// time in M2 (true I3 point-in-time bounding lands in #21).
+    /// so the chain is the selecting predicates). `as_of_ts` is the minimum
+    /// source freshness (the data cut-off), not the materialisation wall-clock.
     ///
     /// # Errors
     /// - [`QueryError::InvalidDsl`] if the segment fails to compile or the DSL cannot be serialised
@@ -501,7 +501,21 @@ impl QueryEngine {
 
         // Scalars.
         let snapshot_id = uuid::Uuid::now_v7().to_string();
-        let as_of_ts = chrono::Utc::now().to_rfc3339();
+        // I3 point-in-time bounding (issue #21): the snapshot's `as_of_ts` is
+        // the MINIMUM source freshness over the segment's sources — the data
+        // cut-off the snapshot reflects — not the materialisation wall-clock.
+        // Sources without a registered epoch fall back to now (no signal).
+        let now = now_epoch();
+        let min_epoch = compiled
+            .sources
+            .iter()
+            .filter_map(|d| self.freshness.get(&d.system, &d.entity))
+            .map(|m| m.last_epoch_secs)
+            .min();
+        let as_of_epoch = min_epoch.unwrap_or(now);
+        let as_of_ts = chrono::DateTime::from_timestamp(as_of_epoch, 0)
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         // hit_reason: the per-predicate selection chain (D11, issue #13). The
         // validated op list is serialised to JSON text and **bound as a
         // parameter** — never interpolated into SQL (values inside ops come
@@ -527,13 +541,14 @@ impl QueryEngine {
 
         // Wrap the compiled segment so the subquery emits `<key>, features,
         // hit_reason` per row (the writer selects exactly those columns).
-        // Frozen features: LEFT JOIN every feature family's wide view on the
-        // key and project `json_object('family.short', fs_i.short, …)` —
+        // Frozen features: LEFT JOIN a POINT-IN-TIME pivot per family (issue
+        // #21): the EAV rows are bounded by `as_of_ts <= <as_of>` and the
+        // value at the newest as_of within that window is frozen — the
+        // latest-wins wide view would leak post-cut-off feature values (I3).
         // `json_object` omits NULLs, so a user's features JSON holds exactly
-        // the values they had at selection time (an empty object when the
-        // store has nothing for them).
+        // the values they had at selection time.
         let key = &q.key;
-        let mut wrap_params = Vec::with_capacity(write.params.len() + 1);
+        let mut wrap_params = Vec::with_capacity(write.params.len() + 1 + families.len() * 2);
         // The wrap SELECT's `CAST(? AS JSON) AS hit_reason` placeholder precedes
         // every `?` inside the compiled subquery, so it binds first.
         wrap_params.push(Value::Text(hit_reason));
@@ -542,10 +557,23 @@ impl QueryEngine {
         let mut json_pairs: Vec<String> = Vec::new();
         for (idx, (family, shorts)) in families.iter().enumerate() {
             let fa = format!("fs_{idx}");
+            let mut pivot_cols = vec!["user_id".to_string(), "tenant_id".to_string()];
+            for short in shorts {
+                pivot_cols.push(format!(
+                    "arg_max(num_value, as_of_ts) FILTER (WHERE feature_name = \
+                     '{family}.{short}') AS {short}"
+                ));
+            }
+            let pivot_select = pivot_cols.join(", ");
             joins.push_str(&format!(
-                " LEFT JOIN {WRITE_CATALOG_ALIAS}.feature_wide_{family} {fa} ON {fa}.user_id = \
-                 s.{key} AND {fa}.tenant_id = ?"
+                " LEFT JOIN (SELECT {pivot_select} FROM {WRITE_CATALOG_ALIAS}.feature_store WHERE \
+                 starts_with(feature_name, '{family}.') AND as_of_ts <= CAST(? AS TIMESTAMPTZ) \
+                 GROUP BY user_id, tenant_id) {fa} ON {fa}.user_id = s.{key} AND {fa}.tenant_id = \
+                 ?"
             ));
+            // SQL placeholder order: the pivot's as_of `?` then the join's
+            // tenant `?`, both AFTER the compiled subquery's placeholders.
+            wrap_params.push(Value::Text(as_of_ts.clone()));
             wrap_params.push(Value::Text(tenant.to_string()));
             for short in shorts {
                 json_pairs.push(format!("'{family}.{short}', {fa}.{short}"));
@@ -772,6 +800,7 @@ fn strip_derive(q: &SegmentQuery) -> SegmentQuery {
     SegmentQuery {
         source: q.source.clone(),
         key: q.key.clone(),
+        as_of: q.as_of.clone(),
         ops: q
             .ops
             .iter()
@@ -1572,6 +1601,232 @@ mod tests {
             (share_sum - 1.0).abs() < 0.01,
             "segment category shares must sum to 1: {seg_mix:?}"
         );
+        ingestion.shutdown();
+    }
+    #[tokio::test]
+    async fn test_should_bound_snapshot_as_of_and_frozen_features() {
+        // I3 (issue #21): the snapshot's `as_of_ts` = the MINIMUM source
+        // freshness (not the materialisation wall-clock), and the frozen
+        // features exclude values written AFTER the cut-off.
+        use consumer_engine_core::{FeatureRow, SourceType};
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = consumer_engine_storage::Writer::attach(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("attach");
+        writer
+            .ingest_raw(
+                "erp",
+                "orders",
+                &["user_id".into(), "sku".into()],
+                &[vec![Some("u1".into()), Some("A".into())]],
+            )
+            .expect("ingest");
+        // Two feature values: an early one (0.9) and a late one (0.1) written
+        // AFTER the source's freshness cut-off.
+        writer
+            .write_feature_rows(&[
+                FeatureRow {
+                    user_id: "u1".into(),
+                    feature_name: "cadence.regularity".into(),
+                    num_value: 0.9,
+                    as_of_ts: "2025-01-01T00:00:00Z".into(),
+                    producer_id: "cadence_sql".into(),
+                },
+                FeatureRow {
+                    user_id: "u1".into(),
+                    feature_name: "cadence.regularity".into(),
+                    num_value: 0.1,
+                    as_of_ts: "2025-06-01T00:00:00Z".into(),
+                    producer_id: "cadence_sql".into(),
+                },
+            ])
+            .expect("features");
+        writer
+            .refresh_feature_wide_view("cadence", &["regularity".into()])
+            .expect("view");
+        // Source cut-off = 2025-03-01 (between the two feature as_of times).
+        let cut_off = chrono::DateTime::parse_from_rfc3339("2025-03-01T00:00:00Z")
+            .expect("parse")
+            .timestamp();
+        let freshness = Arc::new(FreshnessRegistry::new());
+        freshness
+            .set("erp", "orders", SourceType::Batch, cut_off)
+            .expect("set");
+        let ingestion = consumer_engine_ingestion::IngestionHandle::start(
+            writer,
+            Arc::new(consumer_engine_ingestion::ProducerRegistry::new()),
+        )
+        .expect("start");
+        let read_conn = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let attach_sql = consumer_engine_storage::read_only_attach_sql(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        );
+        let reader = Reader::start(read_conn, attach_sql, ReaderLimits::default()).expect("reader");
+        let engine = QueryEngine::new(
+            reader,
+            ingestion.clone(),
+            GuardrailConfig {
+                enforce_catalogue: false,
+                ..GuardrailConfig::default()
+            },
+            freshness,
+            SuppressionRules::default(),
+        );
+        let q = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"},
+            "key": "user_id",
+            "ops": [{"kind":"filter","predicate":{"column":"sku","op":"eq","value":"A"}}]
+        }))
+        .expect("parse");
+        let snap = engine
+            .materialize(&q, "c1", "default")
+            .await
+            .expect("materialize");
+        let bare = snap.strip_prefix("snap_").expect("prefix");
+        let meta = engine
+            .snapshot_meta(bare, "default")
+            .await
+            .expect("meta")
+            .expect("snapshot exists");
+        assert!(
+            meta.as_of_ts.starts_with("2025-03-01"),
+            "snapshot as_of_ts must be the min source freshness, got {}",
+            meta.as_of_ts
+        );
+        // The frozen feature must be the pre-cut-off value (0.9), NOT the
+        // post-cut-off value (0.1) — I3: no post-as_of data in the snapshot.
+        let r = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach 2");
+        let features: String = r
+            .query_row(
+                "SELECT features FROM dro.audience_snapshot LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("features cell");
+        assert!(
+            features.contains("0.9"),
+            "frozen features must carry the pre-cut-off value: {features}"
+        );
+        assert!(
+            !features.contains("0.1"),
+            "frozen features must EXCLUDE the post-cut-off value (I3 leak): {features}"
+        );
+        ingestion.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_should_feature_predicate_respect_as_of() {
+        // Point-in-time (issue #21 / spec 10 I4): with an `asOf`, the Feature
+        // predicate reads the EAV bounded by `as_of_ts <= asOf` and uses the
+        // value at the newest as_of within that window — not the latest-wins
+        // wide view.
+        use consumer_engine_core::FeatureRow;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let writer = consumer_engine_storage::Writer::attach(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("attach");
+        writer
+            .ingest_raw(
+                "erp",
+                "orders",
+                &["user_id".into()],
+                &[vec![Some("u1".into())]],
+            )
+            .expect("ingest");
+        writer
+            .write_feature_rows(&[
+                FeatureRow {
+                    user_id: "u1".into(),
+                    feature_name: "cadence.regularity".into(),
+                    num_value: 0.9,
+                    as_of_ts: "2025-01-01T00:00:00Z".into(),
+                    producer_id: "cadence_sql".into(),
+                },
+                FeatureRow {
+                    user_id: "u1".into(),
+                    feature_name: "cadence.regularity".into(),
+                    num_value: 0.1,
+                    as_of_ts: "2025-06-01T00:00:00Z".into(),
+                    producer_id: "cadence_sql".into(),
+                },
+            ])
+            .expect("features");
+        writer
+            .refresh_feature_wide_view("cadence", &["regularity".into()])
+            .expect("view");
+        let ingestion = consumer_engine_ingestion::IngestionHandle::start(
+            writer,
+            Arc::new(consumer_engine_ingestion::ProducerRegistry::new()),
+        )
+        .expect("start");
+        let read_conn = consumer_engine_storage::open_reader(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        )
+        .expect("read attach");
+        let attach_sql = consumer_engine_storage::read_only_attach_sql(
+            &tmp.path().join("cat.db"),
+            &tmp.path().join("data"),
+        );
+        let reader = Reader::start(read_conn, attach_sql, ReaderLimits::default()).expect("reader");
+        let engine = QueryEngine::new(
+            reader,
+            ingestion.clone(),
+            GuardrailConfig {
+                enforce_catalogue: false,
+                ..GuardrailConfig::default()
+            },
+            Arc::new(FreshnessRegistry::new()),
+            SuppressionRules::default(),
+        );
+        // asOf = the early window → 0.9 > 0.5 → u1 matches.
+        let early = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"}, "key": "user_id",
+            "asOf": "2025-03-01T00:00:00Z",
+            "ops": [{"kind":"feature","name":"cadence.regularity","op":"gt","value":0.5}]
+        }))
+        .expect("parse");
+        let res = engine
+            .run_sync(&early, "default")
+            .await
+            .expect("early query");
+        assert!(
+            !res.rows.is_empty(),
+            "asOf at the early window must match (0.9 > 0.5)"
+        );
+        // asOf = the late window → 0.1 <= 0.5 → u1 does NOT match (PIT wins
+        // over the latest-wins wide view).
+        let late = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"}, "key": "user_id",
+            "asOf": "2025-06-01T00:00:00Z",
+            "ops": [{"kind":"feature","name":"cadence.regularity","op":"gt","value":0.5}]
+        }))
+        .expect("parse");
+        let res = engine.run_sync(&late, "default").await.expect("late query");
+        assert!(
+            res.rows.is_empty(),
+            "asOf at the late window must NOT match (0.1 <= 0.5)"
+        );
+        // A junk asOf is rejected at the boundary.
+        let bad = crate::parse::parse(serde_json::json!({
+            "source": {"system":"erp","entity":"orders"}, "key": "user_id",
+            "asOf": "not-a-timestamp",
+            "ops": [{"kind":"feature","name":"cadence.regularity","op":"gt","value":0.5}]
+        }));
+        assert!(bad.is_err(), "junk asOf must be rejected");
         ingestion.shutdown();
     }
 }

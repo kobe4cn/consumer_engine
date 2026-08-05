@@ -375,10 +375,41 @@ pub fn value_to_json(v: Value) -> serde_json::Value {
         // Huge ints lose precision beyond f64; map to string to stay exact.
         Value::HugeInt(i) => json!(i.to_string()),
         Value::UHugeInt(i) => json!(i.to_string()),
-        // Best-effort for remaining scalar/structural kinds (temporal, decimal,
-        // struct, map, union, blob, geometry): null for T1.
+        // Timestamps → ISO-8601 UTC strings (P2-2, issue #21): the wire
+        // contract is ISO-8601, so a TIMESTAMPTZ cell must never degrade to
+        // null — except an unrepresentable (out-of-range) value, where null is
+        // more honest than fabricating a timestamp.
+        Value::Timestamp(unit, ts) => match timestamp_to_iso(unit, ts) {
+            Some(iso) => json!(iso),
+            None => serde_json::Value::Null,
+        },
+        // Best-effort for remaining scalar/structural kinds (decimal, struct,
+        // map, union, blob, geometry): null.
         _ => serde_json::Value::Null,
     }
+}
+
+/// Convert a DuckDB timestamp (epoch in `unit`'s resolution) to an ISO-8601
+/// UTC string.
+fn timestamp_to_iso(unit: duckdb::types::TimeUnit, ts: i64) -> Option<String> {
+    use duckdb::types::TimeUnit;
+    let (secs, nanos) = match unit {
+        TimeUnit::Second => (ts, 0),
+        TimeUnit::Millisecond => (
+            ts.div_euclid(1000),
+            (ts.rem_euclid(1000) * 1_000_000) as u32,
+        ),
+        TimeUnit::Microsecond => (
+            ts.div_euclid(1_000_000),
+            (ts.rem_euclid(1_000_000) * 1000) as u32,
+        ),
+        TimeUnit::Nanosecond => (
+            ts.div_euclid(1_000_000_000),
+            (ts.rem_euclid(1_000_000_000)) as u32,
+        ),
+    };
+    chrono::DateTime::from_timestamp(secs, nanos)
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
 }
 
 #[cfg(test)]
@@ -520,5 +551,35 @@ mod tests {
         assert_eq!(count_orders(&reader).await, 3);
         reader.shutdown();
         let _ = tmp;
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn test_should_render_timestamptz_as_iso8601() {
+        // P2-2 / issue #21: a TIMESTAMPTZ cell must serialize as ISO-8601 UTC,
+        // never degrade to null.
+        let epoch_micros = 1_736_899_200_000_000_i64; // 2025-01-15T00:00:00Z
+        let v = Value::Timestamp(duckdb::types::TimeUnit::Microsecond, epoch_micros);
+        let json = value_to_json(v);
+        assert_eq!(
+            json.as_str().expect("string"),
+            "2025-01-15T00:00:00Z",
+            "microsecond epoch must render ISO-8601"
+        );
+        let v = Value::Timestamp(duckdb::types::TimeUnit::Second, 1_736_899_200);
+        assert_eq!(
+            value_to_json(v).as_str().expect("string"),
+            "2025-01-15T00:00:00Z"
+        );
+        // Sub-second precision is preserved.
+        let v = Value::Timestamp(duckdb::types::TimeUnit::Millisecond, 1_736_899_200_123);
+        assert_eq!(
+            value_to_json(v).as_str().expect("string"),
+            "2025-01-15T00:00:00.123Z"
+        );
     }
 }

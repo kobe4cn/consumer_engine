@@ -2247,3 +2247,92 @@ async fn test_should_survive_engine_restart() {
     drop(engine2);
     server2.abort();
 }
+
+#[tokio::test]
+async fn test_should_edit_catalogue_description_and_supersede() {
+    // Issue #23 (spec 13 §4): a human can edit a column description via
+    // PUT /catalog; the edit is re-embedded and appended as a VERSIONED row so
+    // retrieval picks the NEW description (the original is preserved).
+    let base = spawn().await;
+    let client = reqwest::Client::new();
+    onboard(
+        &client,
+        &base,
+        "erp",
+        "orders",
+        &["user_id", "sku"],
+        vec![vec!["u1", "A"]],
+    )
+    .await;
+
+    // Baseline: retrieval returns the profiler's stub description.
+    let resp = client
+        .get(format!("{base}/catalog?q=user&k=20"))
+        .send()
+        .await
+        .expect("catalog");
+    let hits: Value = resp.json().await.expect("json");
+    let original = hits
+        .as_array()
+        .expect("hits")
+        .iter()
+        .find(|h| h["columnName"] == "user_id")
+        .map(|h| h["description"].as_str().expect("desc").to_string())
+        .expect("user_id column profiled");
+    assert!(
+        original.contains("user_id"),
+        "baseline description names the column: {original}"
+    );
+
+    // Edit the description to a distinctive marker.
+    let resp = client
+        .put(format!("{base}/catalog"))
+        .json(&serde_json::json!({
+            "system": "erp", "tableName": "orders", "columnName": "user_id",
+            "description": "pseudonymous customer id edited marker zebra"
+        }))
+        .send()
+        .await
+        .expect("put catalog");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "edit must succeed: {}",
+        resp.status()
+    );
+
+    // Retrieval now surfaces the EDITED description (the versioned row
+    // supersedes the original by source_epoch).
+    let resp = client
+        .get(format!("{base}/catalog?q=marker%20zebra&k=20"))
+        .send()
+        .await
+        .expect("catalog after edit");
+    let hits: Value = resp.json().await.expect("json");
+    let edited = hits
+        .as_array()
+        .expect("hits")
+        .iter()
+        .find(|h| h["columnName"] == "user_id")
+        .map(|h| h["description"].as_str().expect("desc").to_string());
+    assert!(
+        edited.is_some_and(|d| d.contains("edited marker zebra")),
+        "retrieval must surface the edited description: {hits}"
+    );
+
+    // Editing a never-catalogued column is a 404.
+    let resp = client
+        .put(format!("{base}/catalog"))
+        .json(&serde_json::json!({
+            "system": "erp", "tableName": "orders", "columnName": "ghost",
+            "description": "nope"
+        }))
+        .send()
+        .await
+        .expect("put ghost");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "unknown column must 404"
+    );
+}
