@@ -18,6 +18,7 @@ pub mod ident;
 pub mod semantic;
 pub mod snapshot;
 pub mod suppression;
+pub mod time;
 
 pub use catalog::{READ_ONLY_CATALOG_ALIAS, WRITE_CATALOG_ALIAS};
 pub use config::{
@@ -32,6 +33,7 @@ pub use ident::{validate_feature_name, validate_ident};
 pub use semantic::{CatalogHit, CatalogRow, SemanticType};
 pub use snapshot::SnapshotSpec;
 pub use suppression::{SuppressionAction, SuppressionChannel, SuppressionRow};
+pub use time::now_epoch;
 
 /// Boxed, source-preserving error carrying crate, used to embed an upstream
 /// failure (e.g. a `duckdb` error) inside [`Error`] without `core` depending on

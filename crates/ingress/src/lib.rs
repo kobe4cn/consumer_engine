@@ -9,10 +9,7 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2024_compatibility, missing_docs, missing_debug_implementations)]
 
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -21,7 +18,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use consumer_engine_core::{Error, Freshness, FreshnessRegistry, SourceType, validate_ident};
+use consumer_engine_core::{
+    Error, Freshness, FreshnessRegistry, SourceType, now_epoch, validate_ident,
+};
 use consumer_engine_execution::RowCells;
 use consumer_engine_ingestion::IngestionHandle;
 use consumer_engine_query::{QueryEngine, QueryError};
@@ -161,12 +160,8 @@ pub struct QueryRequest {
     /// Raw SQL escape hatch (M1: rejected).
     #[serde(default)]
     sql: Option<String>,
-    /// Approval token for the escape hatch (M1: not honoured).
+    /// Approval token for the escape hatch (spec 21 §4: honoured since #7).
     #[serde(default)]
-    #[allow(
-        dead_code,
-        reason = "forward-contract field for the escape-hatch approval gate (spec 21 §4)"
-    )]
     approval_token: Option<String>,
 }
 
@@ -390,14 +385,6 @@ async fn query(
         freshness: res.freshness,
         query_id: res.query_id,
     }))
-}
-
-/// Current epoch seconds (0 if the clock is before the epoch).
-fn now_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// HTTP error wrapper for either a core [`Error`] or a [`QueryError`].

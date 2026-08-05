@@ -8,7 +8,7 @@ use axum::{
     extract::{Extension, Query, State},
     http::StatusCode,
 };
-use consumer_engine_core::{CatalogHit, Error, validate_ident};
+use consumer_engine_core::{CatalogHit, Error, now_epoch, validate_ident};
 use serde::Deserialize;
 
 use crate::{ApiError, AppState, Tenant};
@@ -46,7 +46,17 @@ pub async fn get_catalog(
             "q exceeds {MAX_Q_BYTES} bytes"
         ))));
     }
-    let k = q.k.unwrap_or(DEFAULT_K).clamp(1, MAX_K);
+    // Reject, don't sanitise (AGENTS.md § Input Validation): an out-of-range
+    // `k` is a caller error, not something to silently coerce.
+    let k = match q.k {
+        Some(k) if (1..=MAX_K).contains(&k) => k,
+        Some(k) => {
+            return Err(ApiError::Core(Error::InvalidInput(format!(
+                "k must be 1..={MAX_K}, got {k}"
+            ))));
+        }
+        None => DEFAULT_K,
+    };
     let hits = st.intent_rag.retrieve(&utterance, k, &tenant).await?;
     Ok(Json(hits))
 }
@@ -108,12 +118,4 @@ pub async fn put_catalog(
     row.source_epoch = now_epoch().max(row.source_epoch + 1);
     st.ingestion.write_catalog(vec![row], &tenant).await?;
     Ok(StatusCode::OK)
-}
-
-/// Current epoch seconds.
-fn now_epoch() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }

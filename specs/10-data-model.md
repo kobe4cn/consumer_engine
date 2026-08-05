@@ -111,7 +111,7 @@ All JSON is `camelCase`. Every result carries a `freshness` label (D5).
 // Sync query response (small result)
 { "rows": [ {"userId": "u_7", /*...*/} ],
   "count": 48213,
-  "freshness": { "worstSource": "batch", "lagHours": 6 },
+  "freshness": { "worstSource": "batch", "lagSeconds": 6 },
   "queryId": "q_..." }
 
 // Async job

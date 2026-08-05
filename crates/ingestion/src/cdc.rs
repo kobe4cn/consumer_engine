@@ -9,13 +9,10 @@
 //! ships behind the `ingestion-cdc` feature; the trait is feature-independent
 //! so tests drive the machinery with a deterministic mock.
 
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use consumer_engine_core::{Error, FreshnessRegistry, Result, SourceType};
+use consumer_engine_core::{Error, FreshnessRegistry, Result, SourceType, now_epoch};
 
 use crate::IngestionHandle;
 
@@ -129,12 +126,4 @@ pub async fn run_cdc_pump(
 #[must_use]
 pub fn source_key(system: &str, entity: &str) -> String {
     format!("{system}.{entity}")
-}
-
-/// Current epoch seconds (0 if the clock is before the epoch).
-fn now_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }

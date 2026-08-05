@@ -29,10 +29,6 @@ use tracing::warn;
 pub struct Engine {
     ingestion: IngestionHandle,
     reader: Reader,
-    #[allow(dead_code)]
-    freshness: Arc<FreshnessRegistry>,
-    #[allow(dead_code)]
-    registry: Arc<ProducerRegistry>,
     compaction: JoinHandle<()>,
 }
 
@@ -294,8 +290,6 @@ impl Engine {
         let engine = Engine {
             ingestion,
             reader,
-            freshness,
-            registry,
             compaction,
         };
         Ok((router, engine))

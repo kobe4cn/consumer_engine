@@ -15,9 +15,9 @@ and lock via config, not code edits.
 | Source type | Target freshness | Mechanism |
 | -- | ---------------- | --------- |
 | CDC (Debezium/Kafka) | ≤ 5 min end-to-end | micro-batch flush 5 s + compaction hourly |
-| Batch (file/pull) | = batch interval (operator-visible) | scheduled pull; `freshness.lagHours` reported |
+| Batch (file/pull) | = batch interval (operator-visible) | scheduled pull; `freshness.lagSeconds` reported |
 
-Every query result carries `freshness = { worstSource, lagHours }` (the worst
+Every query result carries `freshness = { worstSource, lagSeconds }` (the worst
 source touched). A query mixing CDC + batch reports the batch lag.
 
 ## 3. Query latency budgets (sync path)
@@ -27,7 +27,7 @@ source touched). A query mixing CDC + batch reports the batch lag.
 | P50 sync query | < 1 s | — |
 | P99 sync query | < 5 s | `statement_timeout` 30 s → `Error::Guardrail` |
 | Sync row cap | — | 100k rows (`sync_row_cap`); else async |
-| Sync cost cap | — | estimated 1 s; else async |
+| Sync cost cap | — | no estimated-cost signal (EXPLAIN exposes only rows); heavy queries are runtime-bounded by `statement_timeout` + the row cap — see 12 §4 |
 | Output inline cap | — | 1 M rows; bigger → materialise+presigned |
 | Per-query memory | — | `memory_limit` 8 GB |
 | Concurrency | — | in-flight `Semaphore` = physical cores |

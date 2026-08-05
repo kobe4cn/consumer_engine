@@ -34,7 +34,7 @@ const JOB_TTL: Duration = Duration::from_secs(60 * 60);
 /// expire lazily on [`JobRegistry::get`] after `JOB_TTL`.
 #[derive(Clone, Debug)]
 pub struct JobRegistry {
-    map: Arc<DashMap<String, (JobStatus, Instant)>>,
+    map: Arc<DashMap<String, (JobStatus, String, Instant)>>,
     ttl: Duration,
 }
 
@@ -56,38 +56,53 @@ impl JobRegistry {
     }
 
     /// Mark `id` as `Running`.
-    pub fn insert_running(&self, id: &str) {
-        self.map
-            .insert(id.to_string(), (JobStatus::Running, Instant::now()));
+    pub fn insert_running(&self, id: &str, tenant: &str) {
+        self.map.insert(
+            id.to_string(),
+            (JobStatus::Running, tenant.to_string(), Instant::now()),
+        );
     }
 
     /// Mark `id` as `Done(snapshot)`.
-    pub fn set_done(&self, id: &str, snapshot: String) {
-        self.map
-            .insert(id.to_string(), (JobStatus::Done(snapshot), Instant::now()));
+    pub fn set_done(&self, id: &str, tenant: &str, snapshot: String) {
+        self.map.insert(
+            id.to_string(),
+            (
+                JobStatus::Done(snapshot),
+                tenant.to_string(),
+                Instant::now(),
+            ),
+        );
     }
 
     /// Mark `id` as `Failed(err)`.
-    pub fn set_failed(&self, id: &str, err: String) {
-        self.map
-            .insert(id.to_string(), (JobStatus::Failed(err), Instant::now()));
+    pub fn set_failed(&self, id: &str, tenant: &str, err: String) {
+        self.map.insert(
+            id.to_string(),
+            (JobStatus::Failed(err), tenant.to_string(), Instant::now()),
+        );
     }
 
     /// Read the status of `id`, if present. Entries older than the registry
     /// TTL are dropped (and reported as absent), bounding the map's size.
     #[must_use]
-    pub fn get(&self, id: &str) -> Option<JobStatus> {
+    /// Read a job's status — but only if it belongs to `tenant` (issue #22:
+    /// a foreign tenant polling a known id must not learn its state).
+    pub fn get_owned(&self, id: &str, tenant: &str) -> Option<JobStatus> {
         let now = Instant::now();
         // Check-and-expire under the shard guard so a concurrent poll can't race
         // a stale entry.
         if let Some(entry) = self.map.get(id)
-            && now.duration_since(entry.1) > self.ttl
+            && now.duration_since(entry.2) > self.ttl
         {
             drop(entry);
             self.map.remove(id);
             return None;
         }
-        self.map.get(id).map(|r| r.0.clone())
+        self.map
+            .get(id)
+            .filter(|r| r.1 == tenant)
+            .map(|r| r.0.clone())
     }
 }
 
@@ -154,7 +169,7 @@ pub async fn post_jobs(
     // job (fail fast at the trust boundary).
     let q = consumer_engine_query::parse::parse(req.dsl)?;
     let id = format!("j_{}", uuid::Uuid::now_v7());
-    st.jobs.insert_running(&id);
+    st.jobs.insert_running(&id, &tenant);
 
     // Concurrency cap (AGENTS.md § Resource Limits: bound concurrent in-flight
     // work with a Semaphore — an unbounded spawn per request is a fork bomb).
@@ -176,6 +191,7 @@ pub async fn post_jobs(
     let jobs = st.jobs.clone();
     let job_id = id.clone();
     let campaign_id = req.materialize.campaign_id.clone();
+    let tenant = tenant.clone();
     tokio::spawn(async move {
         let _permit = permit;
         let qe_inner = qe.clone();
@@ -188,9 +204,11 @@ pub async fn post_jobs(
                 .await
         });
         match inner.await {
-            Ok(Ok(snapshot)) => jobs.set_done(&job_id, snapshot),
-            Ok(Err(e)) => jobs.set_failed(&job_id, e.to_string()),
-            Err(join) => jobs.set_failed(&job_id, format!("materialise task failed: {join}")),
+            Ok(Ok(snapshot)) => jobs.set_done(&job_id, &tenant, snapshot),
+            Ok(Err(e)) => jobs.set_failed(&job_id, &tenant, e.to_string()),
+            Err(join) => {
+                jobs.set_failed(&job_id, &tenant, format!("materialise task failed: {join}"))
+            }
         }
     });
 
@@ -200,9 +218,10 @@ pub async fn post_jobs(
 /// `GET /jobs/:id`: poll a job. `404` if unknown.
 pub async fn get_job(
     State(st): State<AppState>,
+    Extension(Tenant(tenant)): Extension<Tenant>,
     Path(id): Path<String>,
 ) -> Result<Json<JobResponse>, ApiError> {
-    let Some(status) = st.jobs.get(&id) else {
+    let Some(status) = st.jobs.get_owned(&id, &tenant) else {
         return Err(ApiError::NotFound);
     };
     let resp = match status {
@@ -237,9 +256,16 @@ mod tests {
         // Entries older than the TTL must be dropped on the next poll, bounding
         // the registry (AGENTS.md § Resource Limits: bound every collection).
         let reg = JobRegistry::with_ttl(Duration::from_millis(10));
-        reg.insert_running("j_1");
-        assert!(reg.get("j_1").is_some());
+        reg.insert_running("j_1", "default");
+        assert!(reg.get_owned("j_1", "default").is_some());
+        assert!(
+            reg.get_owned("j_1", "other").is_none(),
+            "a foreign tenant must not read the job"
+        );
         std::thread::sleep(Duration::from_millis(25));
-        assert!(reg.get("j_1").is_none(), "expired entry must be dropped");
+        assert!(
+            reg.get_owned("j_1", "default").is_none(),
+            "expired entry must be dropped"
+        );
     }
 }

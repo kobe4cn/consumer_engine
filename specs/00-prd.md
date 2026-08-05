@@ -45,7 +45,7 @@ POST /query
       { "Lapsed":   { "within_days": 30, "of": { "sku": "A" } } },
       { "Feature":  { "name": "cadence_regularity", "op": ">", "value": 0.7 } }
     ] } }
-→ 200 { "rows": [...], "count": 48213, "freshness": { "source": "batch", "lag_hours": 6 } }
+→ 200 { "rows": [...], "count": 48213, "freshness": { "source": "batch", "lag_seconds": 6 } }
 ```
 
 ## 3. Goals

@@ -6,12 +6,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use consumer_engine_core::{
     BoxError, Error, Freshness, FreshnessRegistry, GuardrailConfig, READ_ONLY_CATALOG_ALIAS,
-    SnapshotSpec, SuppressionRules, WRITE_CATALOG_ALIAS,
+    SnapshotSpec, SuppressionRules, WRITE_CATALOG_ALIAS, now_epoch,
 };
 use consumer_engine_execution::{QueryResult, Reader, RowCells};
 use consumer_engine_ingestion::IngestionHandle;
@@ -808,14 +808,6 @@ fn strip_derive(q: &SegmentQuery) -> SegmentQuery {
             .cloned()
             .collect(),
     }
-}
-
-/// Current epoch seconds (0 if the clock is before the epoch).
-fn now_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
