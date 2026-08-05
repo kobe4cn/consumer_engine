@@ -52,13 +52,12 @@ returns rows with a `freshness` label. No DSL yet. Shipped in T1 (`e50e918`);
 covered by `tests/e2e.rs` + storage unit tests (single-writer refusal,
 read-only probe rejection, restart durability).
 
-### M1 — Boolean/temporal DSL (B) for operators — ⚠️ OPEN — exit criterion met, awaiting human sign-off
+### M1 — Boolean/temporal DSL (B) for operators — ✅ CLOSED (human sign-off, 2025-08)
 
-> **Status**: exit criterion now MET with evidence — the read pool (#20) fixed
-> the re-attach root cause and the bench gate (#25) enforces P50 < 1 s /
-> P99 < 5 s, measuring P50 13–65 ms @ 50k rows. Closure requires ONLY the human
-> sign-off (roadmap §4). Evidence table:
-> [docs/research/perf-calibration.md](../docs/research/perf-calibration.md) §M1.
+> **Status**: CLOSED by human sign-off (2025-08) with the evidence table in
+> [docs/research/perf-calibration.md](../docs/research/perf-calibration.md) §M1
+> — the read pool (#20) fixed the re-attach root cause and the bench gate
+> (#25) enforces P50 < 1 s / P99 < 5 s (measured 13–65 ms @ 50k rows).
 
 **Specs touched**: 12, 21. **Exit**: an agent composes "bought SKU A in 30d,
 lapsed" via `/query` (sync) and gets guarded, parameterised results; P50 < 1 s
@@ -98,14 +97,14 @@ Shipped in #7 (`5bf7c05`): idempotent `/suppression` (Q3), `Exclude` anti-join,
 config-driven rules (per-campaign no-repeat + global frequency cap); e2e
 asserts suppressed users absent from rerun + snapshot, cap enforced.
 
-### M5 — Hardening: J + P + budgets + security — ⚠️ OPEN — exit criteria NOT met
+### M5 — Hardening: J + P + budgets + security — ✅ CLOSED (human sign-off, 2025-08)
 
-> **Status**: reverted from CLOSED (2025-08) — exit criteria "perf budgets met"
-> and "G2/G3 hold" NOT met (measured 2.5–15 s P50 @ 50k rows; AC6 tenant
-> isolation deferred). See
-> [docs/research/spec-gap-analysis.md](../docs/research/spec-gap-analysis.md).
-> Closure requires: the perf fix (P1-1), tenant isolation (issue #10 AC6), and
-> human confirmation (roadmap §4).
+> **Status**: CLOSED by human sign-off (2025-08) with the evidence table in
+> [docs/research/perf-calibration.md](../docs/research/perf-calibration.md) §M5
+> — the perf gate (#25) measures P50 13–65 ms @ 50k rows and tenant isolation
+> AC6 is enforced by construction (#22). 71 §4 snapshot expiry remains a
+> separately-tracked open ticket (#17, upstream DuckLake binder blocker —
+> accepted as a non-blocking deferral).
 
 **Specs touched**: 12 (J/P), 70, 71, 72. **Exit**: JIT `Derive` over survivors
 works and is bounded; `Characterize` emits comparative profiles; perf budgets

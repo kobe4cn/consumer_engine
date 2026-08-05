@@ -159,6 +159,9 @@ PIT、租户）定义为可延后；而这个定义只经过实现者自己确�
 
 - M1 / M5 在 [90-roadmap.md](../../specs/90-roadmap.md) 中从 CLOSED 回退为
   **OPEN（exit criterion 未达成）**；关闭流程改为"人确认制"（见 roadmap §5）。
+- **已闭环（2025-08）**：读池（#20）、冻结特征/谓词链（#13）、租户隔离 AC6（#22）、
+  bench 门禁（#25）补齐证据后，经人签字 M1/M5 重新 **CLOSED**（见
+  [perf-calibration.md](./perf-calibration.md) §M1/M5 证据表）。
 - GitHub issue #3（M1/T2）、#10（T7c/M5）重新打开并附未达成证据。
 - 本文档登记为差距的权威清单；补缺按"缺口排序"进行，P1-1 读连接池是性价比
   最高的一刀（单此项可把延迟砍掉 5–10 倍）。
